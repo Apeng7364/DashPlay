@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+bridge_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Optional private dependency directory; never installs into host Python.
+if [ -d "$bridge_dir/deps" ]; then
+    export PYTHONPATH="$bridge_dir/deps${PYTHONPATH:+:$PYTHONPATH}"
+fi
+exec "${BT_BRIDGE_PYTHON:-python3}" "$bridge_dir/bridge.py" "$@"

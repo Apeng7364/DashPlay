@@ -1,0 +1,22 @@
+[Unit]
+Description=DashPlay hotspot and CarPlay receiver
+# Start as soon as the root filesystem is writable, not after basic.target or local-fs.target: the
+# latter waits for Armbian's /var/log ramlog mount (~5 s later on this box, 2026-10-11), which the
+# service never uses (logs go to /run and the journal). /tmp holds the JVM's perf data.
+# Wants, not After, bluetooth: the JVM starts while bluetoothd comes up; bt-bridge waits for it.
+DefaultDependencies=no
+After=systemd-remount-fs.service tmp.mount
+Wants=bluetooth.service
+# Stop before filesystems unmount so the JVM can finish writing its AppCDS archive.
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/dashplay/supervisor.py --root /opt/dashplay
+Restart=on-failure
+RestartSec=20
+TimeoutStopSec=60
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

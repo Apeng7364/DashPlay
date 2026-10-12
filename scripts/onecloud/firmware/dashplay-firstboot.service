@@ -1,0 +1,17 @@
+[Unit]
+Description=DashPlay first boot: give this box its own SSH host keys
+# The firmware image ships without host keys so that no two boxes share them.
+ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+Before=ssh.service
+After=systemd-remount-fs.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+# RSA key generation takes ~17 s on this CPU; let CarPlay start first instead of competing with it.
+Nice=19
+IOSchedulingClass=idle
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

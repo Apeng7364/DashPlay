@@ -1,0 +1,19 @@
+# Loaded by run-receiver.py via -Djava.security.properties; overrides only this property.
+# Cortex-A5 has no AES instructions: on the OneCloud JVM AES-GCM measured 2.2 MB/s versus 9.9 MB/s
+# for ChaCha20-Poly1305 (2026-10-10), and the single Netty TLS thread hit 51% CPU forwarding ~10 Mbit/s
+# video, so frames stalled while scrolling. Disabling the GCM suites leaves ChaCha20 for browsers.
+# First lines are the Debian JDK 21 defaults, kept unchanged.
+jdk.tls.disabledAlgorithms=SSLv3, TLSv1, TLSv1.1, DTLSv1.0, RC4, DES, \
+    MD5withRSA, DH keySize < 1024, EC keySize < 224, 3DES_EDE_CBC, anon, NULL, \
+    ECDH, TLS_RSA_*, rsa_pkcs1_sha1 usage HandshakeSignature, \
+    ecdsa_sha1 usage HandshakeSignature, dsa_sha1 usage HandshakeSignature, \
+    TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, \
+    TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, \
+    TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+
+# The server's TLS keystore password is a constant in its source, so PBKDF2/MAC iterations protect
+# nothing here; at the JDK default of 10000 they cost ~2.7 s of every start on this CPU (2026-10-10).
+# Applies to keystores the server generates; existing ones are converted by KeystoreRewrap.java.
+keystore.pkcs12.certPbeIterationCount=1
+keystore.pkcs12.keyPbeIterationCount=1
+keystore.pkcs12.macIterationCount=1

@@ -1,0 +1,47 @@
+# DashPlay — notices and attribution
+
+DashPlay is distributed under the GNU General Public License v3.0 (see `LICENSE`). It is a set of
+patches and tools for PlayPort and must stay under the same license.
+
+- **PlayPort** — <https://github.com/youcci/playport> (GPL-3.0). The patches in `patches/` modify
+  PlayPort at commit `9a0882dd0ffe48e467b59d58b12d81391df55ade`; PlayPort source is not copied here.
+- **DiPlay** by shihabal3amri and **xcertplay** by shilapi (GPL-3.0) — the protocol stack PlayPort
+  derives from.
+- **WheelPlay** — <https://github.com/fython/wheelplay> (GPL-3.0), commit
+  `c1bd07717c8e87a3130ef03477d2ca318fb66caa`. The iAP2 file-transfer (album artwork) receiver in
+  `patches/playport-car-viewer.patch` is ported from it, and so are the wired CarPlay transport
+  classes in `patches/playport-wired.patch` (USBMUX host, Lockdown pairing and CarKit service, the
+  TLS duplex channel and the wired iAP2 control client; Android logging and XML replaced).
+
+No accessory authentication identity, accessory certificate or private key is included in the
+repository, packages, documentation or tests. Tests generate synthetic identities at runtime.
+DashPlay does not automatically download identities or provide a one-click APK importer. Local
+identity mode requires the user-supplied PKCS#8 EC P-256 private key `identity.pk8` and matching
+`certificate.p7b`; the receiver refuses to start without them.
+
+PlayPort documents DiPlay release APKs, Carlinkit firmware, the user's own MFi identity and an
+`--mfi-server` remote service as possible sources/options. Mentioning these is attribution, not a
+grant to redistribute their contents. Shared experimental identities can be revoked. DashPlay is
+not an Apple-certified product and is intended for personal experimentation; do not sell or
+redistribute authentication identities.
+
+The **box settings icon** is original geometric artwork generated for DashPlay by
+`scripts/generate-box-settings-icon.py` (2026-10-11), distributed under GPL-3.0 with this project.
+It uses no third-party icon or font assets. See [icon provenance](assets/ICON-SOURCE.md).
+The historical receiver resource name `f50-settings.png` is retained for compatibility.
+
+The OneCloud and Phicomm N1 **firmware images** (distributed separately, not in this repository) additionally contain:
+the Armbian-unofficial 25.11 OneCloud base image (Debian 13 armhf packages, Linux 6.12; sources from
+Debian and the Armbian build framework) or, for the N1, the ophub amlogic-s9xxx-armbian image
+(<https://github.com/ophub/amlogic-s9xxx-armbian>, Debian 13 arm64, Linux 6.12 ophub kernel), Debian's OpenJDK 21 runtime (GPL-2.0 with Classpath
+Exception), PlayPort built from the patches here and its Maven dependencies (licenses inside each JAR) and
+**dbus-next** 0.2.3 (<https://github.com/altdesktop/python-dbus-next>, MIT,
+unmodified). No identity, pairing record, password, token or host key is included; SSH host keys and
+the machine id are generated on the first boot.
+
+Each DashPlay release also carries the **program bundle** `dashplay-bundle-<version>.tar` (the
+`scripts/onecloud` program, PlayPort built from the patches here with its Maven dependencies, and
+dbus-next 0.2.3), which the OpenWrt packages of the sister repository openwrt-dashplay install.
+
+CarPlay, iPhone, AirPlay and MFi are trademarks of Apple Inc. This is an independent project; no
+Apple, PlayPort, DiPlay, xcertplay or WheelPlay affiliation or endorsement is implied.

@@ -1,0 +1,7 @@
+# Build only: running with host networking/capabilities needs separate approval.
+FROM f50-bt-bridge-test:local
+RUN apt-get update && apt-get install -y --no-install-recommends bluez \
+    && rm -rf /var/lib/apt/lists/*
+ENV DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/f50-bridge-bus
+ENV BT_BRIDGE_PYTHON=/opt/bridge-venv/bin/python
+ENTRYPOINT ["/project/linux/bt-bridge/hardware-entrypoint.sh"]

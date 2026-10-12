@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Run the DashPlay receiver (OneCloud, N1, OpenWrt); keep Wi-Fi credentials and tokens out of logs.
+
+Reads the Wi-Fi handed to the iPhone from a JSON file (state/hotspot.json, or --hotspot: the car
+hotspot, or on OpenWrt the network read from ubus) and uses the system Python and BlueZ/D-Bus.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import signal
+import subprocess
+import time
+
+
+MILESTONES = [("RTSP listening", "receiver listening"), ("wireless bootstrap: iPhone", "invitation sent"),
+              ("accepted by the iPhone", "invitation accepted"), ("CarPlay session active", "session active"),
+              ("CarPlay is live", "CarPlay live")]
+
+
+def durable_write(path, text):
+    """Replace a file so that a power cut leaves either the old or the new content, never an empty file."""
+    temporary = path.with_name(path.name + ".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as out:
+        out.write(text)
+        out.flush()
+        os.fsync(out.fileno())
+    temporary.replace(path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def write_browser_access(root, token, settings_port=80):
+    """Authorize viewers on the receiver LAN; admin login remains separate."""
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise ValueError("Unexpected browser token format")
+    path = root / "playport/web/dist/receiver-access.js"
+    # The player links "Add iPhone / network" to this box's settings page (settings_page.py; port 80,
+    # or another one on OpenWrt, where LuCI has 80).
+    content = ("localStorage.setItem('playport-token'," + json.dumps(token) + ");\n"
+               f"window.playportBoxSettingsPort={int(settings_port)};\n")
+    temporary = path.with_suffix('.js.tmp')
+    temporary.write_text(content)
+    temporary.chmod(0o644)
+    temporary.replace(path)
+    assert path.read_text() == content
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--bind", required=True)
+    parser.add_argument("--phone", default="", help="legacy single phone; migrated into the phone list")
+    parser.add_argument("--interface", required=True)
+    parser.add_argument("--channel", type=int, required=True, help="AP channel; may not be up yet")
+    parser.add_argument("--hotspot", type=Path, help="Wi-Fi handed to the iPhone (default state/hotspot.json); "
+                        "e.g. the car's own hotspot when the box joins it as a client")
+    parser.add_argument("--bind-wait", type=int, default=0,
+                        help="seconds the server may wait for --bind to be configured (started before the network)")
+    parser.add_argument("--security", default="wpa2", choices=["open", "wpa2", "wpa3-transition", "wpa3"],
+                        help="how that Wi-Fi is secured, as handed to the iPhone")
+    parser.add_argument("--web-host", default="",
+                        help="address the viewer listens on, e.g. 0.0.0.0 when the head unit reaches the box "
+                             "through the car hotspot while AirPlay stays on --bind")
+    parser.add_argument("--wired", action="store_true",
+                        help="offer wired CarPlay: an iPhone on the USB cable (iphone-usb-bridge.py)")
+    parser.add_argument("--wired-status", type=Path, help="where the receiver writes the wired CarPlay phase")
+    parser.add_argument("--java", default="/usr/bin/java", help="Java 21 (OpenWrt: the dashplay-jre package)")
+    parser.add_argument("--settings-port", type=int, default=80, help="port of the box settings page")
+    parser.add_argument("--no-wireless", action="store_true",
+                        help="no Bluetooth/Wi-Fi handoff (car_hotspot mode: the iPhone uses the cable only)")
+    args = parser.parse_args()
+    root = args.root.resolve()
+    wired = args.wired
+    os.umask(0o077)
+    state = root / "state" / "receiver"
+    state.mkdir(parents=True, exist_ok=True)
+    config_path = state / "config.json"
+    try:
+        saved = json.loads(config_path.read_text())
+    except (OSError, ValueError):
+        # Missing, or cut to 0 bytes by a power loss while it was being saved (2026-10-11: the
+        # receiver then failed every start); fall back to the default display.
+        saved = {}
+    hotspot = json.loads((args.hotspot or root / "state/hotspot.json").read_text())
+    ssid = hotspot["ssid"]
+    password = "" if args.security == "open" else hotspot["passphrase"]
+    config = {
+        "deviceName": "DashPlay", "model": "DashPlay", "manufacturer": "DashPlay",
+        "airPlayPort": 7000, "httpPort": 18443,
+        "display": saved.get("display", {"width": 1280, "height": 720, "fps": 30, "uiScale": 100, "hevc": False}),
+        # While an iPhone is on the cable the receiver pauses wireless invitations (WiredBootstrap).
+        "wireless": not args.no_wireless, "wifiSsid": ssid, "wifiPassphrase": password,
+        "wifiChannel": args.channel, "wifiSecurity": args.security,
+        "bluetoothDeviceAddress": args.phone or None, "mdns": "jmdns",
+    }
+    durable_write(config_path, json.dumps(config, indent=2) + "\n")
+    assert json.loads(config_path.read_text()) == config
+    token_path = state / "browser-token"
+    try:
+        token = token_path.read_text().strip()
+    except OSError:
+        token = ""
+    if not re.fullmatch(r"[0-9a-f]{32}", token):   # missing, or emptied by a power cut
+        token = secrets.token_hex(16)
+        durable_write(token_path, token + "\n")
+    write_browser_access(root, token, args.settings_port)
+    env = dict(os.environ, BT_BRIDGE_PYTHON="/usr/bin/python3", BT_BRIDGE_READY_WAIT="15", BT_BRIDGE_CONNECT_TIMEOUT="8",
+               BT_BRIDGE_RECOVERY_STATE=str(state / "bluetooth-recovery.stamp"),
+               CARPLAY_PRESENCE_HELPER=str(root / "phone-presence.py"),
+               CARPLAY_PRESENCE_INTERFACE=args.interface, CARPLAY_DEFAULT_PHONE=args.phone,
+               CARPLAY_PRESENCE_STATE=str(state / "phone-presence.json"))
+    if args.web_host:
+        env["CARPLAY_WEB_HOST"] = args.web_host
+    if args.wired_status:
+        env["CARPLAY_WIRED_STATUS"] = str(args.wired_status)
+    if args.bind_wait:
+        env["CARPLAY_BIND_WAIT_MS"] = str(args.bind_wait * 1000)
+    # AppCDS keeps working after jar updates only if the archive is rebuilt; this JDK mapped a stale
+    # archive, logged "shared class paths mismatch" and neither used nor re-dumped it (2026-10-10),
+    # costing ~3 s per start. Drop the archive whenever any classpath jar changes.
+    jars = [root / "launcher/onecloud-launcher.jar",
+            *sorted((root / "playport/server/build/install/server/lib").glob("*.jar"))]
+    fingerprint = "\n".join(f"{jar.name} {jar.stat().st_size} {jar.stat().st_mtime_ns}" for jar in jars)
+    stamp = state / "app-cds.classpath"
+    if not stamp.exists() or stamp.read_text() != fingerprint:
+        (state / "app-cds.jsa").unlink(missing_ok=True)
+        stamp.write_text(fingerprint)
+    options = [
+        # 1 GB board: F50 measured ~180 MB resident, so a 384 MB heap ceiling leaves system headroom.
+        "-Xms64m", "-Xmx384m",
+        # iAP2 bootstrap steps (message ids only, no credentials) for diagnosing a stalled Wi-Fi handoff.
+        "-Dorg.slf4j.simpleLogger.log.wireless=debug",
+        # Milliseconds since JVM start on every line, for boot-time profiling.
+        "-Dorg.slf4j.simpleLogger.showDateTime=true",
+        # Prefer ChaCha20 for the browser TLS link; see tls.security for the measured reason.
+        "-Djava.security.properties=" + str(root / "tls.security"),
+        # AppCDS: archive loaded application classes on first clean exit, map them on later starts.
+        "-Xlog:cds=info:file=" + str(state / "cds.log"),
+        "-Xlog:gc:file=" + str(state / "gc.log"),
+        "-XX:+AutoCreateSharedArchive", "-XX:SharedArchiveFile=" + str(state / "app-cds.jsa"), "-cp",
+        # launcher/onecloud-launcher.jar (source in launcher/) warms the handshake crypto in parallel.
+        str(root / "launcher/onecloud-launcher.jar") + ":" + str(root / "playport/server/build/install/server/lib/*"),
+        "onecloud.Launcher", "--bind", args.bind,
+        "--identity-dir", str(root / "identity"), "--state-dir", str(state),
+        "--bt-bridge", str(root / "linux-bt-bridge/bt-bridge"), "--token", token,
+    ] + (["--usb-bridge", str(root / "iphone-usb-bridge.py")] if wired else [])
+    argfile = state / "java.args"
+    argfile.write_text("\n".join(json.dumps(value) for value in options) + "\n")
+    # The supervisor signals the whole process group; outlive the JVM so it can finish writing the
+    # AppCDS archive on exit (exiting first let systemd SIGKILL it mid-dump). A Python function
+    # handler, unlike SIG_IGN, is reset to default in the exec'd JVM, which keeps its own handling.
+    signal.signal(signal.SIGTERM, lambda *_: None)
+    with subprocess.Popen(
+        [args.java, "@" + str(argfile)], cwd=root / "playport", env=env,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, errors="replace",
+    ) as process:
+        (state / "java.pid").write_text(str(process.pid) + "\n")
+        for line in process.stdout:
+            line = line.replace(token, "[REDACTED]")
+            if line.lstrip().startswith("raw-body="):
+                # The iAP2 trace's hex preview of a frame: for the Wi-Fi configuration it held the first
+                # bytes of the password, which the plain-text redaction below cannot see (2026-10-12).
+                line = line[:line.index("raw-body=")] + "raw-body=[not logged]\n"
+            print(line.replace(password, "[REDACTED]") if password else line, end="", flush=True)
+            # The JVM's timestamps follow the wall clock, which jumps when time is synced during boot
+            # (~27 s on 2026-10-11); mark milestones on the boot clock, comparable with "boot" lines.
+            milestone = next((name for key, name in MILESTONES if key in line), None)
+            if milestone:
+                print(f"boot {time.monotonic():.2f}s {milestone}", flush=True)
+        raise SystemExit(process.wait())
+
+
+if __name__ == "__main__":
+    main()
