@@ -91,7 +91,7 @@ DashPlay 在 OpenWrt 上是插件，**不提供刷 OpenWrt 的工具**。设备�
    `cat /etc/openwrt_release; cat /etc/apk/arch; df -h /; free -m`
    需要 `DISTRIB_RELEASE` 为 25.12.x、架构是 `aarch64_*` 或 `x86_64`、约 230 MB 空闲存储、内存 512 MB 以上。不满足就说明原因并停下。
 2. **下载并安装**（先说明会往路由器装 Python、Java 等约 225 MB，得到同意）：从 openwrt-dashplay 发布页下载 `dashplay-*.apk`、与 `/etc/apk/arch` 一致的 `dashplay-jre-*_<架构>.apk`、`luci-app-dashplay-*.apk`、`luci-i18n-dashplay-zh-cn-*.apk` 和 `SHA256SUMS`，校验后传到路由器 `/tmp`，然后：
-   `apk update && apk add --allow-untrusted /tmp/dashplay-*.apk /tmp/luci-*.apk`
+   `apk update && apk add --allow-untrusted /tmp/dashplay-jre-*_$(cat /etc/apk/arch).apk /tmp/dashplay-2*.apk /tmp/luci-*.apk`
    （包没有签名，所以要 `--allow-untrusted`。）
 3. **蓝牙**（无线 CarPlay 需要）：
    - F50：**不要**装系统的 `bluez-daemon`（会带入和 F50 内核不匹配的模块）。执行 openwrt-dashplay README「ZTE F50」一节的四条命令（生成独立蓝牙环境、设置两个选项、重启服务）。
