@@ -1,10 +1,13 @@
 import importlib.util
+import json
 import socket
 import struct
 import unittest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/onecloud'))
 spec = importlib.util.spec_from_file_location('presence', Path(__file__).resolve().parents[2] / 'scripts/onecloud/phone-presence.py')
 presence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(presence)
@@ -62,6 +65,52 @@ class PresenceTests(unittest.TestCase):
         self.assertEqual(len(frame), 42)
         self.assertEqual(frame[:6], b'\xff' * 6)
         self.assertEqual(frame[-4:], socket.inet_aton('192.0.2.2'))
+
+class StateFileTests(unittest.TestCase):
+    """A power cut (every drive ends with one) while the frequently rewritten state file was not on disk left it
+    empty; every presence command then failed and no iPhone was invited again (review 2026-10-12)."""
+
+    def setUp(self):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / 'presence.json'
+
+    def test_known_phones_survive_a_broken_state_file(self):
+        state = {'phones': {'AA:BB:CC:DD:EE:FF': {'wifi': ['02:00:00:00:00:01']}}, 'last_phone': 'AA:BB:CC:DD:EE:FF', 'probe': 1}
+        presence.save_state(self.path, state, lasting_before=json.dumps([state['phones'], state['last_phone']], sort_keys=True))
+        self.path.write_text('')                       # what the power cut left
+        loaded = presence.load_state(self.path)
+        self.assertEqual(loaded['phones'], state['phones'])
+        self.assertEqual(loaded['last_phone'], 'AA:BB:CC:DD:EE:FF')
+
+    def test_garbage_or_nothing_starts_empty(self):
+        self.path.write_text('{"phones": ')
+        self.assertEqual(presence.load_state(self.path), {})
+        self.path.unlink()
+        self.assertEqual(presence.load_state(self.path), {})
+
+class BluezNotReadyTests(unittest.TestCase):
+    """Right after a restart the Bluetooth bus socket is not there yet: logged as an error (FileNotFoundError)
+    though the iPhone cannot be invited before Bluetooth is up anyway (F50, 2026-10-12)."""
+
+    def test_missing_bus_socket_is_a_note_not_an_error(self):
+        import os, sys as system, tempfile, types
+        fake = types.ModuleType('dbus_next'); aio = types.ModuleType('dbus_next.aio')
+        class Bus:
+            def __init__(self, **_): pass
+            async def connect(self): raise FileNotFoundError(2, 'No such file or directory')
+        fake.BusType = types.SimpleNamespace(SYSTEM=1); fake.Message = fake.MessageType = object; aio.MessageBus = Bus
+        with patch.dict(system.modules, {'dbus_next': fake, 'dbus_next.aio': aio}):
+            with self.assertRaises(presence.BluezNotReady):
+                presence.asyncio.run(presence.paired_phones())
+        with tempfile.TemporaryDirectory() as directory:
+            state = os.path.join(directory, 'phone-presence.json')
+            with patch.dict(os.environ, {'CARPLAY_PRESENCE_STATE': state}), patch.object(presence.sys, 'argv', ['x', 'admit']), \
+                    patch.object(presence, 'main', side_effect=presence.BluezNotReady()):
+                self.assertEqual(presence.entry(), 1)
+            log = Path(directory, 'presence-errors.log').read_text()
+        self.assertIn('admit BlueZ not ready yet', log)
+        self.assertNotIn('Error', log)
 
 if __name__ == '__main__':
     unittest.main()

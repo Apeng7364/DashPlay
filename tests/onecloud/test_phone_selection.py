@@ -90,11 +90,14 @@ class PairedCacheTests(unittest.TestCase):
 
 
 class DurableStateTests(unittest.TestCase):
-    def run_command(self, directory, state, command):
+    def run_command(self, directory, state, command, known=True):
         import json, os
         from unittest import mock
         path = Path(directory) / 'phone-presence.json'
         path.write_text(json.dumps(state))
+        if known:   # the flushed copy of who is known (phone-presence.save_state), as on a box in use
+            path.with_name('phone-presence.known.json').write_text(
+                json.dumps({'phones': state.get('phones'), 'last_phone': state.get('last_phone')}))
         env = {'CARPLAY_PRESENCE_INTERFACE': 'test0', 'CARPLAY_PRESENCE_STATE': str(path), 'CARPLAY_DEFAULT_PHONE': A}
         with mock.patch('platform_debian.DebianPlatform.boot_id', return_value='synthetic-boot'), mock.patch.dict(os.environ, env), mock.patch.object(p.sys, 'argv', ['phone-presence.py', command]), \
              mock.patch.object(p.os, 'fsync', wraps=os.fsync) as fsync:
@@ -106,6 +109,15 @@ class DurableStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state, flushes = self.run_command(directory, {'phones': {A: {}}, 'last_phone': A, 'active': A}, 'idle')
         self.assertNotIn('active', state)
+        self.assertEqual(flushes, 0)
+
+    def test_a_missing_copy_of_the_known_phones_is_written_once(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            state, flushes = self.run_command(directory, {'phones': {A: {}}, 'last_phone': A}, 'idle', known=False)
+            self.assertGreater(flushes, 0)
+            self.assertEqual(json.loads((Path(directory) / 'phone-presence.known.json').read_text())['last_phone'], A)
+            _, flushes = self.run_command(directory, state, 'idle', known=False)   # the copy is there now
         self.assertEqual(flushes, 0)
 
     def test_changed_phone_records_are_flushed(self):

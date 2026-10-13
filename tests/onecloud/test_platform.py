@@ -10,7 +10,7 @@ from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/onecloud'))
 from platform_api import Platform, get_platform
-from platform_debian import AP_VIF, DebianPlatform, ap_width, derived_address, hostapd_config, machine_key, supports_sta_ap, wifi_driver
+from platform_debian import AP_VIF, DebianPlatform, ap_width, derived_address, hostapd_config, machine_key, supports_sta_ap, wifi_driver, wpa_network_lines
 from setup_wizard import Scanner
 
 
@@ -295,7 +295,10 @@ class PlatformTests(unittest.TestCase):
         self.assertEqual(waits, [(30, .25), (60, .25), (30, .2)])
         self.assertIn('RequestAddress=192.0.2.9', self.platform.sta_network.read_text())
         self.assertEqual(self.platform.sta_network.stat().st_mode & 0o777, 0o644)
-        self.assertIn('ssid="Test\\"\\\\"', (self.root / 'wpa.conf').read_text())
+        # The name in hex and the password as written (wpa_supplicant has no escapes in quoted values).
+        conf = (self.root / 'wpa.conf').read_text()
+        self.assertIn(' ssid=' + 'Test"\\'.encode().hex() + '\n', conf)
+        self.assertIn(' psk="synthetic"\\"\n', conf)
         self.assertIn('key_mgmt=WPA-PSK SAE', (self.root / 'wpa.conf').read_text())
         with patch.object(self.platform, 'start'), patch.object(self.platform, 'stop_child') as stop:
             self.assertFalse(self.platform.join_wifi(car, {}, Mock(side_effect=TimeoutError), 60))
@@ -330,6 +333,18 @@ class PlatformTests(unittest.TestCase):
             self.assertTrue(self.platform.start_ap(wait))
             child.poll.return_value = 1
             self.assertFalse(self.platform.start_ap(wait))
+
+    def test_ap_that_never_comes_up_lets_the_next_attempt_run(self):
+        # hostapd alive but never AP-ENABLED: the timeout ended the supervisor, so the 40 MHz and 2.4 GHz
+        # fallbacks never ran (review 2026-10-12).
+        child = Mock()
+        child.poll.return_value = None
+        def wait(predicate, seconds):
+            raise TimeoutError("Service dependency did not become ready")
+        with patch.object(self.platform, 'start', return_value=child), patch.object(self.platform, 'ap_ready', return_value=False), \
+                patch.object(self.platform, 'stop_child') as stop:
+            self.assertFalse(self.platform.start_ap(wait))
+        stop.assert_called_once_with('hostapd')
 
     @patch('platform_debian.subprocess.run')
     def test_ap_ready_trusts_hostapd_when_driver_reports_no_channel(self, run):
@@ -367,6 +382,46 @@ class KnownFrequencyTests(unittest.TestCase):
         self.assertTrue(platform_debian.missed_on_known_freq(header + other, "小鹏汽车"))
         self.assertFalse(platform_debian.missed_on_known_freq(header + other + car, "小鹏汽车"))
         self.assertFalse(platform_debian.missed_on_known_freq(header, "小鹏汽车"))   # no scan finished yet
+
+class HotspotInjectionTests(unittest.TestCase):
+    """A newline in the hotspot name or password added its own hostapd line: "abcdefgh\nwpa=0" passed the
+    length check and turned the hotspot open (review 2026-10-12)."""
+
+    def test_hostapd_config_refuses_control_characters(self):
+        with self.assertRaises(ValueError):
+            hostapd_config("wlan1", 149, 80, "DashPlay", "abcdefgh\nwpa=0")
+        with self.assertRaises(ValueError):
+            hostapd_config("wlan1", 149, 80, "Dash\nwpa=0", "abcdefgh")
+        self.assertIn("wpa_passphrase=a b'c\"d\\e", hostapd_config("wlan1", 149, 80, "Dash Play", "a b'c\"d\\e"))
+
+    def test_settings_page_asks_for_a_wpa_password(self):
+        from settings_page import _hotspot_credentials
+        with self.assertRaises(ValueError):
+            _hotspot_credentials({"ssid": "DashPlay", "password": "abcdefgh\nwpa=0"}, {})
+        with self.assertRaises(ValueError):
+            _hotspot_credentials({"ssid": "DashPlay", "password": "密码密码密码密码"}, {})   # not ASCII
+        with self.assertRaises(ValueError):
+            _hotspot_credentials({"ssid": "Dash\tPlay", "password": "abcdefgh"}, {})
+        self.assertEqual(_hotspot_credentials({"ssid": "小鹏 G6", "password": "a b'c\"de"}, {}), ("小鹏 G6", "a b'c\"de"))
+
+
+
+class WpaSupplicantQuotingTests(unittest.TestCase):
+    """wpa_supplicant takes a quoted value up to its last quote, without escapes: the backslashes added for \\
+    and " became part of the password, and such car hotspots never connected (review 2026-10-12)."""
+
+    def test_name_in_hex_and_password_as_written(self):
+        self.assertEqual(wpa_network_lines('小鹏 "G6"', 'pa\\ss"word'),
+                         [" ssid=" + '小鹏 "G6"'.encode().hex(), ' psk="pa\\ss"word"'])
+        hex_key = "0123456789abcdef" * 4
+        self.assertEqual(wpa_network_lines("Car", hex_key)[1], " psk=" + hex_key)
+
+    def test_control_characters_are_refused(self):
+        with self.assertRaises(ValueError):
+            wpa_network_lines("Car", 'abcdefgh"\n key_mgmt=NONE')
+        with self.assertRaises(ValueError):
+            wpa_network_lines("Car\n", "abcdefgh")
+
 
 if __name__ == '__main__':
     unittest.main()

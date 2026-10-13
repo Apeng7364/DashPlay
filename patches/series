@@ -26,3 +26,14 @@ playport-media-diagnostics.patch
 playport-viewer-hiccups.patch
 playport-viewer-lag.patch
 playport-viewer-lag-gate.patch
+playport-viewer-steady-picture.patch
+playport-media-element-timeline.patch
+playport-wireless-music-cushion.patch
+playport-music-seamless-align.patch
+playport-fullscreen-return.patch
+playport-viewer-review-fixes.patch
+playport-viewer-access-own-page.patch
+playport-own-page-http2.patch
+playport-idle-release.patch
+playport-idle-release-setting.patch
+playport-viewer-drive-fixes.patch

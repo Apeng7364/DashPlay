@@ -11,7 +11,8 @@ Three ways of use, chosen in first-run setup (setup_wizard.py, docs/三种使用
 In the two joining modes the box hotspot is only the fallback: when the hotspot is not found within
 CAR_WAIT seconds, it opens so that a phone can reach the settings page, keeps scanning while idle and
 switches back once the hotspot appears. The settings page (port 80, settings_page.py) is served in
-every mode.
+every mode. Optional: a DuckDNS name with a Let's Encrypt certificate (state/ddns.json, own_domain.py)
+for car browsers that refuse the box's local CA.
 """
 import argparse
 import ipaddress
@@ -28,6 +29,7 @@ import time
 
 from boxnet import ensure_leaf
 from mdns_name import NameResponder
+import own_domain
 from settings_page import SettingsPage
 import setup_wizard
 from platform_api import get_platform
@@ -57,6 +59,15 @@ def hotspot_attempts(channel, width):
     if channel > 14:
         attempts.append((6, 20))
     return attempts
+
+
+def idle_release(state, default=300):
+    """The owner's choice in state/options.json, or 5 minutes."""
+    try:
+        value = json.loads((state / "options.json").read_text()).get("idle_release", default)
+        return max(0, int(value))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return default
 
 
 def main():
@@ -199,6 +210,7 @@ def main():
     scanner = setup_wizard.Scanner(interface, hotspot["ssid"], lambda: status["mode"], platform=platform)
     settings = SettingsPage(state, lambda: status, request_reexec, lambda: [ip.network for ip in platform.local_addresses()],
                             scanner, WIRED_STATUS)
+    maintainer = []   # own_domain.Maintainer, when a DuckDNS name is set
     try:
         mark("supervisor start")
         platform.prepare(wait_for)
@@ -214,7 +226,23 @@ def main():
         # it starts and stalled ~15 s waiting for it (2026-10-11).
         bluetooth = threading.Thread(target=power_bluetooth, name="bluetooth-power", daemon=True)
         bluetooth.start()
-        names = [setup_wizard.MDNS_NAME]
+        ddns = own_domain.load(state)
+        own_name = own_domain.name_of(ddns)
+        status["own_name"] = own_name
+        names = [setup_wizard.MDNS_NAME] + ([own_name] if own_name else [])
+
+        def with_name(entries):
+            # The name first once its certificate is in use: the head unit then opens it without a warning.
+            return ([f"https://{own_name}:18443/"] if own_name and own_domain.serving(state) else []) + entries
+
+        def keep_name(target, wifi=None):
+            """DuckDNS record -> target (None: leave it) and the certificate, in the background. wifi: the joined
+            Wi-Fi, whose public IPv6 address goes into the record too when the owner asked for it."""
+            if ddns:
+                maintainer.append(own_domain.Maintainer(root, ddns, target, stopped, interface=wifi))
+                maintainer[0].start()
+        if not (ddns and ddns.get("ipv6")):
+            own_domain.unguard()   # the public IPv6 option was turned off: its firewall goes with it
         use = setup.get("mode")   # None until chosen in first-run setup
         status["use"] = use
         # Debugging at home (e.g. wired CarPlay): DASHPLAY_SKIP_CAR=1 skips the minute spent looking for
@@ -224,7 +252,10 @@ def main():
         WIRED_STATUS.unlink(missing_ok=True)
         # The cable is always offered; wireless (Bluetooth handoff) except in car_hotspot mode.
         usb_args = ["--wired", "--wired-status", str(WIRED_STATUS)] + (
-            [] if setup_wizard.wireless(setup) else ["--no-wireless"])
+            [] if setup_wizard.wireless(setup) else ["--no-wireless"]) + [
+            # state/options.json "idle_release": seconds without a viewer before wireless CarPlay ends (0: never);
+            # in state/, which program updates keep (they replace service.json).
+            "--idle-release", str(idle_release(state))]
 
         def receiver_argv(plan, wait=False):
             """plan: (bind address, channel, security) of the joined hotspot, which the iPhone is handed.
@@ -259,18 +290,29 @@ def main():
             setup = setup_wizard.load(state)
             if setup.get("failed"):
                 setup_wizard.save(state, {key: value for key, value in setup.items() if key != "failed"})
+            # The certificate before the receiver: the JVM reads the keystore once at start, and one started
+            # first kept the old certificate without the new address (audit 2026-10-13, A6).
+            renewed = ensure_leaf(state, names, [sta_address, str(address.ip)])
+            if keep_early and renewed:
+                # Same address, but renewed or signed by a new CA (rare): the early receiver has the old one.
+                stop_child("receiver")
+                keep_early = False
+                mark("early receiver stopped: the web certificate was renewed")
             if not keep_early:
                 start("receiver", receiver_argv(joined))
             # mifi: the iPhone's video comes through the portable Wi-Fi; acknowledge at once (relay lag).
             platform.quick_ack()
-            status.update(mode="sta", ssid=car["ssid"], home=f"http://{sta_address}/", channel=sta_channel, entries=[
-                f"https://{sta_address}:18443/", f"http://{sta_address}/ （本设置页）"])
-            ensure_leaf(state, names, [sta_address, str(address.ip)])
+            status.update(mode="sta", ssid=car["ssid"], home=f"http://{sta_address}/", channel=sta_channel, entries=with_name([
+                f"https://{sta_address}:18443/", f"http://{sta_address}/ （本设置页）"]))
             mark(f"{use} hotspot joined, viewer on {sta_address}")
+            keep_name(sta_address, interface)
         else:
-            status.update(mode="ap", ssid=hotspot["ssid"], open=open_ap, entries=[
-                f"https://{address.ip}:18443/", f"http://{address.ip}/ （本设置页）"])
             ensure_leaf(state, names, [str(address.ip)])
+            status.update(mode="ap", ssid=hotspot["ssid"], open=open_ap, entries=with_name([
+                f"https://{address.ip}:18443/", f"http://{address.ip}/ （本设置页）"]))
+            # Box hotspot: the head unit opens the box at its fixed address; online through the Ethernet cable
+            # (at home) the box renews the certificate. The fallback hotspot of the joining modes leaves the record.
+            keep_name(str(address.ip) if use == "box_hotspot" else None)
             platform.set_ap_address(address)
             # The JVM needs ~6 s on this CPU (with AppCDS) before it first contacts the iPhone, while the
             # AP is up in ~4 s, so start it first (2026-10-10 boot profiling). It only needs the address
@@ -365,6 +407,8 @@ def main():
         pass
     finally:
         stopped.set()
+        for worker in maintainer:
+            worker.join(10)   # acme.sh is stopped first: no signer left running into the restarted service
         settings.stop()
         platform.stop_all()
         platform.remove_sta_network()

@@ -34,9 +34,11 @@ The OneCloud and Phicomm N1 **firmware images** (distributed separately, not in 
 the Armbian-unofficial 25.11 OneCloud base image (Debian 13 armhf packages, Linux 6.12; sources from
 Debian and the Armbian build framework) or, for the N1, the ophub amlogic-s9xxx-armbian image
 (<https://github.com/ophub/amlogic-s9xxx-armbian>, Debian 13 arm64, Linux 6.12 ophub kernel), Debian's OpenJDK 21 runtime (GPL-2.0 with Classpath
-Exception), PlayPort built from the patches here and its Maven dependencies (licenses inside each JAR) and
+Exception), PlayPort built from the patches here and its Maven dependencies (licenses inside each JAR),
+**acme.sh** 3.1.6 (<https://github.com/acmesh-official/acme.sh>, GPL-3.0, unmodified main script and DuckDNS
+hook, with its LICENSE.md; used only when the owner sets up an own DuckDNS name) and
 **dbus-next** 0.2.3 (<https://github.com/altdesktop/python-dbus-next>, MIT,
-unmodified). No identity, pairing record, password, token or host key is included; SSH host keys and
+unmodified). The same acme.sh files are in the program bundle that the OpenWrt package installs. No identity, pairing record, password, token or host key is included; SSH host keys and
 the machine id are generated on the first boot.
 
 Each DashPlay release also carries the **program bundle** `dashplay-bundle-<version>.tar` (the

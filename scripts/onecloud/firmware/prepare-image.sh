@@ -19,7 +19,7 @@ cp -p "$cache"/* "$root/state/receiver/" 2>/dev/null || true
 rm -rf "$cache"
 printf '{"ssid": "DashPlay"}\n' > "$root/state/hotspot.json"
 chmod 600 "$root/state/hotspot.json"
-rm -f "$root/playport/web/dist/receiver-access.js" "$root/playport/web/dist/temporary-metrics.js"
+rm -f "$root/playport/web/dist/receiver-access.js" "$root/playport/web/dist/receiver-access.json" "$root/playport/web/dist/temporary-metrics.js"
 rm -rf "$root/playport/web/dist/experiments"   # browser tests from development, not part of the product
 
 # System: no Bluetooth pairings, no per-box identity, no logs, no package caches.

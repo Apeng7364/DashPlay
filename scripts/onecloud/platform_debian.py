@@ -54,9 +54,22 @@ def ap_width(channel, width):
         return 20
     return width
 
+def wpa_network_lines(ssid, passphrase):
+    """The ssid and psk lines of a wpa_supplicant network block. The name goes in hex (any bytes); the password
+    as written: a quoted value runs to its last quote, without escapes, so the backslashes once added for
+    \\ and " became part of it and such hotspots never connected (review 2026-10-12)."""
+    if any(ord(c) < 32 or ord(c) == 127 for c in ssid + passphrase):
+        raise ValueError("control character in the Wi-Fi name or password")
+    psk = passphrase if re.fullmatch(r"[0-9a-fA-F]{64}", passphrase) else f'"{passphrase}"'
+    return [f" ssid={ssid.encode().hex()}", f" psk={psk}"]
+
+
 def hostapd_config(interface, channel, width, ssid, passphrase, country="CN"):
     """passphrase None: an open network (first-run setup only). country None: leave the regulatory
     domain to the driver."""
+    # One setting per line: a newline in the name or password added its own (review 2026-10-12).
+    if any(ord(c) < 32 or ord(c) == 127 for c in ssid + (passphrase or "")):
+        raise ValueError("control character in the hotspot name or password")
     lines = [f"interface={interface}", "driver=nl80211", f"ssid={ssid}"]
     if country:
         # Sets the regulatory domain on start; the global "00" domain marks every 5 GHz channel no-IR.
@@ -321,8 +334,7 @@ class DebianPlatform:
     def join_wifi(self, car, lease, wait_for, seconds):
         """Associate with the car hotspot and get a DHCP lease; returns True on success, False after timeout cleanup."""
         conf = self.run / "wpa.conf"
-        ssid = car["ssid"].replace("\\", "\\\\").replace('"', '\\"')
-        psk = car["passphrase"].replace("\\", "\\\\").replace('"', '\\"')
+        network = "\n".join(wpa_network_lines(car["ssid"], car["passphrase"]))
         # Last time's frequency first: a full 2.4 + 5 GHz scan is ~2.7 s on rtw88, longer while the JVM
         # starts, and the box sat ~10 s between the dongle appearing and authenticating (2026-10-11 cold
         # boot). If the car moved channel, everything is scanned again after JOIN_KNOWN_FREQ_SECONDS.
@@ -330,7 +342,7 @@ class DebianPlatform:
 
         def write_conf(scan_freq):
             # Car hotspots run WPA2, WPA3 or the transition mode; accept either.
-            conf.write_text(f'ctrl_interface={self.run}/wpa\nnetwork={{\n ssid="{ssid}"\n psk="{psk}"\n'
+            conf.write_text(f'ctrl_interface={self.run}/wpa\nnetwork={{\n{network}\n'
                             ' key_mgmt=WPA-PSK SAE\n ieee80211w=1\n'
                             + (f' scan_freq={int(scan_freq)}\n' if scan_freq else '') + '}\n')
 
@@ -531,7 +543,12 @@ class DebianPlatform:
 
     def start_ap(self, wait_for):
         hostapd = self.start("hostapd", ["hostapd", "-t", str(self.run / "hostapd.conf")])
-        wait_for(lambda: hostapd.poll() is not None or self.ap_ready(), 30)
+        try:
+            wait_for(lambda: hostapd.poll() is not None or self.ap_ready(), 30)
+        except TimeoutError:
+            # Alive but never enabled: give the next channel or width its turn (it ended the supervisor).
+            self.stop_child("hostapd")
+            return False
         return hostapd.poll() is None
 
     def start_dhcp(self, address, portal):
@@ -552,8 +569,9 @@ class DebianPlatform:
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGTERM)
                 try:
-                    # The JVM writes its AppCDS archive while exiting; that took longer than 8 s here.
-                    child.wait(timeout=40 if name == "receiver" else 8)
+                    # The JVM writes its AppCDS archive while exiting; that took longer than 8 s here. A board's
+                    # Bluetooth helper stops its own children within 6 s (board_zte_f50.py).
+                    child.wait(timeout={"receiver": 40, "bluetooth": 15}.get(name, 8))
                 except subprocess.TimeoutExpired:
                     os.killpg(child.pid, signal.SIGKILL)
                     child.wait()

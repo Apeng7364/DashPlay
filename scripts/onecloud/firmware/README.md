@@ -6,9 +6,9 @@ bootloader and kernel and replacing only the rootfs.
 
 | File | Runs on | Does |
 |---|---|---|
-| `build-bundle.sh` | host | the same tree from this repository alone (launcher compiled, dbus-next downloaded with a pinned hash), no AppCDS cache: new boards such as the Phicomm N1 |
+| `build-bundle.sh` | host | the same tree from this repository alone (launcher compiled, dbus-next and acme.sh downloaded with pinned hashes), no AppCDS cache: new boards such as the Phicomm N1 |
 | `make-n1-image.sh` | Phicomm N1 | installs a bundle into the ophub trixie image in a chroot on an N1 and cleans it: a USB-bootable DashPlay image (`armbian-install` then copies it to the eMMC) |
-| `make-bundle.sh` | host | `/opt/dashplay` tree from this repo + the reference box (launcher, bridge deps, jars with their AppCDS cache); refuses personal files |
+| `make-bundle.sh` | host | `/opt/dashplay` tree from this repo + the reference box (launcher, bridge deps, jars with their AppCDS cache); refuses personal files; no acme.sh (the optional own name then reports that it cannot get a certificate) |
 | `install.sh` | build box | the 4 packages and system changes that separate the working box from the base image (2026-10-11 diff), the services |
 | `dashplay-firstboot.service` | firmware | new SSH host keys on the first boot |
 | `prepare-image.sh --yes` | build box | wipes user data, logs, keys, machine-id; root/1234; re-arms Armbian's filesystem grow; zeroes free space |

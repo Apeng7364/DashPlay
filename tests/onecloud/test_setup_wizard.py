@@ -449,5 +449,21 @@ class MdnsTests(unittest.TestCase):
             mdns_name.answer(bad, 'dashplay.local', '10.0.0.2', legacy=False)
 
 
+
+class IdleReleaseOptionTests(unittest.TestCase):
+    def test_owner_choice_in_state_survives_program_updates(self):
+        import json, tempfile
+        sys_path = str(Path(__file__).resolve().parents[2] / "scripts/onecloud")
+        import sys as system
+        if sys_path not in system.path: system.path.insert(0, sys_path)
+        from supervisor import idle_release
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            self.assertEqual(idle_release(state), 300)
+            (state / "options.json").write_text(json.dumps({"idle_release": 0}))
+            self.assertEqual(idle_release(state), 0)
+            (state / "options.json").write_text("not json")
+            self.assertEqual(idle_release(state), 300)
+
 if __name__ == '__main__':
     unittest.main()

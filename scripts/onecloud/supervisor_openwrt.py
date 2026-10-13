@@ -6,6 +6,8 @@ the iPhone (uci dashplay.main.wifi: a wifi-iface section, or "auto" = the first 
 first), starts the receiver on that network's address and the settings page (iPhones only) on
 settings_port, and restarts itself when that Wi-Fi changes. Without a Bluetooth adapter it runs
 wired CarPlay only. Compared with supervisor.py: no box hotspot, no joining, no first-run setup.
+Optional: a DuckDNS name with a Let's Encrypt certificate (uci duckdns_domain / duckdns_token,
+own_domain.py) for car browsers that refuse the local CA; it then replaces the name.
 """
 import argparse
 import json
@@ -25,15 +27,31 @@ from boxnet import ensure_leaf
 from settings_page import SettingsPage
 import setup_wizard
 import diagnostics
+import own_domain
 from platform_openwrt import OpenWrtPlatform, RUN
 
 DEFAULTS = {"enabled": "1", "wifi": "auto", "settings_port": "18080",
             "java": "/usr/lib/dashplay-jre/bin/java", "name": "dashplay.lan",
             # Boards whose BlueZ cannot come from the system (ZTE F50: board_zte_f50.py): a command that
             # brings up the controller and its own D-Bus, and that bus's address.
-            "bluetooth_service": "", "dbus_address": ""}
+            "bluetooth_service": "", "dbus_address": "",
+            # Seconds without a viewer page before wireless CarPlay is ended, so an iPhone near a box left on
+            # does not keep sending its screen (0: never; then a reopened page shows the picture at once).
+            "idle_release": "300",
+            # The name also answers with the router's own public IPv6 address, for car browsers that refuse a
+            # private one: 0 no, 1 beside the LAN address, 2 instead of it (LAN address while there is none).
+            "public_ipv6": "0",
+            # A DuckDNS sub-domain and its token: the name becomes <sub-domain>.duckdns.org, with a Let's Encrypt
+            # certificate the router obtains and renews itself (own_domain.py). Empty: off.
+            "duckdns_domain": "", "duckdns_token": ""}
 RECHECK_EVERY = 10      # seconds between looks at the Wi-Fi handed to the iPhone
 WIRED_STATUS = RUN / "wired-status.json"
+
+
+def trusted_networks(network):
+    """Who may use the settings page: the network of the Wi-Fi handed to the iPhone, where the head unit is,
+    not every interface of the router (the WAN or a guest network too; audit 2026-10-13, A5)."""
+    return [network["address"].network]
 
 
 def read_config(uci_text):
@@ -46,16 +64,51 @@ def read_config(uci_text):
     return config
 
 
-def point_name(name, host):
-    """Keep our uci dhcp record (section "dashplay") answering name -> the router's address, so the head
-    unit can open https://dashplay.lan:18443/ whatever the LAN address. Returns True when it changed."""
-    def get(key):
-        return subprocess.run(["uci", "-q", "get", key], capture_output=True, text=True).stdout.strip()
+def name_changes(uci_dhcp, name, host, public=None, only_public=False):
+    """`uci -q show dhcp` -> the uci commands that make the router's DNS answer name -> host (its LAN address,
+    record "dashplay") and name -> public (its own public IPv6 address, record "dashplay6", uci
+    dashplay.main.public_ipv6). only_public leaves the LAN address out, and the name is then answered
+    locally only: dnsmasq asks upstream for a type the hosts records lack, and a public record of the name
+    may point at the LAN (F50, 2026-10-13). Without a public address the LAN address stays. [] when current."""
+    kinds, options = {}, {}
+    for line in (uci_dhcp or "").splitlines():
+        match = re.match(r"^dhcp\.([^.=]+)=(\w+)$", line)
+        if match:
+            kinds[match.group(1)] = match.group(2)
+        match = re.match(r"^dhcp\.([^.=]+)\.(\w+)=(.*)$", line)
+        if match:
+            options.setdefault(match.group(1), {})[match.group(2)] = re.findall(r"'([^']*)'", match.group(3)) or [match.group(3)]
+    alone = bool(only_public and public)
+    changes = []
+    for section, ip in (("dashplay", None if alone else host), ("dashplay6", public)):
+        have = options.get(section, {})
+        if ip is None:
+            if section in kinds:
+                changes.append(["delete", f"dhcp.{section}"])
+        elif kinds.get(section) != "domain" or have.get("name") != [name] or have.get("ip") != [ip]:
+            changes += [["set", f"dhcp.{section}=domain"], ["set", f"dhcp.{section}.name={name}"],
+                        ["set", f"dhcp.{section}.ip={ip}"]]
+    dns = next((section for section, kind in kinds.items() if kind == "dnsmasq"), None)
+    if dns:
+        servers = options.get(dns, {}).get("server", [])
+        ours = {f"/{old}/" for section in ("dashplay", "dashplay6") for old in options.get(section, {}).get("name", [])}
+        local = f"/{name}/" if alone else None
+        for entry in sorted((ours | {f"/{name}/"}) - {local}):
+            if entry in servers:
+                changes.append(["del_list", f"dhcp.{dns}.server={entry}"])
+        if local and local not in servers:
+            changes.append(["add_list", f"dhcp.{dns}.server={local}"])
+    return changes + [["commit", "dhcp"]] if changes else []
 
-    if get("dhcp.dashplay") == "domain" and get("dhcp.dashplay.name") == name and get("dhcp.dashplay.ip") == host:
+
+def point_name(name, host, public=None, only_public=False):
+    """Keep our uci dhcp records answering name -> the router (name_changes), so the head unit can open
+    https://dashplay.lan:18443/ whatever the LAN address. Returns True when they changed."""
+    shown = subprocess.run(["uci", "-q", "show", "dhcp"], capture_output=True, text=True).stdout
+    changes = name_changes(shown, name, host, public, only_public)
+    if not changes:
         return False
-    for change in (["set", "dhcp.dashplay=domain"], ["set", f"dhcp.dashplay.name={name}"],
-                   ["set", f"dhcp.dashplay.ip={host}"], ["commit", "dhcp"]):
+    for change in changes:
         subprocess.run(["uci", *change], check=True, capture_output=True)
     def reload():
         try:
@@ -69,6 +122,18 @@ def point_name(name, host):
 
     threading.Thread(target=reload, name="dnsmasq-reload", daemon=True).start()
     return True
+
+
+def own_config(config):
+    """The DuckDNS sub-domain and token from uci, or None when off or invalid (then said once, never fatal)."""
+    if not config["duckdns_domain"]:
+        return None
+    try:
+        return {"domain": own_domain.sub_domain(config["duckdns_domain"]),
+                "token": own_domain.check_token(config["duckdns_token"])}
+    except ValueError:
+        print("dashplay.main.duckdns_domain/duckdns_token invalid: own name off", flush=True)
+        return None
 
 
 def plan_of(network):
@@ -88,6 +153,9 @@ def main():
         raise ValueError("Invalid dashplay.main.wifi or settings_port")
     if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,62})(\.[a-z0-9-]{1,63})+", config["name"]):
         raise ValueError("Invalid dashplay.main.name")
+    ddns = own_config(config)
+    if ddns:
+        config["name"] = own_domain.name_of(ddns)
     for relative in ["run-receiver.py", "phone-presence.py", "pair-phone.py", "pairing_window.py", "settings_page.py",
                      "settings_ui.py", "platform_openwrt.py", "diagnostics.py", "iphone-usb-bridge.py",
                      "linux-bt-bridge/bt-bridge"]:
@@ -118,7 +186,8 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stopped.set())
     have_identity = identity_ok()
-    status = {"mode": "openwrt", "entries": [], "identity": have_identity, "home": f"http://{config['name']}:{port}/"}
+    status = {"mode": "openwrt", "entries": [], "identity": have_identity, "home": f"http://{config['name']}:{port}/",
+              "own_name": config["name"] if ddns else None}
 
     def wait_for(predicate, seconds, interval=0.2):
         until = time.monotonic() + seconds
@@ -134,9 +203,11 @@ def main():
         reexec.append(reason)
         stopped.set()
 
-    settings = SettingsPage(state, lambda: status, request_reexec,
-                            lambda: [ip.network for ip in platform.local_addresses()], None, WIRED_STATUS,
+    trusted = []   # the network the settings page serves, once the Wi-Fi is known (it starts after that)
+    settings = SettingsPage(state, lambda: status, request_reexec, lambda: list(trusted), None, WIRED_STATUS,
                             managed={"by": "OpenWrt", "admin": "/cgi-bin/luci/admin/network/wireless"})
+    maintainer = []   # own_domain.Maintainer, when a DuckDNS name is set
+
     def say(text):
         """procd sends stdout to logread, which the F50's Wi-Fi driver floods within seconds: keep our
         own lines in RUN/supervisor.log too (mirrored to state/logs like every RUN/*.log)."""
@@ -159,7 +230,8 @@ def main():
             sys.executable, str(root / "run-receiver.py"), "--root", str(root), "--bind", str(network["address"].ip),
             "--channel", str(network["channel"]), "--security", network["security"],
             "--hotspot", str(handoff_file), "--interface", network["device"], "--web-host", "0.0.0.0",
-            "--java", config["java"], "--settings-port", str(port), "--wired", "--wired-status", str(WIRED_STATUS)]
+            "--java", config["java"], "--settings-port", str(port), "--wired", "--wired-status", str(WIRED_STATUS),
+            "--idle-release", str(int(config["idle_release"]) if config["idle_release"].isdigit() else 300)]
             + ([] if wireless else ["--no-wireless"]) + (["--bind-wait", "120"] if wait else []))
 
     try:
@@ -227,16 +299,31 @@ def main():
         # The name resolves through the router's own DNS, i.e. for devices on its access point only; on a
         # client network (car hotspot, portable Wi-Fi) the head unit asks that network's DNS instead.
         named = network["mode"] == "ap"
-        if named and point_name(config["name"], host):
-            say(f"{config['name']} now points at {host}")
+        public_mode = config["public_ipv6"] if config["public_ipv6"] in ("1", "2") else "0"
+
+        def point(public):
+            if point_name(config["name"], host, public, public_mode == "2"):
+                say(f"{config['name']} now points at "
+                    + " and ".join(a for a in ([] if public and public_mode == "2" else [host]) + [public] if a))
+
+        public = platform.public_ipv6(network["device"]) if named and public_mode != "0" else None
+        if named:
+            point(public)
+        renewed = ensure_leaf(state, [config["name"], setup_wizard.MDNS_NAME], [host])
+        # The DuckDNS name also works on a client network (the head unit asks the public record), once its
+        # certificate is in use.
         status.update(ssid=network["ssid"], home=f"http://{host}:{port}/",
-                      entries=([f"https://{config['name']}:18443/"] if named else []) + [f"https://{host}:18443/"])
+                      entries=([f"https://{config['name']}:18443/"] if named or (ddns and own_domain.serving(state)) else [])
+                      + [f"https://{host}:18443/"])
+        if ddns:
+            maintainer.append(own_domain.Maintainer(root, ddns, host, stopped, say))
+            maintainer[0].start()
         if network["mode"] == "sta" and platform.zone_input(network["network"]) not in ("ACCEPT", None):
             # A client network usually sits in the wan zone, which rejects the iPhone's AirPlay connections.
             status["warning"] = (f"「{network['ssid']}」所在的防火墙区域拒绝入站连接，iPhone 连不上 DashPlay。"
                                  f"请在 OpenWrt 后台把网络 {network['network']} 放进允许入站的区域，或改用路由器自己的 WiFi。")
             say(f"warning: firewall zone of {network['network']} rejects input")
-        ensure_leaf(state, [config["name"], setup_wizard.MDNS_NAME], [host])
+        trusted[:] = trusted_networks(network)
         settings.start(port)
         diagnostics.start(stopped, diagnostics.DiagLog(state / "diag"), RUN / "receiver.log", platform, status,
                           state=state)
@@ -246,12 +333,13 @@ def main():
         # setup.json carries the way of use the settings page shows: wireless (handoff) or cable only.
         setup_wizard.save(state, {"done": True, "mode": "box_hotspot" if wireless else "car_hotspot"})
         if have_identity:
-            if early and plan_of(early) == plan_of(network) and wireless == has_bluez:
+            # A renewed certificate (or a new CA) needs a new receiver: it reads the keystore once (audit A6).
+            if early and plan_of(early) == plan_of(network) and wireless == has_bluez and not renewed:
                 mark("early receiver kept")
             else:
                 if early:
                     platform.stop_child("receiver")
-                    mark("early receiver stopped: the live Wi-Fi or Bluetooth differs")
+                    mark("early receiver stopped: the live Wi-Fi, Bluetooth or certificate differs")
                 launch(network, wireless)
         else:
             say("MFi identity missing: settings page only, CarPlay starts once the files are added")
@@ -270,10 +358,18 @@ def main():
                 now, why = platform.handoff(config["wifi"])
                 if now is None or plan_of(now) != plan:
                     request_reexec("Wi-Fi changed" if now else why)
+                elif named and public_mode != "0":
+                    # The mobile network may hand out a new prefix when it reconnects.
+                    latest = platform.public_ipv6(network["device"])
+                    if latest != public:
+                        public = latest
+                        point(public)
     except InterruptedError:
         pass
     finally:
         stopped.set()
+        for worker in maintainer:
+            worker.join(10)   # acme.sh is stopped first: no signer left running into the restarted service
         settings.stop()
         platform.stop_all()
         say("DashPlay services stopped")

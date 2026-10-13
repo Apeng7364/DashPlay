@@ -112,6 +112,30 @@ def zone_input(uci_firewall, network):
     return None
 
 
+def public_ipv6(addresses, routes, lan_device):
+    """`ip -6 -o addr show scope global` and `ip -6 -o route show default` -> the router's own public IPv6
+    address, or None. One on the LAN device first (a delegated prefix), else one on the device of an IPv6
+    default route (a mobile modem: the F50's sipa_eth0 holds 2408:…, its LAN only a unique local prefix).
+    The router answers its own address itself, so a head unit on its Wi-Fi opening the page there stays
+    on the Wi-Fi, while a car browser that refuses private addresses sees a public one (F50, 2026-10-13).
+    Temporary, deprecated or tentative addresses change or may not answer yet: skipped."""
+    found = {}
+    for line in (addresses or "").splitlines():
+        match = re.match(r"^\d+:\s+([^\s@]+)\S*\s+inet6\s+([0-9a-fA-F:]+)/\d+\s+(.*)$", line)
+        if not match or re.search(r"\b(temporary|deprecated|tentative|dadfailed)\b", match.group(3)):
+            continue
+        try:
+            address = ipaddress.IPv6Address(match.group(2))
+        except ValueError:
+            continue
+        if address.is_global:   # not unique local (fc00::/7), link-local or documentation
+            found.setdefault(match.group(1), []).append(str(address))
+    for device in [lan_device] + re.findall(r"\bdev (\S+)", routes or ""):
+        if found.get(device):
+            return found[device][0]
+    return None
+
+
 class OpenWrtPlatform(DebianPlatform):
     """Process handling, Bluetooth and addresses as on Debian; Wi-Fi is read from OpenWrt."""
 
@@ -140,6 +164,12 @@ class OpenWrtPlatform(DebianPlatform):
     def zone_input(network):
         out = subprocess.run(["uci", "-q", "show", "firewall"], capture_output=True, text=True, timeout=5).stdout
         return zone_input(out, network)
+
+    @staticmethod
+    def public_ipv6(lan_device):
+        def ip(*args):
+            return subprocess.run(["ip", "-6", "-o", *args], capture_output=True, text=True, timeout=5).stdout
+        return public_ipv6(ip("addr", "show", "scope", "global"), ip("route", "show", "default"), lan_device)
 
     def diagnostics(self):
         data = {}

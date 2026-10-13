@@ -18,6 +18,7 @@ import subprocess
 from platform_api import get_platform
 import sys
 import time
+import traceback
 
 
 def request(mac, source, target):
@@ -163,11 +164,18 @@ def migrate(state, default_phone):
             record.pop('controller', None)
 
 
+class BluezNotReady(Exception):
+    """The Bluetooth bus is not up yet (right after a restart): nobody can be invited before it is."""
+
+
 async def paired_phones():
     sys.path.insert(0, str(Path(__file__).resolve().parent / 'linux-bt-bridge/deps'))
     from dbus_next import BusType, Message, MessageType
     from dbus_next.aio import MessageBus
-    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    except (FileNotFoundError, ConnectionRefusedError) as error:
+        raise BluezNotReady() from error
     try:
         # BlueZ answers slowly while it is bootstrapping a phone over RFCOMM.
         response = await asyncio.wait_for(bus.call(Message(destination='org.bluez', path='/',
@@ -210,6 +218,42 @@ def pending_phone(path, boot, now):
     return None
 
 
+LASTING = ('phones', 'last_phone')
+
+
+def _read_json(path):
+    try:
+        value = json.loads(path.read_text())
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def load_state(path):
+    """The presence state. A car's power cut can leave the often rewritten file empty, which made every
+    command fail and no iPhone was invited again (review 2026-10-12): then start empty, with who is
+    known and who used the box last from their durable copy."""
+    state = _read_json(path)
+    known = _read_json(path.with_name(path.stem + '.known.json'))
+    for key in LASTING:
+        if key not in state and known.get(key) is not None:
+            state[key] = known[key]
+    return state
+
+
+def save_state(path, state, lasting_before):
+    """Probes are rewritten cheaply; who is known and who used the box last also go to a flushed copy."""
+    lasting = json.dumps([state.get(key) for key in LASTING], sort_keys=True)
+    known = path.with_name(path.stem + '.known.json')
+    if lasting != lasting_before or not known.exists():
+        temporary = known.with_suffix('.tmp')
+        temporary.write_text(json.dumps({key: state.get(key) for key in LASTING}) + '\n')
+        durable_replace(temporary, known)
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(state) + '\n')
+    temporary.replace(path)
+
+
 def main():
     interface = os.environ['CARPLAY_PRESENCE_INTERFACE']
     state_path = Path(os.environ['CARPLAY_PRESENCE_STATE'])
@@ -218,9 +262,9 @@ def main():
     state_path.parent.mkdir(parents=True, exist_ok=True)
     with state_path.with_suffix('.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        state = json.loads(state_path.read_text()) if state_path.exists() else {}
+        state = load_state(state_path)
         # Only who is known and who used the box last must survive a power cut; probes stay cheap.
-        lasting = json.dumps([state.get('phones'), state.get('last_phone')], sort_keys=True)
+        lasting = json.dumps([state.get(key) for key in LASTING], sort_keys=True)
         migrate(state, default_phone)
         command = sys.argv[1]
         boot = get_platform().boot_id()
@@ -324,12 +368,7 @@ def main():
                     ok = phone in paired and (phone in present or phone == new_phone)
             else:
                 raise ValueError('Unknown presence command')
-        temporary = state_path.with_suffix('.tmp')
-        temporary.write_text(json.dumps(state) + '\n')
-        if json.dumps([state.get('phones'), state.get('last_phone')], sort_keys=True) != lasting:
-            durable_replace(temporary, state_path)
-        else:
-            temporary.replace(state_path)
+        save_state(state_path, state, lasting)
         if ok and output:
             if not re.fullmatch(r'(?:[0-9A-F]{2}:){5}[0-9A-F]{2}', output):
                 return 1
@@ -337,17 +376,33 @@ def main():
         return 0 if ok else 1
 
 
-if __name__ == '__main__':
+def entry():
     try:
-        sys.exit(main())
+        return main()
+    except BluezNotReady:
+        # A normal moment, not an error: the bus socket appears a few seconds after a restart (2026-10-12).
+        if os.environ.get('CARPLAY_PRESENCE_STATE'):
+            note(Path(os.environ['CARPLAY_PRESENCE_STATE']), f'{sys.argv[1] if len(sys.argv) > 1 else "-"} BlueZ not ready yet')
+        return 1
     except Exception as error:
-        # No credentials, peer identifiers or raw messages; only the command and error type.
+        # No credentials, peer identifiers or raw messages: the command, the error type, the file it could
+        # not find (a system path) and where in this script it failed.
         try:
             log = Path(os.environ['CARPLAY_PRESENCE_STATE']).parent / 'presence-errors.log'
             lines = log.read_text().splitlines()[-19:] if log.exists() else []
-            lines.append(f'{time.monotonic():.1f} {sys.argv[1] if len(sys.argv) > 1 else "-"} {type(error).__name__}')
+            frames = traceback.extract_tb(error.__traceback__)
+            ours = [f for f in frames if Path(f.filename).name == Path(__file__).name][-1]
+            deepest = frames[-1]
+            missing = f' {error.filename}' if isinstance(error, OSError) and error.filename else ''
+            via = f' via {Path(deepest.filename).name}:{deepest.lineno}' if deepest is not ours else ''
+            lines.append(f'{time.monotonic():.1f} {sys.argv[1] if len(sys.argv) > 1 else "-"} {type(error).__name__}'
+                         f'{missing} at line {ours.lineno} {ours.name}{via}')
             log.write_text('\n'.join(lines) + '\n')
         except Exception:
             pass
         # Absence is the safe default.
-        sys.exit(1)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(entry())

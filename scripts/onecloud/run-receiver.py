@@ -40,16 +40,34 @@ def write_browser_access(root, token, settings_port=80):
     """Authorize viewers on the receiver LAN; admin login remains separate."""
     if not re.fullmatch(r"[0-9a-f]{32}", token):
         raise ValueError("Unexpected browser token format")
-    path = root / "playport/web/dist/receiver-access.js"
-    # The player links "Add iPhone / network" to this box's settings page (settings_page.py; port 80,
-    # or another one on OpenWrt, where LuCI has 80).
-    content = ("localStorage.setItem('playport-token'," + json.dumps(token) + ");\n"
-               f"window.playportBoxSettingsPort={int(settings_port)};\n")
-    temporary = path.with_suffix('.js.tmp')
+    dist = root / "playport/web/dist"
+    # Served by the receiver to the box's own page only (WebHub.ownPage): a script any site could include
+    # gave the token away (audit 2026-10-13, A2). The player links "Add iPhone / network" to this box's
+    # settings page (settings_page.py; port 80, or another one on OpenWrt, where LuCI has 80).
+    (dist / "receiver-access.js").unlink(missing_ok=True)
+    path = dist / "receiver-access.json"
+    content = json.dumps({"token": token, "settingsPort": int(settings_port)}) + "\n"
+    temporary = path.with_suffix('.json.tmp')
     temporary.write_text(content)
     temporary.chmod(0o644)
     temporary.replace(path)
     assert path.read_text() == content
+
+
+# The iAP2 trace's Wi-Fi configuration field, a quoted string with " and \ escaped.
+PASSPHRASE_FIELD = re.compile(r'(passphrase:\s*)"(?:[^"\\]|\\.)*"')
+
+
+def redact(line, token, password):
+    """A receiver log line without the viewer token or the hotspot password."""
+    line = line.replace(token, "[REDACTED]")
+    if line.lstrip().startswith("raw-body="):
+        # The iAP2 trace's hex preview of a frame: for the Wi-Fi configuration it held the first
+        # bytes of the password, which the plain-text redaction cannot see (2026-10-12).
+        return line[:line.index("raw-body=")] + "raw-body=[not logged]\n"
+    # The trace escapes " and \ in the password, so a plain replace missed such passwords (review 2026-10-12).
+    line = PASSPHRASE_FIELD.sub(r'\1"[REDACTED]"', line)
+    return line.replace(password, "[REDACTED]") if password else line
 
 
 def main():
@@ -73,6 +91,8 @@ def main():
     parser.add_argument("--wired-status", type=Path, help="where the receiver writes the wired CarPlay phase")
     parser.add_argument("--java", default="/usr/bin/java", help="Java 21 (OpenWrt: the dashplay-jre package)")
     parser.add_argument("--settings-port", type=int, default=80, help="port of the box settings page")
+    parser.add_argument("--idle-release", type=int, default=300,
+                        help="end wireless CarPlay after this many seconds without a viewer page (0: never)")
     parser.add_argument("--no-wireless", action="store_true",
                         help="no Bluetooth/Wi-Fi handoff (car_hotspot mode: the iPhone uses the cable only)")
     args = parser.parse_args()
@@ -122,6 +142,7 @@ def main():
         env["CARPLAY_WIRED_STATUS"] = str(args.wired_status)
     if args.bind_wait:
         env["CARPLAY_BIND_WAIT_MS"] = str(args.bind_wait * 1000)
+    env["CARPLAY_IDLE_RELEASE_SECONDS"] = str(max(0, args.idle_release))
     # AppCDS keeps working after jar updates only if the archive is rebuilt; this JDK mapped a stale
     # archive, logged "shared class paths mismatch" and neither used nor re-dumped it (2026-10-10),
     # costing ~3 s per start. Drop the archive whenever any classpath jar changes.
@@ -164,12 +185,8 @@ def main():
     ) as process:
         (state / "java.pid").write_text(str(process.pid) + "\n")
         for line in process.stdout:
-            line = line.replace(token, "[REDACTED]")
-            if line.lstrip().startswith("raw-body="):
-                # The iAP2 trace's hex preview of a frame: for the Wi-Fi configuration it held the first
-                # bytes of the password, which the plain-text redaction below cannot see (2026-10-12).
-                line = line[:line.index("raw-body=")] + "raw-body=[not logged]\n"
-            print(line.replace(password, "[REDACTED]") if password else line, end="", flush=True)
+            line = redact(line, token, password)
+            print(line, end="", flush=True)
             # The JVM's timestamps follow the wall clock, which jumps when time is synced during boot
             # (~27 s on 2026-10-11); mark milestones on the boot clock, comparable with "boot" lines.
             milestone = next((name for key, name in MILESTONES if key in line), None)

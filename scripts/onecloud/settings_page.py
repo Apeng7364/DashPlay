@@ -1,4 +1,4 @@
-"""Plain-HTTP settings page on port 80: first-run setup, phones, hotspots, status, CA.
+"""Plain-HTTP settings page on port 80: first-run setup, phones, hotspots, status, CA, own DuckDNS name.
 
 Reachable in both modes (box hotspot: http://192.168.78.1/, car hotspot: http://<box address>/, and
 http://dashplay.local/ in either). Only clients on the box's own LAN subnets may use it. Secrets are
@@ -12,11 +12,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
 import os
+import tempfile
 from pathlib import Path
 import secrets
 import threading
 import urllib.parse
 
+import own_domain
 from pairing_window import PairingWindow
 import settings_ui as ui
 import setup_wizard
@@ -33,26 +35,33 @@ def _load(path: Path):
         return None
 
 
+_SAVING = threading.Lock()
+
+
 def _save(path: Path, value):
-    tmp = path.with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as out:
-        json.dump(value, out)
-        out.flush()
-        os.fsync(out.fileno())
-    tmp.replace(path)
-    os.sync()   # the root fs commits only every 120 s; saved settings must survive switching the car off
+    # Requests run in threads: one save at a time, each with its own temporary file (a double-click on save
+    # wrote both into one .tmp and failed the second rename; review 2026-10-12).
+    with _SAVING:
+        fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as out:
+            json.dump(value, out)
+            out.flush()
+            os.fsync(out.fileno())
+        Path(name).replace(path)
+        os.sync()   # the root fs commits only every 120 s; saved settings must survive switching the car off
 
 
 def _hotspot_credentials(form, old):
     ssid = (form.get("ssid") or "").strip()
-    if not 1 <= len(ssid.encode()) <= 32:
-        raise ValueError("热点名称为 1–32 字节。")
+    if not 1 <= len(ssid.encode()) <= 32 or any(ord(c) < 32 or ord(c) == 127 for c in ssid):
+        raise ValueError("热点名称为 1–32 字节，不能含换行等控制字符。")
     password = form.get("password", "")
     if not password:
         password = old.get("passphrase", "")
-    if not 8 <= len(password) <= 63:
-        raise ValueError("热点密码为 8–63 个字符。")
+    # WPA: 8–63 printable ASCII characters. A newline also became its own hostapd line (review 2026-10-12).
+    if not (8 <= len(password) <= 63 and all(32 <= ord(c) <= 126 for c in password)):
+        raise ValueError("热点密码为 8–63 个英文字母、数字或符号（可含空格）。")
     return ssid, password
 
 
@@ -105,6 +114,7 @@ class SettingsPage:
         self.car_file = state / "car-hotspot.json"
         self.wired_status = wired_status
         self.hotspot_file = state / "hotspot.json"
+        self.ddns_file = state / "ddns.json"
         self.ca_file = state / "tls" / "ca.crt"
         self.status, self.on_change, self.allowed = status, on_change, allowed_networks
         self.scanner = scanner
@@ -264,11 +274,69 @@ class SettingsPage:
                 return f"已保存。盒子下次打开自己的热点时使用「{ssid}」。"
             self.apply_later("box hotspot changed")
             return ("page", self.reconnect_page(ssid, "正在更改盒子热点"))
+        if path == "/ddns":
+            self.check_nonce(form)
+            return self.save_ddns(form)
         if path == "/retry":
             self.check_nonce(form)
             self.on_change("retry requested")
             return f"正在重新连接{network_label(self.setup().get('mode'))}。"
         raise ValueError("未知操作。")
+
+    def save_ddns(self, form):
+        """Own DuckDNS name (own_domain.py); a new name or turning it off drops the old name's certificate."""
+        old = own_domain.load(self.state)
+        if form.get("action") == "clear":
+            self.ddns_file.unlink(missing_ok=True)
+            own_domain.forget_certificate(self.state)
+            self.apply_later("own domain cleared")
+            return "已关闭自己的域名，盒子约 1 分钟后改回自带证书。"
+        domain = own_domain.sub_domain(form.get("domain"))
+        token = (form.get("token") or "").strip()
+        if not token and old and old["domain"] == domain:
+            token = old["token"]   # left empty: keep the saved one
+        token = own_domain.check_token(token)
+        if not old or old["domain"] != domain:
+            own_domain.forget_certificate(self.state)
+        # Public IPv6 only where the box joins a hotspot: on its own hotspot it has no public address.
+        ipv6 = form.get("ipv6") == "on" and self.setup().get("mode") in setup_wizard.JOINS
+        _save(self.ddns_file, {"domain": domain, "token": token, **({"ipv6": True} if ipv6 else {})})
+        self.apply_later("own domain saved")
+        return (f"已保存 {domain}{own_domain.SUFFIX}。盒子约 1 分钟后重启服务，联网时自动更新解析并申请正式证书"
+                "（几分钟），下次开机起用。")
+
+    def ddns_block(self, nonce, mode):
+        """Advanced: the own DuckDNS name. On OpenWrt LuCI sets it; this page only tells how it is going."""
+        name = self.status().get("own_name")
+        if self.managed:
+            return (f'<div class=cell><span class=main><b>自己的域名</b><span>{escape(own_domain.message(self.state, name))}'
+                    f'</span></span><span class=value>{escape(name)}</span></div>') if name else ""
+        ddns = own_domain.load(self.state) or {}
+        form = (f'<form method=post action=/ddns>{ui.hidden(nonce)}<div class=group>'
+                f'<label class=cell><span class=main><b>子域名</b></span><input type=text name=domain '
+                f'value="{escape(ddns.get("domain", ""))}" placeholder="如 mycar" required autocapitalize=off '
+                'style="text-align:right"></label>'
+                '<label class=cell><span class=main><b>Token</b></span><input type=password name=token '
+                f'placeholder="{"留空表示不修改" if ddns else "必填"}" autocomplete=off style="text-align:right"></label>'
+                + ('<label class=cell><span class=main><b>同时登记公网 IPv6</b><span>车机不让打开 192.168.x.x 这类局域网地址时才勾选</span>'
+                   f'</span><input type=checkbox name=ipv6 value=on{" checked" if ddns.get("ipv6") else ""}></label>'
+                   if mode in setup_wizard.JOINS else "") + '</div>'
+                '<button class="btn plain" name=action value=save>保存</button></form>'
+                + (f'<form method=post action=/ddns>{ui.hidden(nonce)}<button class="btn plain" name=action value=clear '
+                   'onclick="return confirm(\'关闭后车机改用盒子自带证书的地址，确定？\')">关闭</button></form>' if ddns else ""))
+        state = own_domain.message(self.state, name, mode == "box_hotspot") if ddns else ""
+        ipv6 = ('勾选「同时登记公网 IPv6」后，盒子把自己的公网 IPv6 地址也登记到这个域名：车机拿到的是公网地址，'
+                '画面仍在同一个 WiFi 里直接传。需要车机热点或随身 WiFi 给设备分配 IPv6；这个地址在 DuckDNS 上谁都查得到，'
+                '所以盒子同时开启防火墙，只让同一个 WiFi 里的设备连进来。' if mode in setup_wizard.JOINS else
+                '盒子热点方式没有公网地址，车机不让打开局域网地址的问题无法用这个办法解决。')
+        return (f'<details><summary class=cell><span class=main><b>自己的域名</b><span>证书警告点不过去，或不让打开局域网地址</span></span>'
+                f'<span class=value>{escape(name or "未设置")}</span><span class=chev></span></summary>'
+                f'<div class=inner style="padding:0 0 12px">{form}'
+                + (f'<p class=foot>{escape(state)}</p>' if state else "") +
+                '<p class=foot>在 duckdns.org 免费注册并建一个子域名，把子域名和页面上的 token 填在这里。盒子会把这个域名指向自己，'
+                '并向 Let’s Encrypt 申请免费的正式证书、到期前自动续签；车机改用 https://子域名.duckdns.org:18443/ 打开，'
+                f'不再有证书警告。不需要开放任何端口。{ipv6}'
+                + ('盒子热点方式在车上没有网络，申请和续签要在家插上网线开机。' if mode == "box_hotspot" else "") + '</p></div></details>')
 
     def save_hotspot(self, form):
         old = _load(self.hotspot_file) or {}
@@ -555,15 +623,26 @@ class SettingsPage:
             network += (f'<form method=post action=/retry>{ui.hidden(nonce)}'
                         f'<button class="cell action">立即重试{label}</button></form>')
         if self.managed:
+            admin = self.managed["admin"]
+            if admin.startswith("/"):
+                # On the router's own web server (port 80), not on this page's port (a 404 there).
+                host = urllib.parse.urlsplit(status.get("home", "")).hostname
+                admin = f"http://{host}{admin}" if host else admin
             network = (f'<div class=cell><span class=main><b>交给 iPhone 的 WiFi</b></span>'
                        f'<span class=value>{escape(status.get("ssid", "") or "等待 WiFi")}</span></div>'
-                       f'<a class=cell href="{escape(self.managed["admin"])}"><span class=main><b>在 {self.managed["by"]} 后台设置 WiFi</b>'
+                       f'<a class=cell href="{escape(admin)}"><span class=main><b>在 {self.managed["by"]} 后台设置 WiFi</b>'
                        '<span>WiFi 名称、密码或信道改了以后，DashPlay 会自动跟着改</span></span><span class=chev></span></a>')
             if status.get("warning"):
                 fallback = ui.banner(escape(status["warning"]), "bad")
+        # Why the head unit may not open the picture, and what to do, in the order to try (2026-10-13).
+        reach = (('<a class=cell href="/ca.crt"><span class=main><b>下载盒子 CA 证书</b><span>装到车机上，证书警告就没了</span></span><span class=chev></span></a>'
+                  if self.ca_file.exists() else "") + self.ddns_block(nonce, mode))
+        reach_foot = ("" if self.managed else
+                      "一般用不到。按顺序试：① 车机提示证书不安全，点「继续访问」即可。② 没有「继续访问」：在车机上装盒子 CA 证书；"
+                      "车机不让装，就设置「自己的域名」。③ 车机不让打开 192.168.x.x 这类局域网地址：设置「自己的域名」并勾选"
+                      "「同时登记公网 IPv6」（方式一、方式二）。")
         advanced = ('<a class=cell href="/diag.txt"><span class=main><b>下载诊断记录</b><span>画面卡顿、断线时，把它交给 AI 助手或开发者分析</span></span><span class=chev></span></a>'
-                    + ('<a class=cell href="/ca.crt"><span class=main><b>下载盒子 CA 证书</b><span>车机浏览器不接受盒子证书时，装上它即可</span></span><span class=chev></span></a>'
-                       if self.ca_file.exists() else "") + ("" if self.managed else
+                    + ("" if self.managed else
                     f'<form method=post action=/reset>{ui.hidden(nonce)}<button class="cell destructive" '
                     'onclick="return confirm(\'清除使用方式、热点和所有已添加的手机，回到首次设置？\')">重新进行首次设置</button></form>'))
         body = (f'<h1 class=span>盒子设置</h1>{notice}{self.chain(devices, presence, phase, wired)}'
@@ -571,6 +650,7 @@ class SettingsPage:
                 + self.entries_block(status, False)
                 + block + '</div><div>'
                 + ui.group("网络", network)
-                + ui.group("高级", advanced, "" if self.managed else "重新进行首次设置可以更换使用方式，会保留盒子证书和盒子热点密码。")
+                + (ui.group("车机打不开画面时", reach, reach_foot) if reach else "")
+                + ui.group("高级", advanced, "" if self.managed else "重新进行首次设置可以更换使用方式，会保留盒子证书、自己的域名和盒子热点密码。")
                 + '</div>')
         return ui.page("盒子设置", body, refresh, wide=True)

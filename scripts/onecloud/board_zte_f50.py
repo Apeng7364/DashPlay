@@ -32,6 +32,37 @@ def local_address():
     return ":".join(f"{b:02X}" for b in [first] + [secrets.randbits(8) for _ in range(5)])
 
 
+def stop_children(children, timeout=6):
+    """Stop every child (each in its own process group) within one deadline: one after the other, 8 s each,
+    outlasted the supervisor's wait for this helper, which was then killed with the children left running."""
+    for _, child in children:
+        if child.poll() is None:
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    until = time.monotonic() + timeout
+    for _, child in children:
+        try:
+            child.wait(timeout=max(0.0, until - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+
+
+def kill_leftovers(runtime):
+    """dbus-daemon, btattach and bluetoothd of this BlueZ left by a helper that was killed: they keep hci0."""
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            if os.readlink(proc / "exe").startswith(str(runtime) + "/"):
+                os.kill(int(proc.name), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+
+
 def setup(runtime):
     """Private BlueZ + D-Bus root from the device's own (signed) package feeds; no package scripts run."""
     subprocess.run(["apk", "add", "--root", str(runtime), "--initdb", "--no-scripts", "--keys-dir", "/etc/apk/keys",
@@ -100,6 +131,10 @@ def main():
         radios = [p for p in Path("/sys/class/rfkill").glob("rfkill*") if (p / "type").read_text().strip() == "bluetooth"]
         if len(radios) != 1:
             raise SystemExit("expected exactly one built-in Bluetooth rfkill")
+        kill_leftovers(runtime)
+        until = time.monotonic() + 5
+        while list(Path("/sys/class/bluetooth").glob("hci*")) and time.monotonic() < until:
+            time.sleep(0.2)
         if list(Path("/sys/class/bluetooth").glob("hci*")):
             raise SystemExit("an HCI controller already exists (is the old f50-carplay service still running?)")
         (radios[0] / "state").write_text("0\n")
@@ -126,13 +161,7 @@ def main():
                     raise SystemExit(f"{name} exited with {child.returncode}")
             time.sleep(2)
     finally:
-        for _, child in reversed(children):
-            if child.poll() is None:
-                os.killpg(child.pid, signal.SIGTERM)
-                try:
-                    child.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
+        stop_children(list(reversed(children)))
 
 
 if __name__ == "__main__":
