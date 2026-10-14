@@ -62,7 +62,8 @@ cp "$work/acme.sh-$ACME_VERSION/LICENSE.md" "$stage/acme/LICENSE.md"
 chmod 755 "$stage/acme/acme.sh"
 
 cp "$repo"/scripts/onecloud/firmware/install.sh "$repo"/scripts/onecloud/firmware/prepare-image.sh \
-   "$repo"/scripts/onecloud/firmware/dashplay-firstboot.service "$repo/scripts/onecloud/board-probe.sh" "$stage/firmware/"
+   "$repo"/scripts/onecloud/firmware/dashplay-firstboot.service "$repo"/scripts/onecloud/firmware/upgrade.py \
+   "$repo/scripts/onecloud/board-probe.sh" "$stage/firmware/"
 printf '{\n  "interface": "auto",\n  "address": "192.168.78.1/24",\n  "channel": 149,\n  "width": 80\n}\n' > "$stage/service.json"
 printf '{"ssid": "DashPlay"}\n' > "$stage/state/hotspot.json"
 find "$stage" -name __pycache__ -type d -prune -exec rm -rf {} +

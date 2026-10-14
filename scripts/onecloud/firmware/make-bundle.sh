@@ -51,7 +51,7 @@ cp "$repo/licenses/dbus-next-0.2.3-MIT.txt" "$stage/linux-bt-bridge/deps/dbus_ne
 cp -R "$repo/research/playport/web/dist" "$stage/playport/web/dist"
 rm -rf "$stage/playport/web/dist/receiver-access.js" "$stage/playport/web/dist/receiver-access.json" "$stage/playport/web/dist/experiments"   # private tablet tests
 cp "$repo"/scripts/onecloud/firmware/install.sh "$repo"/scripts/onecloud/firmware/prepare-image.sh \
-   "$repo"/scripts/onecloud/firmware/dashplay-firstboot.service "$stage/firmware/"
+   "$repo"/scripts/onecloud/firmware/dashplay-firstboot.service "$repo"/scripts/onecloud/firmware/upgrade.py "$stage/firmware/"
 printf '{\n  "interface": "auto",\n  "address": "192.168.78.1/24",\n  "channel": 149,\n  "width": 80\n}\n' > "$stage/service.json"
 printf '{"ssid": "DashPlay"}\n' > "$stage/state/hotspot.json"
 

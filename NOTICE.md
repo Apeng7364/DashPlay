@@ -6,7 +6,9 @@ patches and tools for PlayPort and must stay under the same license.
 - **PlayPort** — <https://github.com/youcci/playport> (GPL-3.0). The patches in `patches/` modify
   PlayPort at commit `9a0882dd0ffe48e467b59d58b12d81391df55ade`; PlayPort source is not copied here.
 - **DiPlay** by shihabal3amri and **xcertplay** by shilapi (GPL-3.0) — the protocol stack PlayPort
-  derives from.
+  derives from. The CarPlay view areas in `patches/playport-view-areas.patch` (several areas in /info and
+  `updateViewArea` to switch between them without reconnecting) follow DiPlay pull request #246 and its
+  `docs/VIEW_AREAS.md` <https://github.com/shihabal3amri/DiPlay>.
 - **WheelPlay** — <https://github.com/fython/wheelplay> (GPL-3.0), commit
   `c1bd07717c8e87a3130ef03477d2ca318fb66caa`. The iAP2 file-transfer (album artwork) receiver in
   `patches/playport-car-viewer.patch` is ported from it, and so are the wired CarPlay transport

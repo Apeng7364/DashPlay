@@ -1,0 +1,9 @@
+--- a/spd_dump.c
++++ b/spd_dump.c
+@@ -900 +900,5 @@
+-			get_partition_info(io, name, 0);
++			/* Read-only whole-user-area access; bypass NV alias conversion by using GPT offsets. */
++			if (!strcmp(name, "user_partition")) {
++				strcpy(gPartInfo.name, name);
++				gPartInfo.size = check_partition(io, name, 0);
++			} else get_partition_info(io, name, 0);

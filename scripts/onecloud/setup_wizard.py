@@ -14,6 +14,7 @@ DNS answers every name with the box, so a phone joins without a password and ope
 itself (captive portal). The daily box hotspot is always WPA2 and never captive. Older files migrate:
 a box with a saved car hotspot becomes "car_hotspot".
 """
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,33 @@ SCAN_CACHE_SECONDS = 20
 # names in four scans, 12 together; the OneCloud listed 7-10). The list adds scans up and keeps a hotspot until
 # it was not seen for this long.
 SCAN_KEEP_SECONDS = 120
+
+
+# Tesla's browser opens no private address (10/8, 172.16/12, 192.168/16), by name or not, and its Wi-Fi does
+# not use IPv6 there; the shared address space 100.64.0.0/10 (RFC 6598) is not private, and a LAN numbered
+# 100.96.0.1/24 opens (a friend's F50, 2026-10-14). OpenWrt moves its LAN there (shared_lan), the box its own
+# hotspot (Tesla mode, box_hotspot_address); a joined hotspot is numbered by its owner.
+SHARED_LAN = ipaddress.IPv4Interface("100.96.0.1/24")
+SHARED_SPACE = ipaddress.IPv4Network("100.64.0.0/10")
+
+
+def box_hotspot_address(usual, tesla, local_addresses):
+    """The box hotspot's address and why it is not the one asked for (None when it is): SHARED_LAN in Tesla mode,
+    unless another interface (the Ethernet at home, say) already has an address in that network."""
+    if not tesla:
+        return usual, None
+    for other in local_addresses:
+        if other.version == 4 and other.ip != SHARED_LAN.ip and other.network.overlaps(SHARED_LAN.network):
+            return usual, f"另一个网口已在用 {other}，盒子热点仍用 {usual.ip}，特斯拉可能打不开"
+    return SHARED_LAN, None
+
+
+def tesla_reaches(address):
+    """Whether a Tesla's browser opens this box address (not a private one)."""
+    try:
+        return ipaddress.IPv4Address(address) in SHARED_SPACE
+    except ValueError:
+        return False
 
 
 MODES = ("car_hotspot", "mifi", "box_hotspot")

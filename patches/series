@@ -37,3 +37,6 @@ playport-own-page-http2.patch
 playport-idle-release.patch
 playport-idle-release-setting.patch
 playport-viewer-drive-fixes.patch
+playport-viewer-tesla.patch
+playport-view-areas.patch
+playport-car-bluetooth.patch

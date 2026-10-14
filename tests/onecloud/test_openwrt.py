@@ -12,7 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/onecloud')
 import platform_openwrt as ow
 from settings_page import SettingsPage
 import setup_wizard
-from supervisor_openwrt import name_changes, read_config, trusted_networks
+import supervisor_openwrt
+from supervisor_openwrt import (name_changes, read_config, trusted_networks, shared_lan_changes,
+                               shared_lan_conflict, apply_shared_lan, car_audio_args)
 
 # Shape of `ubus call network.wireless status` on OpenWrt 25.12 (two radios, a 2.4 GHz AP listed first).
 WIRELESS = {
@@ -111,7 +113,7 @@ class TrustedNetworkTests(unittest.TestCase):
 
 # `ip -6 -o addr show scope global` and `ip -6 -o route show default` on the F50 (2026-10-13): the public
 # address is on the mobile modem; the LAN has a unique local prefix and hands the modem's /64 on by relay.
-F50_ADDR = """13: sipa_eth0    inet6 2408:8409:8500:5dd4:3439:f3ff:fe2a:e97f/64 scope global dynamic mngtmpaddr \\       valid_lft forever preferred_lft forever
+F50_ADDR = """13: sipa_eth0    inet6 2408:8409:8500:1d4:a00:1ff:fe00:1/64 scope global dynamic mngtmpaddr \\       valid_lft forever preferred_lft forever
 34: br-lan    inet6 fd9e:30a4:d99::1/60 scope global noprefixroute \\       valid_lft forever preferred_lft forever
 """
 F50_ROUTE = """default via fe80::1 dev sipa_eth0 proto ra metric 1024 expires 62108sec pref medium
@@ -121,7 +123,7 @@ default via fe80::1 dev sipa_eth0 proto static metric 4096 pref medium
 
 class PublicIpv6Tests(unittest.TestCase):
     def test_the_modems_address_when_the_lan_has_only_a_local_prefix(self):
-        self.assertEqual(ow.public_ipv6(F50_ADDR, F50_ROUTE, "br-lan"), "2408:8409:8500:5dd4:3439:f3ff:fe2a:e97f")
+        self.assertEqual(ow.public_ipv6(F50_ADDR, F50_ROUTE, "br-lan"), "2408:8409:8500:1d4:a00:1ff:fe00:1")
 
     def test_an_address_on_the_lan_comes_first(self):
         delegated = F50_ADDR + "34: br-lan    inet6 240e:3b0:1234:5600::1/64 scope global dynamic noprefixroute \\ valid_lft 3000sec\n"
@@ -147,7 +149,7 @@ dhcp.cfg01411c.domain='lan'
 dhcp.cfg01411c.local='/lan/'
 dhcp.lan=dhcp
 """
-NAME, LAN_IP, PUBLIC = "car.duckdns.org", "192.168.77.1", "2408:8409:8500:5dd4:3439:f3ff:fe2a:e97f"
+NAME, LAN_IP, PUBLIC = "car.duckdns.org", "192.168.77.1", "2408:8409:8500:1d4:a00:1ff:fe00:1"
 
 
 def applied(uci, changes):
@@ -211,6 +213,162 @@ class NameRecordTests(unittest.TestCase):
         self.assertIn("'/dashplay.lan/'", renamed)
 
 
+# `uci -q show network` and `ip -4 -o addr show` of the F50 (2026-10-14), without its Tailscale line.
+NETWORK = """network.lan=interface
+network.lan.device='br-lan'
+network.lan.proto='static'
+network.lan.ipaddr='192.168.77.1'
+network.lan.ip6assign='60'
+network.lan.netmask='255.255.255.0'
+network.wan=interface
+network.wan.proto='dhcp'
+"""
+ADDRESSES = """1: lo    inet 127.0.0.1/8 scope host lo
+13: sipa_eth0    inet 10.123.116.156/8 scope global sipa_eth0
+34: br-lan    inet 192.168.77.1/24 brd 192.168.77.255 scope global br-lan
+"""
+
+
+class SharedLanTests(unittest.TestCase):
+    """uci dashplay.main.shared_lan: the LAN moves to 100.96.0.1/24 for browsers refusing private addresses (Tesla)."""
+
+    def test_on_moves_the_lan_and_remembers_its_address(self):
+        changes, remember, why = shared_lan_changes(NETWORK, "lan", True)
+        after = applied(NETWORK, changes)
+        self.assertEqual(why, "")
+        self.assertIn("network.lan.ipaddr='100.96.0.1'", after)
+        self.assertIn("network.lan.netmask='255.255.255.0'", after)
+        self.assertEqual(remember, {"ipaddr": "192.168.77.1", "netmask": "255.255.255.0"})
+        self.assertEqual(shared_lan_changes(after, "lan", True, remember)[0], [], "nothing to do when current")
+        self.assertIn("network.wan.proto='dhcp'", after, "other interfaces untouched")
+
+    def test_off_puts_the_address_back_once(self):
+        changes, remember, _ = shared_lan_changes(NETWORK, "lan", True)
+        moved = applied(NETWORK, changes)
+        back_changes, kept, _ = shared_lan_changes(moved, "lan", False, remember)
+        back = applied(moved, back_changes)
+        self.assertIn("network.lan.ipaddr='192.168.77.1'", back)
+        self.assertIsNone(kept)
+        self.assertEqual(shared_lan_changes(back, "lan", False, None)[0], [], "off and nothing remembered: no change")
+
+    def test_an_address_with_prefix_length_comes_back_without_netmask(self):
+        cidr = "network.lan=interface\nnetwork.lan.proto='static'\nnetwork.lan.ipaddr='192.168.1.1/24'\n"
+        changes, remember, _ = shared_lan_changes(cidr, "lan", True)
+        moved = applied(cidr, changes)
+        back = applied(moved, shared_lan_changes(moved, "lan", False, remember)[0])
+        self.assertIn("network.lan.ipaddr='192.168.1.1/24'", back)
+        self.assertNotIn("netmask", back)
+
+    def test_an_address_changed_by_hand_since_is_left_alone(self):
+        moved = applied(NETWORK, shared_lan_changes(NETWORK, "lan", True)[0])
+        by_hand = moved.replace("100.96.0.1", "10.10.0.1")
+        changes, kept, _ = shared_lan_changes(by_hand, "lan", False, {"ipaddr": "192.168.77.1", "netmask": "255.255.255.0"})
+        self.assertEqual((changes, kept), ([], None))
+
+    def test_a_lan_without_one_static_address_is_not_changed(self):
+        for uci in (NETWORK.replace("proto='static'", "proto='dhcp'"),
+                    NETWORK.replace("ipaddr='192.168.77.1'", "ipaddr='192.168.77.1/24' '192.168.78.1/24'")):
+            changes, _, why = shared_lan_changes(uci, "lan", True)
+            self.assertEqual(changes, [])
+            self.assertTrue(why)
+
+    def test_tailscale_or_an_overlapping_interface_refuses(self):
+        self.assertEqual(shared_lan_conflict(ADDRESSES, "br-lan"), "")
+        with_tailscale = ADDRESSES + "37: tailscale0    inet 100.102.205.24/32 scope global tailscale0\n"
+        drop = ('\t\tiifname != "tailscale0*" ip saddr 100.64.0.0/10 counter packets 0 bytes 0 drop\n')   # F50, 2026-10-14
+        self.assertIn("netfilter-mode=off", shared_lan_conflict(with_tailscale, "br-lan", "table ip ts-filter {\n" + drop))
+        self.assertIn("Tailscale", shared_lan_conflict(with_tailscale, "br-lan", None), "rules unreadable: assume the drop")
+        self.assertEqual(shared_lan_conflict(with_tailscale, "br-lan", "table inet fw4 {\n}\n"), "",
+                         "Tailscale with --netfilter-mode=off adds no drop")
+        self.assertEqual(shared_lan_conflict(ADDRESSES, "br-lan", "table ip ts-filter {\n" + drop), "",
+                         "rules left behind without Tailscale running")
+        self.assertTrue(shared_lan_conflict(ADDRESSES.replace("10.123.116.156/8", "100.96.0.7/22"), "br-lan"))
+        moved = ADDRESSES.replace("192.168.77.1/24 brd 192.168.77.255", "100.96.0.1/24 brd 100.96.0.255")
+        self.assertEqual(shared_lan_conflict(moved, "br-lan"), "", "the LAN itself already there is fine")
+
+    def test_runtime_overlap_appears_and_clears_without_changing_network(self):
+        from types import SimpleNamespace
+        status = {"warning": "other warning"}
+        address = [ADDRESSES]
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args)
+            return SimpleNamespace(returncode=0, stdout=address[0] if args[0] == "ip" else "")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(supervisor_openwrt.subprocess, "run", run):
+            path = Path(tmp) / "network-status.json"
+            refresh = supervisor_openwrt.refresh_network_warning
+            refresh(True, "br-lan", status, "other warning", path)
+            self.assertEqual(status["warning"], "other warning")
+            address[0] = ADDRESSES.replace("10.123.116.156/8", "100.96.0.7/24")
+            refresh(True, "br-lan", status, "other warning", path)
+            self.assertIn("冲突", status["warning"])
+            self.assertEqual(json.loads(path.read_text())["warning"], status["warning"])
+            address[0] = ADDRESSES
+            refresh(True, "br-lan", status, "other warning", path)
+            self.assertEqual(status["warning"], "other warning")
+            self.assertTrue(all(c[0] in ("ip", "nft") for c in calls))
+
+    def test_apply_changes_uci_reloads_the_network_and_puts_it_back(self):
+        uci = {"network": NETWORK}
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args)
+            out = ""
+            if args[:3] == ["uci", "-q", "show"]:
+                out = uci["network"]
+            elif args[:4] == ["ip", "-4", "-o", "addr"]:
+                out = ADDRESSES
+            elif args[:2] == ["nft", "list"]:
+                out = "table inet fw4 {\n}\n"
+            elif args[:4] == ["ubus", "call", "hostapd.phy0-ap0", "get_clients"]:
+                out = json.dumps({"freq": 5180, "clients": {"02:00:00:00:00:a1": {"auth": True}, "02:00:00:00:00:a2": {}}})
+            elif args[0] == "uci" and args[1] != "commit":
+                uci["network"] = applied(uci["network"], [args[1:]])
+            return supervisor_openwrt.subprocess.CompletedProcess(args, 0, out, "")
+
+        network = {"mode": "ap", "network": "lan", "device": "br-lan", "ifname": "phy0-ap0"}
+        said = []
+        with tempfile.TemporaryDirectory() as tmp, patch.object(supervisor_openwrt.subprocess, "run", run), \
+                patch.object(supervisor_openwrt, "ROLLBACK_PENDING", Path(tmp) / "snapshot-files"):
+            state = Path(tmp)
+            self.assertEqual(apply_shared_lan(True, network, state, said.append), (True, ""))
+            self.assertIn("network.lan.ipaddr='100.96.0.1'", uci["network"])
+            self.assertEqual(json.loads((state / "lan-before.json").read_text())["ipaddr"], "192.168.77.1")
+            self.assertIn(["/etc/init.d/network", "reload"], calls)
+            kicked = [json.loads(c[4])["addr"] for c in calls if c[:4] == ["ubus", "call", "hostapd.phy0-ap0", "del_client"]]
+            self.assertEqual(sorted(kicked), ["02:00:00:00:00:a1", "02:00:00:00:00:a2"],
+                             "every station rejoins for an address in the new LAN")
+            self.assertGreater(calls.index(["ubus", "call", "hostapd.phy0-ap0", "get_clients"]),
+                               calls.index(["/etc/init.d/network", "reload"]), "after the LAN has its new address")
+            self.assertEqual(apply_shared_lan(True, network, state, said.append), (False, ""), "already there")
+            self.assertEqual(apply_shared_lan(False, network, state, said.append), (True, ""))
+            self.assertIn("network.lan.ipaddr='192.168.77.1'", uci["network"])
+            self.assertFalse((state / "lan-before.json").exists())
+            changed, warning = apply_shared_lan(True, dict(network, mode="sta"), state, said.append)
+            self.assertFalse(changed)
+            self.assertIn("路由器自己的 WiFi", warning)
+            self.assertIn("network.lan.ipaddr='192.168.77.1'", uci["network"])
+
+
+    def test_waits_while_a_luci_apply_awaits_its_confirm(self):
+        import threading
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(supervisor_openwrt, "ROLLBACK_PENDING", Path(tmp) / "snapshot-files"):
+            snapshot = Path(tmp) / "snapshot-files"
+            snapshot.mkdir()
+            (snapshot / "dashplay").write_text("old")
+            stopped = threading.Event()
+            done = threading.Event()
+            worker = threading.Thread(target=lambda: (supervisor_openwrt.wait_for_confirm(stopped, 30), done.set()))
+            worker.start()
+            self.assertFalse(done.wait(1.5), "waits while the snapshot is there")
+            (snapshot / "dashplay").unlink()   # confirmed: rpcd purges the snapshot
+            self.assertTrue(done.wait(3))
+            worker.join()
+            supervisor_openwrt.wait_for_confirm(stopped, 30)   # no snapshot at all: at once
+
+
 class ConfigTests(unittest.TestCase):
     def test_idle_release_defaults_to_five_minutes_and_can_be_turned_off(self):
         self.assertEqual(read_config("")["idle_release"], "300")
@@ -218,6 +376,23 @@ class ConfigTests(unittest.TestCase):
 
     def test_the_public_ipv6_address_is_off_by_default(self):
         self.assertEqual(read_config("")["public_ipv6"], "0")
+
+    def test_the_shared_lan_is_off_by_default(self):
+        self.assertEqual(read_config("")["shared_lan"], "0")
+
+    def test_tesla_mode_is_off_by_default(self):
+        self.assertEqual(read_config("")["tesla_mode"], "0")
+
+    def test_the_car_bluetooth_switches_reach_the_receiver_on_their_own(self):
+        self.assertEqual(car_audio_args(read_config("")), [])
+        self.assertEqual(car_audio_args(read_config("dashplay.main.car_music='1'\n")), ["--car-music"])
+        self.assertEqual(car_audio_args(read_config("dashplay.main.car_voice='1'\n")), ["--car-voice"])
+        self.assertEqual(car_audio_args(read_config("dashplay.main.car_music='1'\ndashplay.main.car_voice='1'\n")),
+                         ["--car-music", "--car-voice"])
+
+    def test_tesla_mode_is_all_of_them(self):
+        self.assertEqual(car_audio_args(read_config("dashplay.main.tesla_mode='1'\ndashplay.main.car_music='0'\n")),
+                         ["--tesla"])
 
     def test_uci_options_override_defaults(self):
         config = read_config("dashplay.main=dashplay\ndashplay.main.wifi='wwan'\ndashplay.main.settings_port='18090'\n")

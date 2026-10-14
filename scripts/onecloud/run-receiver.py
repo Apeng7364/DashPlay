@@ -36,8 +36,10 @@ def durable_write(path, text):
         os.close(directory)
 
 
-def write_browser_access(root, token, settings_port=80):
-    """Authorize viewers on the receiver LAN; admin login remains separate."""
+def write_browser_access(root, token, settings_port=80, car_music=False, tesla=False):
+    """Authorize viewers on the receiver LAN; admin login remains separate. car_music: the music goes over the car's
+    own Bluetooth (the page leaves the media card and keys to the car, prompts louder); tesla: also the Tesla
+    browser's ways (fullscreen through a listed video site)."""
     if not re.fullmatch(r"[0-9a-f]{32}", token):
         raise ValueError("Unexpected browser token format")
     dist = root / "playport/web/dist"
@@ -46,7 +48,8 @@ def write_browser_access(root, token, settings_port=80):
     # settings page (settings_page.py; port 80, or another one on OpenWrt, where LuCI has 80).
     (dist / "receiver-access.js").unlink(missing_ok=True)
     path = dist / "receiver-access.json"
-    content = json.dumps({"token": token, "settingsPort": int(settings_port)}) + "\n"
+    flags = {**({"carMusic": True} if car_music or tesla else {}), **({"tesla": True} if tesla else {})}
+    content = json.dumps({"token": token, "settingsPort": int(settings_port), **flags}) + "\n"
     temporary = path.with_suffix('.json.tmp')
     temporary.write_text(content)
     temporary.chmod(0o644)
@@ -91,6 +94,13 @@ def main():
     parser.add_argument("--wired-status", type=Path, help="where the receiver writes the wired CarPlay phase")
     parser.add_argument("--java", default="/usr/bin/java", help="Java 21 (OpenWrt: the dashplay-jre package)")
     parser.add_argument("--settings-port", type=int, default=80, help="port of the box settings page")
+    # Any car whose own Bluetooth is paired with the iPhone (found in a Tesla, 2026-10-14); --tesla is all of it.
+    parser.add_argument("--car-music", action="store_true",
+                        help="music over the car's own Bluetooth: the page leaves the media card and keys to the car")
+    parser.add_argument("--car-voice", action="store_true",
+                        help="calls and Siri over the car's own Bluetooth: the receiver offers no microphone")
+    parser.add_argument("--tesla", action="store_true",
+                        help="Tesla mode: --car-music, --car-voice and the Tesla browser's fullscreen")
     parser.add_argument("--idle-release", type=int, default=300,
                         help="end wireless CarPlay after this many seconds without a viewer page (0: never)")
     parser.add_argument("--no-wireless", action="store_true",
@@ -130,7 +140,7 @@ def main():
     if not re.fullmatch(r"[0-9a-f]{32}", token):   # missing, or emptied by a power cut
         token = secrets.token_hex(16)
         durable_write(token_path, token + "\n")
-    write_browser_access(root, token, args.settings_port)
+    write_browser_access(root, token, args.settings_port, args.car_music, args.tesla)
     env = dict(os.environ, BT_BRIDGE_PYTHON="/usr/bin/python3", BT_BRIDGE_READY_WAIT="15", BT_BRIDGE_CONNECT_TIMEOUT="8",
                BT_BRIDGE_RECOVERY_STATE=str(state / "bluetooth-recovery.stamp"),
                CARPLAY_PRESENCE_HELPER=str(root / "phone-presence.py"),
@@ -168,7 +178,7 @@ def main():
         "-XX:+AutoCreateSharedArchive", "-XX:SharedArchiveFile=" + str(state / "app-cds.jsa"), "-cp",
         # launcher/onecloud-launcher.jar (source in launcher/) warms the handshake crypto in parallel.
         str(root / "launcher/onecloud-launcher.jar") + ":" + str(root / "playport/server/build/install/server/lib/*"),
-        "onecloud.Launcher", "--bind", args.bind,
+        "onecloud.Launcher", "--bind", args.bind, *(["--car-voice"] if args.car_voice or args.tesla else []),
         "--identity-dir", str(root / "identity"), "--state-dir", str(state),
         "--bt-bridge", str(root / "linux-bt-bridge/bt-bridge"), "--token", token,
     ] + (["--usb-bridge", str(root / "iphone-usb-bridge.py")] if wired else [])

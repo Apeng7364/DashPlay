@@ -171,6 +171,63 @@ class WizardPageTests(unittest.TestCase):
         self.assertIn('第 1 步，共 3 步', self.page.render(''))
         self.assertEqual(self.changes, [])   # nothing on the air changes until a network is set
 
+    def test_music_and_calls_can_go_over_the_car_bluetooth(self):
+        # Found in a Tesla (2026-10-14), for any car paired with the iPhone: the choice lands in state/options.json
+        # beside idle_release, and the supervisor hands it to the receiver.
+        import json
+        from supervisor import car_audio_args
+        self.set_up_done()
+        (self.state / 'options.json').write_text(json.dumps({'idle_release': 0}))
+        html = self.page.render('')
+        self.assertIn('音乐走车机蓝牙', html)
+        self.assertIn('通话与 Siri 走车机蓝牙', html)
+        self.assertEqual(car_audio_args(self.state), [])
+        self.page.apply('/audio', {'car_music': 'on', 'nonce': self.nonce})
+        self.assertEqual(json.loads((self.state / 'options.json').read_text()),
+                         {'idle_release': 0, 'tesla': False, 'car_music': True, 'car_voice': False})
+        self.assertEqual(car_audio_args(self.state), ['--car-music'])
+        self.assertEqual(self.changes, ['car audio changed'])
+        self.assertIn('name=car_music value=on checked', self.page.render(''))
+        self.page.apply('/audio', {'car_voice': 'on', 'nonce': self.nonce})
+        self.assertEqual(car_audio_args(self.state), ['--car-voice'])
+        with self.assertRaises(ValueError):
+            self.page.apply('/audio', {'car_music': 'on', 'nonce': 'bad'})
+
+    def test_tesla_mode_moves_the_box_hotspot_and_brings_the_car_bluetooth(self):
+        import json
+        from supervisor import car_audio_args
+        setup_wizard.save(self.state, {'done': True, 'mode': 'box_hotspot', 'box': True})
+        html = self.page.render('')
+        self.assertIn('特斯拉模式', html)
+        self.assertIn('盒子热点的网段改成 100.96.0.1', html)
+        message = self.page.apply('/audio', {'tesla': 'on', 'nonce': self.nonce})
+        self.assertIn('热点网段改为 100.96.0.1', message)
+        self.assertEqual(json.loads((self.state / 'options.json').read_text())['tesla'], True)
+        self.assertEqual(car_audio_args(self.state), ['--tesla'])
+        # Saved again unchanged: no talk of a new address.
+        self.assertNotIn('网段', self.page.apply('/audio', {'tesla': 'on', 'car_music': 'on', 'nonce': self.nonce}))
+
+    def test_tesla_mode_on_a_joined_hotspot_says_where_the_address_is_set(self):
+        self.set_up_done('mifi')
+        self.assertIn('自己的后台把局域网地址改成 100.96.0.1', self.page.render(''))
+        self.status['tesla_warning'] = '随身 WiFi分给盒子的地址是 192.168.0.5'
+        self.assertIn('分给盒子的地址是 192.168.0.5', self.page.render(''))
+
+    def test_the_box_hotspot_address_in_tesla_mode(self):
+        import ipaddress
+        usual = ipaddress.IPv4Interface('192.168.78.1/24')
+        self.assertEqual(setup_wizard.box_hotspot_address(usual, False, []), (usual, None))
+        self.assertEqual(setup_wizard.box_hotspot_address(usual, True, [ipaddress.ip_interface('192.168.5.20/24')]),
+                         (setup_wizard.SHARED_LAN, None))
+        # Already ours (a restart before the address was flushed): still the shared one.
+        self.assertEqual(setup_wizard.box_hotspot_address(usual, True, [setup_wizard.SHARED_LAN])[0], setup_wizard.SHARED_LAN)
+        kept, why = setup_wizard.box_hotspot_address(usual, True, [ipaddress.ip_interface('100.96.0.7/16')])
+        self.assertEqual(kept, usual)
+        self.assertIn('100.96.0.7/16', why)
+        self.assertTrue(setup_wizard.tesla_reaches('100.96.0.23'))
+        self.assertFalse(setup_wizard.tesla_reaches('192.168.0.5'))
+        self.assertFalse(setup_wizard.tesla_reaches(None))
+
     def test_advanced_offers_the_drive_diagnostics(self):
         self.set_up_done()
         self.assertIn('href="/diag.txt"', self.page.render(''))

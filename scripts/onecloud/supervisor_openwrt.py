@@ -10,6 +10,7 @@ Optional: a DuckDNS name with a Let's Encrypt certificate (uci duckdns_domain / 
 own_domain.py) for car browsers that refuse the local CA; it then replaces the name.
 """
 import argparse
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -41,11 +42,37 @@ DEFAULTS = {"enabled": "1", "wifi": "auto", "settings_port": "18080",
             # The name also answers with the router's own public IPv6 address, for car browsers that refuse a
             # private one: 0 no, 1 beside the LAN address, 2 instead of it (LAN address while there is none).
             "public_ipv6": "0",
+            # 1: number the LAN of the router's own Wi-Fi in SHARED_LAN, for car browsers that refuse every
+            # private address (Tesla); 0 puts the address it had before back.
+            "shared_lan": "0",
+            # For any car whose own Bluetooth is paired with the iPhone (found in a Tesla, 2026-10-14). car_music 1:
+            # the music goes over the car's Bluetooth, the page leaves the steering wheel, media card and volume to
+            # the car and plays prompts louder. car_voice 1: calls and Siri too (the receiver offers no microphone).
+            "car_music": "0", "car_voice": "0",
+            # 1: Tesla mode: shared_lan, car_music, car_voice and the Tesla browser's fullscreen.
+            "tesla_mode": "0",
             # A DuckDNS sub-domain and its token: the name becomes <sub-domain>.duckdns.org, with a Let's Encrypt
             # certificate the router obtains and renews itself (own_domain.py). Empty: off.
             "duckdns_domain": "", "duckdns_token": ""}
+
+
+def car_audio_args(config):
+    """run-receiver.py options for what goes over the car's own Bluetooth; Tesla mode is all of them."""
+    if config["tesla_mode"] == "1":
+        return ["--tesla"]
+    return [flag for key, flag in (("car_music", "--car-music"), ("car_voice", "--car-voice")) if config[key] == "1"]
+
+
 RECHECK_EVERY = 10      # seconds between looks at the Wi-Fi handed to the iPhone
 WIRED_STATUS = RUN / "wired-status.json"
+# Where browsers refusing private addresses (Tesla) open the router (setup_wizard.SHARED_LAN). Tailscale's own
+# firewall drops 100.64.0.0/10 from other interfaces unless told not to (shared_lan_conflict).
+SHARED_LAN = setup_wizard.SHARED_LAN
+LAN_BEFORE = "lan-before.json"   # in state/: the LAN address to put back when shared_lan is turned off
+# LuCI applies with rollback: rpcd keeps the previous configuration here until the browser confirms it still
+# reaches the router (about 90 s), else puts it back. A LAN moved before that confirm cannot be confirmed,
+# so shared_lan would be rolled back to 0 and the address with it.
+ROLLBACK_PENDING = Path("/var/run/rpcd/snapshot-files")
 
 
 def trusted_networks(network):
@@ -124,6 +151,168 @@ def point_name(name, host, public=None, only_public=False):
     return True
 
 
+def _lan_address(address, netmask):
+    try:
+        return ipaddress.IPv4Interface(f"{address}/{netmask}" if netmask and "/" not in address else address)
+    except ValueError:
+        return None
+
+
+def shared_lan_changes(uci_network, section, on, before=None):
+    """`uci -q show network` -> (uci commands, the LAN address to remember or None, why it cannot be done).
+    on: number network.<section> in SHARED_LAN, remembering its address; off: put back the remembered one,
+    unless the address was changed by hand since (then it is left and forgotten)."""
+    options = {}
+    for line in (uci_network or "").splitlines():
+        match = re.match(rf"^network\.{re.escape(section)}\.(\w+)=(.*)$", line)
+        if match:
+            options[match.group(1)] = re.findall(r"'([^']*)'", match.group(2)) or [match.group(2)]
+    addresses = options.get("ipaddr", [])
+    netmask = (options.get("netmask") or [""])[0]
+    current = _lan_address(addresses[0], netmask) if len(addresses) == 1 else None
+    if on:
+        if current == SHARED_LAN:
+            return [], before, ""
+        if options.get("proto") != ["static"] or current is None:
+            return [], before, f"network {section} is not one static IPv4 address"
+        return ([["set", f"network.{section}.ipaddr={SHARED_LAN.ip}"],
+                 ["set", f"network.{section}.netmask={SHARED_LAN.netmask}"], ["commit", "network"]],
+                {"ipaddr": addresses[0], "netmask": netmask}, "")
+    if not before or current != SHARED_LAN:
+        return [], None, ""
+    return ([["set", f"network.{section}.ipaddr={before['ipaddr']}"],
+             ["set", f"network.{section}.netmask={before['netmask']}"] if before.get("netmask")
+             else ["delete", f"network.{section}.netmask"], ["commit", "network"]], None, "")
+
+
+TAILSCALE_DROP = re.compile(r'iifname != "tailscale0\*?" ip saddr 100\.64\.0\.0/10 .*\bdrop\b')
+
+
+def shared_lan_conflict(ip_addresses, lan_device, ruleset=None):
+    """`ip -4 -o addr show` (and `nft list ruleset`, None when unreadable) -> why SHARED_LAN cannot be used:
+    Tailscale's own firewall (it drops 100.64.0.0/10 arriving on any other interface; with
+    `tailscale set --netfilter-mode=off` it adds none, and the F50's fw4 zone for tailscale0 lets it in),
+    or another interface already in that /24. "" when free."""
+    tailscale = TAILSCALE_DROP.search(ruleset) if ruleset is not None else None
+    for line in (ip_addresses or "").splitlines():
+        fields = line.split()
+        if len(fields) < 4 or fields[2] != "inet":
+            continue
+        device = fields[1]
+        if device.startswith("tailscale") and (ruleset is None or tailscale):
+            return ("Tailscale 的防火墙会丢掉别的网口进来的 100.64.0.0/10 地址：先在路由器上运行 "
+                    "tailscale set --netfilter-mode=off（OpenWrt 防火墙要有放行 tailscale0 的区域），再勾选")
+        try:
+            theirs = ipaddress.IPv4Interface(fields[3]).network
+        except ValueError:
+            continue
+        if device != lan_device and theirs.overlaps(SHARED_LAN.network):
+            return f"{device} 已在用 {theirs}，与 {SHARED_LAN.network} 冲突"
+    return ""
+
+
+def refresh_network_warning(on, lan_device, status, base_warning="", path=None):
+    """Read live routes without changing them; publish only a warning for settings and LuCI."""
+    warning = ""
+    if on:
+        try:
+            addresses = subprocess.run(["ip", "-4", "-o", "addr", "show"],
+                                       capture_output=True, text=True, timeout=5)
+            if addresses.returncode:
+                raise OSError("ip failed")
+            try:
+                nft = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True, timeout=10)
+                ruleset = nft.stdout if nft.returncode == 0 else None
+            except (OSError, subprocess.SubprocessError):
+                ruleset = None
+            warning = shared_lan_conflict(addresses.stdout, lan_device, ruleset)
+            if warning:
+                warning += "。请检查运营商/上游网络；不要反复开关特斯拉模式，避免管理连接中断。"
+        except (OSError, subprocess.SubprocessError):
+            warning = "暂时无法检查特斯拉网段冲突，请检查系统网络状态。"
+    status["warning"] = "；".join(x for x in (base_warning, warning) if x)
+    path = path or RUN / "network-status.json"
+    setup_wizard.save_json(path, {"warning": status["warning"], "checked_at": int(time.time())})
+
+
+def wait_for_confirm(stopped, seconds=120):
+    """Return once no LuCI apply is waiting for its confirm (ROLLBACK_PENDING empty or gone), or after seconds."""
+    until = time.monotonic() + seconds
+    while time.monotonic() < until and not stopped.is_set():
+        try:
+            pending = any(ROLLBACK_PENDING.iterdir())
+        except OSError:
+            pending = False
+        if not pending:
+            return
+        stopped.wait(1)
+
+
+def reconnect_clients(ifname, say):
+    """Deauthenticate every station on the access point, so that each joins again at once and asks DHCP for an
+    address in the new LAN; otherwise they keep the old one until the lease runs out, and the iPhone cannot reach
+    the receiver (F50, 2026-10-14). Returns how many were asked to reconnect."""
+    hostapd = f"hostapd.{ifname}"
+    try:
+        out = subprocess.run(["ubus", "call", hostapd, "get_clients"], capture_output=True, text=True, timeout=5).stdout
+        clients = json.loads(out or "{}").get("clients", {})
+    except (OSError, ValueError, subprocess.SubprocessError):
+        say(f"{hostapd}: clients unknown, devices keep their old address until they reconnect")
+        return 0
+    for address in clients:
+        subprocess.run(["ubus", "call", hostapd, "del_client", json.dumps({"addr": address, "reason": 3, "deauth": True})],
+                       capture_output=True, timeout=5)
+    return len(clients)
+
+
+def apply_shared_lan(on, network, state, say, stopped=None):
+    """Make the LAN of the Wi-Fi handed to the iPhone match uci dashplay.main.shared_lan. Returns (changed,
+    warning for the settings page). Changed: the network is reloaded and the caller starts over."""
+    path = state / LAN_BEFORE
+    try:
+        before = json.loads(path.read_text())
+    except (OSError, ValueError):
+        before = None
+    if on and network["mode"] != "ap":
+        return False, "「车机不让开任何局域网地址」只对路由器自己的 WiFi 有效"
+    if on and not before:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True, timeout=5).stdout
+        try:
+            nft = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True, timeout=10)
+            ruleset = nft.stdout if nft.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            ruleset = None
+        why = shared_lan_conflict(out, network["device"], ruleset)
+        if why:
+            say(f"shared LAN refused: {why}")
+            return False, why
+    shown = subprocess.run(["uci", "-q", "show", "network"], capture_output=True, text=True, timeout=5).stdout
+    changes, remember, why = shared_lan_changes(shown, network["network"], on, before)
+    if why:
+        say(f"shared LAN refused: {why}")
+        return False, f"局域网地址不是单个静态 IPv4 地址，没有改成 {SHARED_LAN.ip}"
+    if remember and remember != before:
+        setup_wizard.save_json(path, remember)   # before the change: a crash in between still puts it back
+    if changes:
+        wait_for_confirm(stopped or threading.Event())
+        if stopped is not None and stopped.is_set():
+            return False, ""
+        for change in changes:
+            subprocess.run(["uci", *change], check=True, capture_output=True, timeout=10)
+        try:
+            subprocess.run(["/etc/init.d/network", "reload"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=60)
+        except subprocess.TimeoutExpired:
+            say("network reload timed out")   # netifd applies the committed address on its own
+        say(f"LAN {network['network']} now {SHARED_LAN.ip}" if on else
+            f"LAN {network['network']} back to {before['ipaddr']}")
+        if network.get("ifname"):
+            say(f"{reconnect_clients(network['ifname'], say)} devices asked to reconnect for a new address")
+    if remember is None and before is not None:
+        path.unlink(missing_ok=True)
+    return bool(changes), ""
+
+
 def own_config(config):
     """The DuckDNS sub-domain and token from uci, or None when off or invalid (then said once, never fatal)."""
     if not config["duckdns_domain"]:
@@ -184,7 +373,8 @@ def main():
     stopped = threading.Event()
     reexec = []
     for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: stopped.set())
+        # A stop wins over a restart asked for meanwhile (a LAN change under way when procd stops us, 2026-10-14).
+        signal.signal(sig, lambda *_: (reexec.clear(), reexec.append(None), stopped.set()))
     have_identity = identity_ok()
     status = {"mode": "openwrt", "entries": [], "identity": have_identity, "home": f"http://{config['name']}:{port}/",
               "own_name": config["name"] if ddns else None}
@@ -232,7 +422,8 @@ def main():
             "--hotspot", str(handoff_file), "--interface", network["device"], "--web-host", "0.0.0.0",
             "--java", config["java"], "--settings-port", str(port), "--wired", "--wired-status", str(WIRED_STATUS),
             "--idle-release", str(int(config["idle_release"]) if config["idle_release"].isdigit() else 300)]
-            + ([] if wireless else ["--no-wireless"]) + (["--bind-wait", "120"] if wait else []))
+            + ([] if wireless else ["--no-wireless"]) + (["--bind-wait", "120"] if wait else [])
+            + car_audio_args(config))
 
     try:
         mark("supervisor start")
@@ -293,6 +484,12 @@ def main():
         if stopped.is_set():
             raise InterruptedError("Service stopping")
         mark(f"Wi-Fi {network['ssid']} up on channel {network['channel']}")
+        moved, warning = apply_shared_lan("1" in (config["shared_lan"], config["tesla_mode"]), network, state, say, stopped)
+        if moved:
+            request_reexec("LAN address changed")   # the name, certificate and DuckDNS follow on the new address
+            raise InterruptedError("LAN address changed")
+        if warning:
+            status["warning"] = warning
         address = network["address"]
         platform.interface, platform.ap_interface = network["device"], network["ifname"]
         host = str(address.ip)
@@ -323,6 +520,9 @@ def main():
             status["warning"] = (f"「{network['ssid']}」所在的防火墙区域拒绝入站连接，iPhone 连不上 DashPlay。"
                                  f"请在 OpenWrt 后台把网络 {network['network']} 放进允许入站的区域，或改用路由器自己的 WiFi。")
             say(f"warning: firewall zone of {network['network']} rejects input")
+        base_warning = status.get("warning", "")
+        shared_on = "1" in (config["shared_lan"], config["tesla_mode"])
+        refresh_network_warning(shared_on, network["device"], status, base_warning)
         trusted[:] = trusted_networks(network)
         settings.start(port)
         diagnostics.start(stopped, diagnostics.DiagLog(state / "diag"), RUN / "receiver.log", platform, status,
@@ -355,6 +555,7 @@ def main():
                     raise RuntimeError(f"{name} exited with {child.returncode}")
             if time.monotonic() >= next_check:
                 next_check = time.monotonic() + RECHECK_EVERY
+                refresh_network_warning(shared_on, network["device"], status, base_warning)
                 now, why = platform.handoff(config["wifi"])
                 if now is None or plan_of(now) != plan:
                     request_reexec("Wi-Fi changed" if now else why)
@@ -373,7 +574,7 @@ def main():
         settings.stop()
         platform.stop_all()
         say("DashPlay services stopped")
-    if reexec:
+    if reexec and reexec[0] is not None:
         say(f"restarting: {reexec[0]}")
         os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), "--root", str(root)])
 

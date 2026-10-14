@@ -1,0 +1,62 @@
+[
+  {
+    "group": "f50",
+    "file": "spreadtrum-source.tar.gz",
+    "url": "https://codeload.github.com/TomKing062/spreadtrum_flash/tar.gz/d24c21a0c93a545c0130668caa1826d59ceebe48",
+    "sha256": "c75e09e188d367be42aa55028d263437fd54c945be70b54e5cdb3fbfe15e00cd"
+  },
+  {
+    "group": "f50",
+    "file": "magisk.img",
+    "url": "https://github.com/Xio-Shark/f50-b16/releases/download/v1.0.0/magisk.img",
+    "sha256": "5a5fd9d2563a45ad830e58e2c27cfbb284f0a04fa52b5e59e5ff7886ff8dc43b"
+  },
+  {
+    "group": "f50",
+    "file": "Magisk_28103.apk",
+    "url": "https://github.com/Xio-Shark/f50-b16/releases/download/v1.0.0/Magisk_28103.apk",
+    "sha256": "fa7e64af14e57194e2463d959e809812e9bdd48f4cc996565706f658e78694de"
+  },
+  {
+    "group": "f50",
+    "file": "openwrt-k5.4.zip",
+    "url": "https://github.com/dikeckaan/mu300-linux/releases/download/v2026.10.15/mu300-magisk-v2026.10.15-openwrt-k5.4.zip",
+    "sha256": "5b033b8bb9034ff53445189ea6f9fa7d5494697a91073ec6a249b5b1f2e8327c"
+  },
+  {
+    "group": "f50",
+    "file": "openwrt-luci-rootfs.tar.gz",
+    "url": "https://github.com/dikeckaan/mu300-linux/releases/download/v2026.10.15/mu300-openwrt-luci-rootfs.tar.gz",
+    "sha256": "8ff2008f00b891c021b139e5f2cd225f54718957176a827c677c055560229eff"
+  },
+  {
+    "group": "adb-mac",
+    "file": "platform-tools-darwin.zip",
+    "url": "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip",
+    "sha256": "ee39ad5967e95c2a07f04dbcbde96b1a0c916ba376096db5d2f498b7727a5d1d"
+  },
+  {
+    "group": "n1",
+    "file": "boot.img",
+    "url": "https://raw.githubusercontent.com/dreamrover/phicomm-n1/e9007301fcfc5beb2c2da51dab9e810cbb509322/firmware_2.19/boot.img",
+    "sha256": "4e6fbc9405ed0c5260fb04f6f24d3a1236cfc1099bebb2cc93f7587d4dea13fe"
+  },
+  {
+    "group": "n1",
+    "file": "bootloader.img",
+    "url": "https://raw.githubusercontent.com/dreamrover/phicomm-n1/e9007301fcfc5beb2c2da51dab9e810cbb509322/firmware_2.19/bootloader.img",
+    "sha256": "8f8b623bf661ed13163d3f17285f96fa961a4e724dae865be4157a937a540272"
+  },
+  {
+    "group": "n1",
+    "file": "recovery.img",
+    "url": "https://raw.githubusercontent.com/dreamrover/phicomm-n1/e9007301fcfc5beb2c2da51dab9e810cbb509322/firmware_2.19/recovery.img",
+    "sha256": "8fc2512aeac57f083765dc354c848e3f84e5a8cef7187666570b9336ea7ea556"
+  },
+  {
+    "group": "onecloud",
+    "file": "USB_Burning_Tool_v2.1.3.exe",
+    "url": "https://github.com/soulteary/onecloud-u-boot/releases/download/2025.01.06/USB_Burning_Tool_v2.1.3.exe",
+    "sha256": "eff6da4fce269df5209017f586799431b9768e89122a588c306f691759e0fbc2"
+  }
+]

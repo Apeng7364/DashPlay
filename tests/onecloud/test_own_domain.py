@@ -161,14 +161,14 @@ class MaintainerTests(unittest.TestCase):
 
     def test_public_ipv6_is_published_only_behind_the_firewall(self):
         v6 = dict(self.config, ipv6=True)
-        with patch.object(own_domain, "public_ipv6", lambda _: ("2408:8409:8450:9d91::5", 64)), \
+        with patch.object(own_domain, "public_ipv6", lambda _: ("2408:8409:8450:1d91::5", 64)), \
                 patch.object(own_domain, "guard", lambda *a: True):
             status = self.run_record(v6)
-        self.assertEqual(self.sent[0], ("192.168.5.80", "2408:8409:8450:9d91::5", False))
-        self.assertEqual((status["ipv6"], status["ipv6_state"]), ("2408:8409:8450:9d91::5", "ok"))
+        self.assertEqual(self.sent[0], ("192.168.5.80", "2408:8409:8450:1d91::5", False))
+        self.assertEqual((status["ipv6"], status["ipv6_state"]), ("2408:8409:8450:1d91::5", "ok"))
         self.assertIn("防火墙只让同一个 WiFi", own_domain.message(self.state, self.name))
         self.sent.clear()
-        with patch.object(own_domain, "public_ipv6", lambda _: ("2408:8409:8450:9d91::5", 64)), \
+        with patch.object(own_domain, "public_ipv6", lambda _: ("2408:8409:8450:1d91::5", 64)), \
                 patch.object(own_domain, "guard", lambda *a: False):
             status = self.run_record(v6)
         self.assertEqual(self.sent[0], ("192.168.5.80", None, True), "no firewall: the old AAAA is cleared, none sent")
@@ -210,8 +210,8 @@ class Ipv6Tests(unittest.TestCase):
         self.assertIsNone(own_domain.public_ipv6("wlan0", lambda *a, **k: subprocess.CompletedProcess(a, 0, "[]", "")))
 
     def test_firewall_lets_in_only_the_wifi(self):
-        rules = own_domain.guard_rules("2408:8409:8450:9d91:5084:daff:fe9d:c893", 64)
-        self.assertIn("ip6 saddr 2408:8409:8450:9d91::/64 accept", rules)
+        rules = own_domain.guard_rules("2408:8409:8450:1d91:200:ff:fe00:5", 64)
+        self.assertIn("ip6 saddr 2408:8409:8450:1d91::/64 accept", rules)
         self.assertIn("ip6 saddr fe80::/10 accept", rules)
         self.assertIn("meta nfproto ipv4 accept", rules)
         self.assertTrue(rules.rstrip().endswith("}"))

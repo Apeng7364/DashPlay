@@ -112,5 +112,35 @@ class BluezNotReadyTests(unittest.TestCase):
         self.assertIn('admit BlueZ not ready yet', log)
         self.assertNotIn('Error', log)
 
+    def test_a_renumbered_lan_finds_the_phone_by_its_known_wifi_address(self):
+        # F50, 2026-10-14: the LAN moved from 192.168.77.0/24 to 100.96.0.0/24 (Tesla option); the iPhone kept its
+        # private Wi-Fi address on the same Wi-Fi name but had no identity for the new subnet, so it was never invited.
+        import os, tempfile, types
+        phone, mac = '02:00:00:00:00:B1', '0200000000a1'
+        address = json.dumps([{'addr_info': [{'scope': 'global', 'local': '100.96.0.1', 'prefixlen': 24}]}])
+        probes = []
+
+        def probe(interface, source, targets, expected_mac=None, collect=False):
+            probes.append(list(targets))
+            return {mac: '100.96.0.234'} if '100.96.0.234' in targets else {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory, 'phone-presence.json')
+            state.write_text(json.dumps({'phones': {phone: {'networks': {'192.168.77.0/24': {'ip': '192.168.77.234', 'mac': mac}}}},
+                                         'last_phone': phone}))
+            with patch.dict(os.environ, {'CARPLAY_PRESENCE_STATE': str(state), 'CARPLAY_PRESENCE_INTERFACE': 'br-lan'}), \
+                    patch.object(presence.sys, 'argv', ['x', 'select']), \
+                    patch.object(presence.subprocess, 'check_output', return_value=address), \
+                    patch.object(presence, 'paired_cached', return_value={phone}), \
+                    patch.object(presence, 'get_platform', return_value=types.SimpleNamespace(boot_id=lambda: 'b')), \
+                    patch.object(presence, 'probe', side_effect=probe), \
+                    patch('builtins.print') as printed:
+                self.assertEqual(presence.main(), 0)
+            printed.assert_called_with(phone)
+            self.assertNotIn('192.168.77.234', [ip for targets in probes for ip in targets], 'the old subnet is not probed')
+            networks = json.loads(state.read_text())['phones'][phone]['networks']
+        self.assertEqual(networks['100.96.0.0/24'], {'ip': '100.96.0.234', 'mac': mac})
+        self.assertEqual(networks['192.168.77.0/24']['ip'], '192.168.77.234', 'the old identity is kept for going back')
+
 if __name__ == '__main__':
     unittest.main()

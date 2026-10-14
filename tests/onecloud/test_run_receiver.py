@@ -27,6 +27,20 @@ class BrowserAccessTest(unittest.TestCase):
             self.assertEqual(access.stat().st_mode & 0o777, 0o644)
             self.assertEqual(sorted(p.name for p in dist.iterdir()), ["receiver-access.json"])
 
+    def page_flags(self, **flags):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "playport/web/dist").mkdir(parents=True)
+            run_receiver.write_browser_access(root, "0123456789abcdef0123456789abcdef", 18080, **flags)
+            access = json.loads((root / "playport/web/dist/receiver-access.json").read_text())
+            return {key: value for key, value in access.items() if key not in ("token", "settingsPort")}
+
+    def test_music_over_the_car_bluetooth_reaches_the_page_alone(self):
+        self.assertEqual(self.page_flags(car_music=True), {"carMusic": True})
+
+    def test_tesla_mode_brings_the_car_music_with_it(self):
+        self.assertEqual(self.page_flags(tesla=True), {"carMusic": True, "tesla": True})
+
     def test_rejects_an_unexpected_token(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(ValueError):

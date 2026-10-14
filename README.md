@@ -6,7 +6,7 @@
 
 DashPlay 基于 [PlayPort](https://github.com/youcci/playport)，提供补丁和配套运行程序：有线 CarPlay（盒子作 USB 主机）、Linux BlueZ 蓝牙桥接、面向车机浏览器的精简界面与系统媒体控制、首次设置与设置页、开机自启与监管等。
 
-**不懂技术也能装**：买好斐讯 N1、玩客云、ZTE F50（已刷 OpenWrt）或其他 OpenWrt 路由器后，把下面这句话发给你的 AI 助手（Claude Code、Codex、WorkBuddy、豆包、DeepSeek 等都可以），它会问清楚你的设备，一步步帮你装好，只在需要你插拔电源、在手机上点选时叫你：
+**不懂技术也能装**：买好斐讯 N1、玩客云、ZTE F50（原厂 B16 或已刷 OpenWrt）或其他 OpenWrt 路由器后，把下面这句话发给你的 AI 助手（Claude Code、Codex、WorkBuddy、豆包、DeepSeek 等都可以），它会问清楚你的设备，一步步帮你装好，只在需要你插拔电源、在手机上点选时叫你：
 
 > 请阅读 https://github.com/yizhixiaoheigou/DashPlay/blob/main/skills/dashplay-install/SKILL.md ，按它一步步帮我把 DashPlay 装好。
 
@@ -28,7 +28,7 @@ DashPlay 基于 [PlayPort](https://github.com/youcci/playport)，提供补丁和
 
 - **玩客云（S805，Armbian / Debian 13 armhf）+ RTL8821CU USB 网卡**（Wi-Fi 与蓝牙二合一，`0bda:c820`），12 V 供电：主力平台，有线 CarPlay 用远离网口的 USB 口（OTG，盒子切成 USB 主机）。线刷固件后手机连盒子热点 `DashPlay` 完成首次设置，由用户自己的 AI 助手放入认证文件即可使用。刷机与使用见 [固件使用说明](docs/DashPlay玩客云固件使用说明.md)，给 AI 的步骤见 [AI 安装说明](docs/DashPlay-AI安装说明.md)；固件构建工具见 `scripts/onecloud/firmware/`。
 - **斐讯 N1（S905D，aarch64，内置 BCM43455 Wi-Fi/蓝牙）**：刷机包是预装 DashPlay 的 U 盘镜像（基于 [ophub amlogic-s9xxx-armbian](https://github.com/ophub/amlogic-s9xxx-armbian) 的 Debian trixie），U 盘启动后可用 `armbian-install` 装进 eMMC；步骤同见 [固件使用说明](docs/DashPlay玩客云固件使用说明.md)。两个 USB 口都是主机口，iPhone 插哪个都行。镜像由 `scripts/onecloud/firmware/make-n1-image.sh` 在一台 N1 上生成。
-- **已经装好 OpenWrt 25.12 的路由器或随身 WiFi（aarch64 / x86_64，含 ZTE F50）**：OpenWrt 插件在姊妹仓库 [openwrt-dashplay](https://github.com/yizhixiaoheigou/openwrt-dashplay)（apk 包与软件源），网络照常在 OpenWrt 后台设置。插件运行的就是本仓库的程序：每次发布附带的 `dashplay-bundle-<版本>.tar`。本仓库不包含为 F50 刷入 OpenWrt 的任何工具或固件。
+- **已经装好 OpenWrt 25.12 的路由器或随身 WiFi（aarch64 / x86_64，含 ZTE F50）**：OpenWrt 插件在姊妹仓库 [openwrt-dashplay](https://github.com/yizhixiaoheigou/openwrt-dashplay)（apk 包与软件源），网络照常在 OpenWrt 后台设置。插件运行的就是本仓库的程序：每次发布附带的 `dashplay-bundle-<版本>.tar`。原厂 F50 B16 的备份、Root 与 SD 卡 OpenWrt 路线见 [装机 skill](skills/dashplay-install/SKILL.md)，包含经校验的辅助脚本；会降低启动校验，最坏需要拆机。非 B16 没有已核实降级路线时必须停止。
 
 ### 实测情况
 
@@ -47,7 +47,7 @@ identity/offline-mfi/identity.pk8       # PKCS#8 EC P-256 私钥
 identity/offline-mfi/certificate.p7b    # 对应的配件证书
 ```
 
-身份来源请阅读 [PlayPort README 的 Accessory identity 一节](https://github.com/youcci/playport#accessory-identity-required)。它列出的途径包括：DiPlay 发布 APK 中的实验身份、Carlinkit 固件、你自己作为 MFi 授权方拥有的身份，以及 `--mfi-server` 远程认证服务。远程认证是上游提供的方式，DashPlay 的启动脚本使用上述本地文件。DashPlay 不自动下载身份，也不提供从 APK 一键导入或身份提取脚本。请注意：
+最省事的来源是 [DiPlay](https://github.com/shihabal3amri/DiPlay/releases) 发布的安卓安装包：取发布列表里最新一个 `DiPlay-*.apk`，包里 `assets/offline-mfi/` 下就是这两个文件。步骤（含核对私钥与证书配对）见 [AI 安装说明](docs/DashPlay-AI安装说明.md) 第 2 节，交给你的 AI 助手即可代办。其他途径见 [PlayPort README 的 Accessory identity 一节](https://github.com/youcci/playport#accessory-identity-required)：Carlinkit 固件、你自己作为 MFi 授权方拥有的身份，以及 `--mfi-server` 远程认证服务（上游提供；DashPlay 的启动脚本使用上述本地文件）。DashPlay 程序本身不附带、不自动下载身份。请注意：
 
 - 公开可得的身份是共享的实验身份，并非签发给本项目或 PlayPort，Apple 随时可能使其失效；
 - 只用于个人实验，不要出售，不要再分发身份文件，不要提交到任何仓库；

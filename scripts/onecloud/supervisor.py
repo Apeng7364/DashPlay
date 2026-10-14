@@ -30,7 +30,7 @@ import time
 from boxnet import ensure_leaf
 from mdns_name import NameResponder
 import own_domain
-from settings_page import SettingsPage
+from settings_page import SettingsPage, network_label
 import setup_wizard
 from platform_api import get_platform
 import diagnostics
@@ -61,13 +61,36 @@ def hotspot_attempts(channel, width):
     return attempts
 
 
+def options(state):
+    """state/options.json (in state/, which program updates keep), {} when missing or unreadable."""
+    try:
+        value = json.loads((state / "options.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def idle_release(state, default=300):
     """The owner's choice in state/options.json, or 5 minutes."""
     try:
-        value = json.loads((state / "options.json").read_text()).get("idle_release", default)
-        return max(0, int(value))
-    except (OSError, ValueError, TypeError, AttributeError):
+        return max(0, int(options(state).get("idle_release", default)))
+    except (ValueError, TypeError):
         return default
+
+
+def tesla_mode(state):
+    """Settings page, state/options.json "tesla": the box hotspot in SHARED_LAN, music, calls and Siri over the
+    car's Bluetooth, the Tesla browser's fullscreen."""
+    return options(state).get("tesla") is True
+
+
+def car_audio_args(state):
+    """run-receiver.py options for what goes over the car's own Bluetooth (settings page, state/options.json
+    "car_music" / "car_voice"; found in a Tesla, 2026-10-14); Tesla mode is all of them."""
+    if tesla_mode(state):
+        return ["--tesla"]
+    chosen = options(state)
+    return [flag for key, flag in (("car_music", "--car-music"), ("car_voice", "--car-voice")) if chosen.get(key) is True]
 
 
 def main():
@@ -122,6 +145,9 @@ def main():
             raise RuntimeError("No Wi-Fi interface found")
     platform = get_platform(interface, run=RUN)
     setup = setup_wizard.load(state)
+    # Tesla mode: the box hotspot moves to setup_wizard.SHARED_LAN, which a Tesla's browser opens (2026-10-14).
+    tesla = tesla_mode(state)
+    address, tesla_warning = setup_wizard.box_hotspot_address(address, tesla, platform.local_addresses())
     have_identity = identity_ok()
     # Until the first-run network step is done the box hotspot is open, so a new phone joins it
     # without knowing any password; the receiver then hands the iPhone an open network too.
@@ -137,10 +163,11 @@ def main():
     stopped = threading.Event()
     reexec = []   # reason, when the configuration changed and the service should restart itself
     for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: stopped.set())
+        # A stop wins over a restart asked for meanwhile (a LAN change under way when procd stops us, 2026-10-14).
+        signal.signal(sig, lambda *_: (reexec.clear(), reexec.append(None), stopped.set()))
     children = platform.children
     status = {"mode": "starting", "entries": [], "box_ssid": hotspot["ssid"], "home": f"http://{address.ip}/",
-              "identity": have_identity}
+              "identity": have_identity, "ap_ip": str(address.ip), "tesla": tesla}
 
     def load_json(name):
         try:
@@ -255,7 +282,7 @@ def main():
             [] if setup_wizard.wireless(setup) else ["--no-wireless"]) + [
             # state/options.json "idle_release": seconds without a viewer before wireless CarPlay ends (0: never);
             # in state/, which program updates keep (they replace service.json).
-            "--idle-release", str(idle_release(state))]
+            "--idle-release", str(idle_release(state)), *car_audio_args(state)]
 
         def receiver_argv(plan, wait=False):
             """plan: (bind address, channel, security) of the joined hotspot, which the iPhone is handed.
@@ -305,9 +332,17 @@ def main():
             status.update(mode="sta", ssid=car["ssid"], home=f"http://{sta_address}/", channel=sta_channel, entries=with_name([
                 f"https://{sta_address}:18443/", f"http://{sta_address}/ （本设置页）"]))
             mark(f"{use} hotspot joined, viewer on {sta_address}")
+            if tesla and not setup_wizard.tesla_reaches(sta_address):
+                # A joined hotspot is numbered by its owner: only its own settings can move it.
+                status["tesla_warning"] = (f"{network_label(use)}分给盒子的地址是 {sta_address}，特斯拉浏览器打不开这类局域网地址。"
+                                           f"在{network_label(use)}自己的后台把局域网地址改成 {setup_wizard.SHARED_LAN.ip}"
+                                           "（100.64–100.127 开头的网段都行），再重新连接。")
             keep_name(sta_address, interface)
         else:
             ensure_leaf(state, names, [str(address.ip)])
+            if tesla_warning:
+                status["tesla_warning"] = tesla_warning
+                print(f"Tesla mode: {tesla_warning}", flush=True)
             status.update(mode="ap", ssid=hotspot["ssid"], open=open_ap, entries=with_name([
                 f"https://{address.ip}:18443/", f"http://{address.ip}/ （本设置页）"]))
             # Box hotspot: the head unit opens the box at its fixed address; online through the Ethernet cable
@@ -414,7 +449,7 @@ def main():
         platform.remove_sta_network()
         platform.flush_address()
         print("DashPlay services stopped", flush=True)
-    if reexec:
+    if reexec and reexec[0] is not None:
         print(f"restarting: {reexec[0]}", flush=True)
         os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), "--root", str(root)])
 

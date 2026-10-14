@@ -28,7 +28,7 @@ DOC_MAC_PREFIXES = ("00:00:5E:00:53:", "02:00:5E:00:53:")
 
 RULES = [
     ("personal-path", re.compile(r"/Users/[A-Za-z0-9._-]+|/home/[A-Za-z0-9._-]+")),
-    ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
+    ("email", re.compile(r"[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
     ("mac-address", re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")),
     # Linux names USB Wi-Fi adapters after their MAC, e.g. wlx followed by 12 hex digits.
     ("mac-in-ifname", re.compile(r"\bwlx(?!020000000)[0-9a-f]{12}\b")),

@@ -1,6 +1,6 @@
 """Plain-HTTP settings page on port 80: first-run setup, phones, hotspots, status, CA, own DuckDNS name.
 
-Reachable in both modes (box hotspot: http://192.168.78.1/, car hotspot: http://<box address>/, and
+Reachable in both modes (box hotspot: http://192.168.78.1/, in Tesla mode http://100.96.0.1/, car hotspot: http://<box address>/, and
 http://dashplay.local/ in either). Only clients on the box's own LAN subnets may use it. Secrets are
 written to 0600 files under state/ and never sent back to the browser; leaving a password field
 empty keeps the stored value. Until setup is done, the page is the step-by-step setup flow.
@@ -115,6 +115,7 @@ class SettingsPage:
         self.wired_status = wired_status
         self.hotspot_file = state / "hotspot.json"
         self.ddns_file = state / "ddns.json"
+        self.options_file = state / "options.json"   # also read by supervisor.py (idle_release, car_music, car_voice)
         self.ca_file = state / "tls" / "ca.crt"
         self.status, self.on_change, self.allowed = status, on_change, allowed_networks
         self.scanner = scanner
@@ -277,6 +278,9 @@ class SettingsPage:
         if path == "/ddns":
             self.check_nonce(form)
             return self.save_ddns(form)
+        if path == "/audio":
+            self.check_nonce(form)
+            return self.save_car_audio(form)
         if path == "/retry":
             self.check_nonce(form)
             self.on_change("retry requested")
@@ -337,6 +341,50 @@ class SettingsPage:
                 '并向 Let’s Encrypt 申请免费的正式证书、到期前自动续签；车机改用 https://子域名.duckdns.org:18443/ 打开，'
                 f'不再有证书警告。不需要开放任何端口。{ipv6}'
                 + ('盒子热点方式在车上没有网络，申请和续签要在家插上网线开机。' if mode == "box_hotspot" else "") + '</p></div></details>')
+
+    # What goes over the car's own Bluetooth instead of the CarPlay page (found in a Tesla, 2026-10-14; supervisor.py
+    # car_audio_args). On OpenWrt LuCI sets the same (dashplay.main.car_music / car_voice / tesla_mode).
+    CAR_AUDIO = (("car_music", "音乐走车机蓝牙",
+                  "iPhone 用蓝牙连车机，并在车机里把媒体来源选成这部 iPhone：方向盘切歌、媒体卡片、音量就和普通手机一样用。"
+                  "CarPlay 网页负责画面和导航播报（播报会放大）。偶尔放歌没声音时，在 iPhone 控制中心把音频输出选成车机。"),
+                 ("car_voice", "通话与 Siri 走车机蓝牙",
+                  "通话和 Siri 用车机自己的麦克风和喇叭（iPhone 要先用蓝牙连上车机），不经过 CarPlay 网页。网页通话有回声时可以试试。"))
+
+    def tesla_text(self, mode):
+        """Tesla mode (supervisor.py tesla_mode): what it does in this way of use."""
+        shared = setup_wizard.SHARED_LAN.ip
+        common = ("音乐、通话和 Siri 交给特斯拉蓝牙（相当于勾上下面两项），iPhone 用蓝牙连特斯拉并选为媒体来源；"
+                  "全屏按钮经腾讯视频、1905 的跳转页去掉地址栏（特斯拉要能上网）。特斯拉的 WiFi 设置里要打开「行驶中保持连接」，"
+                  "否则一出 P 挡画面就停。")
+        if mode in setup_wizard.JOINS:
+            label = network_label(mode)
+            return (f"特斯拉浏览器不让开 192.168.x.x 这类局域网地址：要在{label}自己的后台把局域网地址改成 {shared}"
+                    f"（100.64–100.127 开头的都行），盒子改不了{label}的地址。" + common)
+        return (f"盒子热点的网段改成 {shared}（特斯拉浏览器不让开 192.168.x.x 这类局域网地址），车机打开 "
+                f"https://{shared}:18443/ ；改完车机和手机重新连一次盒子热点。" + common)
+
+    def save_car_audio(self, form):
+        chosen = _load(self.options_file)
+        chosen = dict(chosen) if isinstance(chosen, dict) else {}
+        was_tesla = chosen.get("tesla") is True
+        for key in ("tesla", *(key for key, _title, _text in self.CAR_AUDIO)):
+            chosen[key] = form.get(key) == "on"
+        _save(self.options_file, chosen)
+        self.apply_later("car audio changed")
+        if chosen["tesla"] != was_tesla and self.setup().get("mode") == "box_hotspot":
+            address = setup_wizard.SHARED_LAN.ip if chosen["tesla"] else "盒子原来的地址"
+            return (f"已保存。盒子约 1 分钟后重启服务，热点网段改为 {address}：车机和手机重新连一次盒子热点，"
+                    f"设置页用 http://{setup_wizard.MDNS_NAME}/ 打开。")
+        return "已保存，盒子约 1 分钟后重启服务生效。"
+
+    def car_audio_block(self, nonce):
+        chosen = _load(self.options_file)
+        chosen = chosen if isinstance(chosen, dict) else {}
+        rows = (("tesla", "特斯拉模式", self.tesla_text(self.setup().get("mode"))),) + self.CAR_AUDIO
+        cells = "".join(f'<label class=cell><span class=main><b>{title}</b><span>{escape(text)}</span></span>'
+                        f'<input type=checkbox name={key} value=on{" checked" if chosen.get(key) is True else ""}></label>'
+                        for key, title, text in rows)
+        return f'<form method=post action=/audio>{ui.hidden(nonce)}{cells}<button class="cell action">保存</button></form>'
 
     def save_hotspot(self, form):
         old = _load(self.hotspot_file) or {}
@@ -493,8 +541,9 @@ class SettingsPage:
     def hotspot_foot(self):
         mode = self.setup().get("mode")
         if mode == "box_hotspot":
+            address = self.status().get("ap_ip", "192.168.78.1")
             return ("车机和 iPhone 都连这个热点。车机连上后不能上网（盒子热点没有互联网）；"
-                    "CarPlay 画面地址固定为 https://192.168.78.1:18443/ 。")
+                    f"CarPlay 画面地址固定为 https://{address}:18443/ 。")
         return f"连不上{network_label(mode)}时，盒子临时打开这个热点，手机连它进入设置。"
 
     def render_hotspot_change(self, notice):
@@ -651,6 +700,9 @@ class SettingsPage:
                 + block + '</div><div>'
                 + ui.group("网络", network)
                 + (ui.group("车机打不开画面时", reach, reach_foot) if reach else "")
+                + ("" if self.managed else ui.banner(status.get("tesla_warning", ""), "bad")
+                   + ui.group("特斯拉与车机蓝牙", self.car_audio_block(nonce),
+                              "车机自己能用蓝牙连 iPhone 时可选；特斯拉模式已包含后两项。不勾选时，声音都从 CarPlay 网页出来。"))
                 + ui.group("高级", advanced, "" if self.managed else "重新进行首次设置可以更换使用方式，会保留盒子证书、自己的域名和盒子热点密码。")
                 + '</div>')
         return ui.page("盒子设置", body, refresh, wide=True)

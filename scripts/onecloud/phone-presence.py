@@ -139,6 +139,12 @@ def identity(record, network):
     return record.get('networks', {}).get(network)
 
 
+def known_identity(record, network):
+    """This network's identity, else the newest one from another network: on the same Wi-Fi name the iPhone keeps
+    its private address when the subnet changes (router LAN renumbered, 2026-10-14). Only this subnet is probed."""
+    return identity(record, network) or next(reversed(record.get('networks', {}).values()), None)
+
+
 def learn(record, network, found):
     networks = record.setdefault('networks', {})
     networks.pop(network, None)
@@ -316,7 +322,7 @@ def main():
                 if found:
                     # The verified AirPlay controller is authoritative; otherwise a known Wi-Fi MAC.
                     phone = owner or next((key for key, record in state['phones'].items() if key in paired and
-                                           (identity(record, network) or {}).get('mac') == found['mac']), phone)
+                                           (known_identity(record, network) or {}).get('mac') == found['mac']), phone)
                     record = state['phones'].setdefault(phone, {})
                     learn(record, network, found)
                     if controller:
@@ -333,7 +339,7 @@ def main():
                     found = probe(interface, source, [peer]) or probe(interface, source, [peer])
                 if found:
                     output = next((key for key, record in state['phones'].items() if key in paired and
-                                   (identity(record, network) or {}).get('mac') == found['mac']), None)
+                                   (known_identity(record, network) or {}).get('mac') == found['mac']), None)
                     if output is None and new_phone in paired:
                         output = new_phone
                     ok = output is not None
@@ -343,9 +349,10 @@ def main():
                     note(state_path, 'admit no ARP reply' if ipaddress.ip_address(peer) in ipaddress.ip_network(network)
                          else 'admit peer outside the hotspot subnet')
             elif command in ('present', 'select'):
-                records = {phone: identity(record, network) for phone, record in state['phones'].items()
-                           if phone in paired and identity(record, network)}
-                targets = list({record['ip'] for record in records.values()})
+                records = {phone: known_identity(record, network) for phone, record in state['phones'].items()
+                           if phone in paired and known_identity(record, network)}
+                targets = list({record['ip'] for phone, record in records.items()
+                                if identity(state['phones'][phone], network)})
                 found = probe(interface, source, targets, collect=True) if targets else {}
                 hosts = ipaddress.ip_network(network)
                 if len(found) < len(records) and hosts.num_addresses <= 256 and now - state.get('scan_at', -15) >= 15:
@@ -355,7 +362,10 @@ def main():
                 present = set()
                 for phone, record in records.items():
                     if record['mac'] in found:
-                        record['ip'] = found[record['mac']]
+                        if identity(state['phones'][phone], network):
+                            record['ip'] = found[record['mac']]
+                        else:
+                            learn(state['phones'][phone], network, {'ip': found[record['mac']], 'mac': record['mac']})
                         present.add(phone)
                     else:
                         # Leaving the Wi-Fi ends a refusal back-off; returning is a fresh request.
