@@ -9,7 +9,7 @@ import urllib.request
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('group',choices=('f50','n1','onecloud','adb-mac'))
+    p.add_argument('group',choices=('f50','n1','onecloud','adb-mac','mac-tools-src'))
     p.add_argument('out',type=Path)
     a=p.parse_args()
     manifest=Path(__file__).resolve().parents[1]/'skills/dashplay-install/downloads.json'

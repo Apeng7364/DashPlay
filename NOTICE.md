@@ -47,5 +47,16 @@ Each DashPlay release also carries the **program bundle** `dashplay-bundle-<vers
 `scripts/onecloud` program, PlayPort built from the patches here with its Maven dependencies, and
 dbus-next 0.2.3), which the OpenWrt packages of the sister repository openwrt-dashplay install.
 
+The **macOS helpers** in `tools/mac-arm64/` (used only by the installation guide on the user's Mac, built
+by `scripts/build-mac-tools.sh` from the pinned sources in `skills/dashplay-install/downloads.json`):
+`spd_dump` from **spreadtrum_flash** <https://github.com/TomKing062/spreadtrum_flash> commit
+`d24c21a0c93a545c0130668caa1826d59ceebe48` (a fork of ilyakurdyukov/spreadtrum_flash, Unlicense) with
+`patches/spreadtrum-read-user-area.patch`, statically linked with **libusb** 1.0.29
+<https://github.com/libusb/libusb> (LGPL-2.1; its unmodified source is the pinned release tarball and the
+build script relinks it), and the **lz4** 1.10.0 command line tool <https://github.com/lz4/lz4> (GPL-2.0
+for the program, BSD-2-Clause for the library; unmodified, source is the pinned release tarball). The guide
+also downloads, without redistributing it, a standalone CPython 3.12 build from
+<https://github.com/astral-sh/python-build-standalone> (PSF and bundled-library licenses inside it).
+
 CarPlay, iPhone, AirPlay and MFi are trademarks of Apple Inc. This is an independent project; no
 Apple, PlayPort, DiPlay, xcertplay or WheelPlay affiliation or endorsement is implied.

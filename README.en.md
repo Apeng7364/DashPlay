@@ -8,7 +8,7 @@ DashPlay is built on [PlayPort](https://github.com/youcci/playport): patches plu
 
 **No technical background needed**: once you have a Phicomm N1, a OneCloud (玩客云), a ZTE F50 on stock B16 or OpenWrt or another OpenWrt router, send this sentence to your AI assistant (Claude Code, Codex, WorkBuddy, Doubao, DeepSeek and the like all work). It asks which device you have and installs DashPlay step by step, calling you only to plug or unplug power or tap something on your phone:
 
-> Please read https://github.com/yizhixiaoheigou/DashPlay/blob/main/skills/dashplay-install/SKILL.md and follow it step by step to install DashPlay for me.
+> Please download https://raw.githubusercontent.com/yizhixiaoheigou/DashPlay/main/skills/dashplay-install/SKILL.md with curl in a terminal and read all of it (not through a web summarizer, which may return an old or shortened copy), then follow it step by step to install DashPlay for me.
 
 The guide itself is in Chinese; assistants follow it in whatever language you write to them.
 

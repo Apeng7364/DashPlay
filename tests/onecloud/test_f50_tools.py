@@ -71,4 +71,24 @@ class RootReadbackTests(unittest.TestCase):
             with self.assertRaises(ValueError):root_plan.check(out,'boot')
 
 
+
+class MacToolsTests(unittest.TestCase):
+    """The prebuilt helpers the guide runs on a clean Mac must be exactly the ones listed."""
+    def test_prebuilt_helpers_match_their_checksums_and_pinned_sources(self):
+        repo = Path(__file__).resolve().parents[2]
+        tools = repo / 'tools' / 'mac-arm64'
+        listed = {}
+        for line in (tools / 'SHA256SUMS').read_text().splitlines():
+            digest, name = line.split()
+            listed[name] = digest
+        self.assertEqual(set(listed), {'spd_dump', 'lz4'})
+        for name, digest in listed.items():
+            self.assertEqual(hashlib.sha256((tools / name).read_bytes()).hexdigest(), digest, name)
+            self.assertTrue((tools / name).stat().st_mode & 0o111, name)
+        sources = {i['file'] for i in json.loads((repo / 'skills/dashplay-install/downloads.json').read_text()) if i['group'] == 'mac-tools-src'}
+        build = (repo / 'scripts' / 'build-mac-tools.sh').read_text()
+        self.assertEqual(sources, {'spreadtrum-source.tar.gz', 'libusb-1.0.29.tar.bz2', 'lz4-1.10.0.tar.gz'})
+        for source in sources:
+            self.assertIn(source, build)
+
 if __name__ == '__main__':unittest.main()
