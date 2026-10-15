@@ -375,6 +375,24 @@ def ssh_first_login(w, host, password):
     require(b'KEY_SET' in buf, 'first SSH login with the installer password failed')
 
 
+# Magisk keeps a module installed from a running Android in modules_update until the next boot (modules/ holds only
+# module.prop and "update" until then), so right after the install the switch is in modules_update.
+SWITCH_PATHS = ('/data/adb/modules_update/mu300_linux_switch/switch.sh', '/data/adb/modules/mu300_linux_switch/switch.sh')
+
+
+def arm_linux(w):
+    """The installer's switch writes the one-shot Linux boot into misc and reboots. Its dry run checks the same things
+    first; anything it refuses (its messages start with "mu300-linux:") stops here, with Android still the default."""
+    found = w.adb('shell', ' || '.join(f'ls -d {p} 2>/dev/null' for p in SWITCH_PATHS), check=False).strip()
+    require(found in SWITCH_PATHS, 'the installer\'s switch script is in neither modules_update nor modules; do not reboot')
+    dry = w.adb('shell', f'sh {found} --dry-run 2>&1', check=False)
+    require('dry run: nothing was written' in dry and 'mu300-linux:' not in dry,
+            f'switch dry run refused: {dry.strip().splitlines()[-1:] or "no output"}; Android is unchanged, do not reboot')
+    # the device reboots at the end, so adb may report the lost connection: the text decides
+    out = w.adb('shell', f'sh {found} 2>&1', check=False)
+    require('mu300-linux:' not in out, f'switch refused: {out.strip().splitlines()[-1]}; Android is unchanged')
+
+
 def openwrt(w, args):
     w.needs('flash')
     subprocess.run(['adb', 'connect', ANDROID], capture_output=True, timeout=30)
@@ -416,7 +434,6 @@ def openwrt(w, args):
     say('installing OpenWrt on the SD card (several minutes)')
     out = install(False)
     require(not re.search(r'^! ', out, re.M), 'installer stopped with an error: see logs/mu300-install.log; do not reboot')
-    require('mu300_linux_switch' in w.adb('shell', 'ls /data/adb/modules'), 'installer module missing; do not reboot')
     after = w.adb('exec-out', 'cat /dev/block/by-name/boot_b', binary=True)
     require(after == (w.f50 / 'preinstall-boot_b.bin').read_bytes(), 'Android boot_b changed; do not reboot')
     password_file = w.private / 'openwrt-root-password.txt'
@@ -424,7 +441,7 @@ def openwrt(w, args):
     password_file.chmod(0o600)
     password = parse_password(password_file.read_text())
     say('switching to OpenWrt (about 1 minute)')
-    w.adb('shell', 'sh /data/adb/modules/mu300_linux_switch/switch.sh', check=False)
+    arm_linux(w)
     if not wait_port(OPENWRT, 22, 300):
         action('拔下 F50 的 USB 线再插回电脑（让电脑重新取地址），然后等待。')
         require(wait_port(OPENWRT, 22, 300), f'OpenWrt not reachable at {OPENWRT}:22')

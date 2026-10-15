@@ -75,6 +75,20 @@ class FdlTests(unittest.TestCase):
             fdl.send('quit', 10)
 
 
+class FakeAndroid:
+    """Work.adb stand-in: each "adb shell" command gets the reply of the first key it ends with or starts with."""
+    def __init__(self, replies):
+        self.replies, self.calls = replies, []
+
+    def adb(self, *args, check=True, binary=False, timeout=120):
+        command = args[-1]
+        self.calls.append(command)
+        for key, reply in self.replies.items():
+            if command.endswith(key) or command.startswith(key):
+                return reply
+        return ''
+
+
 class InstallerTests(unittest.TestCase):
     def test_dry_run_only_for_the_sd_card_boot_a_and_misc(self):
         install.check_dry_run(DRY_RUN)
@@ -92,6 +106,29 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(install.parse_password(text), 'example-pass word')
         with self.assertRaises(install.Stop):
             install.parse_password('MU300 Linux noble\nuser: ubuntu\npassword: other\n')
+
+    def test_switch_runs_from_modules_update_right_after_the_install(self):
+        # 2026-10-15: Magisk puts a freshly installed module in modules_update until the next boot; modules/ held only
+        # module.prop and "update", so "sh /data/adb/modules/mu300_linux_switch/switch.sh" found no file
+        fresh = '/data/adb/modules_update/mu300_linux_switch/switch.sh'
+        w = FakeAndroid({'ls': fresh + '\n', '--dry-run 2>&1': 'misc  new: x\ndry run: nothing was written\n',
+                         'switch.sh 2>&1': 'slot a armed for one boot. Rebooting into Linux.\n'})
+        install.arm_linux(w)
+        self.assertEqual([c for c in w.calls if not c.startswith('ls')],
+                         [f'sh {fresh} --dry-run 2>&1', f'sh {fresh} 2>&1'])
+
+    def test_switch_missing_or_refusing_stops_before_a_reboot(self):
+        with self.assertRaisesRegex(install.Stop, 'switch script'):
+            install.arm_linux(FakeAndroid({'ls': ''}))
+        path = '/data/adb/modules/mu300_linux_switch/switch.sh\n'
+        refusing = FakeAndroid({'ls': path, '--dry-run 2>&1': 'mu300-linux: boot_a is not a boot image - install Linux first\n'})
+        with self.assertRaisesRegex(install.Stop, 'not a boot image'):
+            install.arm_linux(refusing)
+        self.assertFalse(any(c.endswith('switch.sh 2>&1') for c in refusing.calls))
+        failing = FakeAndroid({'ls': path, '--dry-run 2>&1': 'dry run: nothing was written\n',
+                               'switch.sh 2>&1': 'mu300-linux: misc verify failed\n'})
+        with self.assertRaisesRegex(install.Stop, 'misc verify failed'):
+            install.arm_linux(failing)
 
     def test_stages_need_the_one_before(self):
         # Work puts the pinned tools first on PATH, for the stage's own commands only
