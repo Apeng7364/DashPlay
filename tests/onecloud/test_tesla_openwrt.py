@@ -79,6 +79,19 @@ class OpenWrtOfflineTests(unittest.TestCase):
         connect.reset_mock()
         self.assertFalse(tesla.wan_available(run, connect)); connect.assert_not_called()
 
+    def test_wan_counts_as_up_when_only_a_domestic_target_answers(self):
+        # 2026-10-15, F50 with a working SIM: the carrier dropped 1.1.1.1:443 (and 8.8.8.8:443) while 223.5.5.5:443
+        # answered, so a probe of 1.1.1.1 alone kept the box answering Tesla's checks with no upstream DNS.
+        interface = {'interface':'wan', 'up':True, 'route':[{'target':'0.0.0.0','mask':0}],
+                     'ipv4-address':[{'address':'192.0.2.9'}]}
+        run = Mock(return_value=Mock(stdout=json.dumps({'interface':[interface]})))
+        def connect(target, timeout, source_address):
+            if target[0] in ('1.1.1.1', '8.8.8.8'):
+                raise OSError('timed out')
+            conn = Mock(); conn.__enter__ = Mock(return_value=conn); conn.__exit__ = Mock(return_value=False)
+            return conn
+        self.assertTrue(tesla.wan_available(run, connect))
+
     def test_real_wan_and_other_car_never_fake_checks_even_when_enabled(self):
         with tempfile.TemporaryDirectory() as root:
             controller = tesla.OfflineChecks(Path(root), Mock())

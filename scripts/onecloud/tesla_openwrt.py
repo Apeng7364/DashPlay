@@ -12,6 +12,9 @@ import subprocess
 import setup_wizard
 
 TABLE = 'dashplay_tesla_checks'
+# Any one answering means the upstream works. A Chinese SIM may drop 1.1.1.1:443 and 8.8.8.8:443 while the
+# rest of the internet works (F50, 2026-10-15), so domestic resolvers come first.
+PROBES = (('223.5.5.5', 443), ('1.12.12.12', 443), ('1.1.1.1', 443))
 
 
 def offline_fields(sections, network, host, own_name):
@@ -63,11 +66,12 @@ def wan_available(run=subprocess.run, connect=socket.create_connection):
             if not any(r.get('target') == '0.0.0.0' and r.get('mask') == 0 for r in item.get('route', [])):
                 continue
             for address in item.get('ipv4-address', []):
-                try:
-                    with connect(('1.1.1.1', 443), timeout=2, source_address=(address['address'], 0)):
-                        return True
-                except OSError:
-                    pass
+                for target in PROBES:
+                    try:
+                        with connect(target, timeout=2, source_address=(address['address'], 0)):
+                            return True
+                    except OSError:
+                        pass
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
     return False
