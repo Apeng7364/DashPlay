@@ -194,76 +194,49 @@ N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
 4. 连上盒子同 N1 第 4 步（地址 `192.168.78.1`，root / `1234`）。也可以给玩客云插网线到路由器：它的网口 MAC 每次开机随机，地址会变，在路由器里找主机名 `onecloud`，或扫局域网找能用 root/1234 登录且有 `/opt/dashplay` 的设备。
 5. 去“放认证文件”，再去“首次设置与上车”。
 
-## ZTE F50 从原厂 B16 到 OpenWrt（先做，再装下节插件）
+## ZTE F50 从原厂 B16 到 OpenWrt 和 DashPlay
 
-**风险先说清楚：这条路线会降低启动校验；断电、版本不符或写错可能变砖，最坏需要拆机短接。Root 阶段的 TCP ADB 实测不验证客户端身份，即使 `ro.adb.secure=1` 也不能当成已认证；只在隔离的电脑直连网络操作，结束后留在 OpenWrt。** 先取得针对这台设备、SD 卡清空及启动分区的授权。其他设备的 NV、IMEI、基带、GPT 绝不能写入。
+**风险先说清楚：这条路线会降低启动校验；断电、版本不符或写错可能变砖，最坏需要拆机短接。Root 后的 TCP ADB 不验证客户端身份，只在电脑直连的 USB 网络里用，结束后留在 OpenWrt。** 先取得针对这台设备、SD 卡清空及启动分区的授权。其他设备的 NV、IMEI、基带、GPT 绝不能写入。
 
-准备：F50、可清空的 8 GB 以上 SD 卡、能传数据的 USB 线、电脑至少 15 GB 空闲空间。下面的主机命令已按 Apple Silicon Mac 整理（`uname -m` 应为 `arm64`；Intel Mac 停下问用户：预编译的 spd_dump、lz4 和固定的 Python 依赖只有 arm64 版本）；Windows/Linux 若没有已验证的 USB/编译环境，停下问用户换到 Mac，不擅自套用 Windows 一键 root 脚本。F50 有两个 USB 口，使用能在电脑上打开原厂后台的那个；另一口无枚举时先换口，不当成设备坏了。
+准备：F50 插卡版（装插件时要用 SIM 卡上网）、可清空的 8 GB 以上 SD 卡（有数据先用读卡器另备份）、能传数据的 USB 线、**Apple Silicon Mac**（`uname -m` 为 `arm64`；Intel Mac、Windows、Linux 停下问用户换 Mac，不套用 Windows 一键 root 脚本）。F50 有两个 USB 口，用能在电脑上打开原厂后台的那个；另一口无反应先换口。全程约 30 分钟，其中机器自己跑约 25 分钟。
 
-### F0 识别与下载
+**全程用仓库里的 `scripts/f50-install.py`，一步一条命令，不要自己另写脚本代替它。** 备份、写入、两槽读回核对、装 OpenWrt、装插件和蓝牙的检查都在里面，这些检查就是本节原来的手工步骤。你的工作是：每条命令前把要用户做的事讲清楚、等用户说好，再运行，把结果转告用户。
+- 每条命令最后一行是 `F50_OK <步骤>`（成功，进下一步）或 `F50_STOP <步骤>: 原因`（停下：把原因原样告诉用户，不重试、不换办法、不自己改设备，`$WORK/f50` 整个目录保留）。中途的 `ACTION:` 行是要用户做的事。
+- 命令会运行几分钟到十几分钟：用你的工具允许的最长等待或后台运行，看到最后一行之前不下结论。日志在 `$WORK/f50/logs/`。
+- 各步按顺序，前一步没 `F50_OK` 后一步会拒绝运行；`flash` 只能跑一次，再跑会拒绝（要人先看现场）。
 
-开始前检查**实际备份目录所在磁盘**：`python3 -c 'import shutil,sys; n=shutil.disk_usage(sys.argv[1]).free; print("FREE_BYTES",n); sys.exit(0 if n >= 15_000_000_000 else 1)' "$WORK"` → 退出 0 → 才能做备份。退出非 0 时不要清理用户文件：用 `df -h` 找用户允许的工作盘，把 `INSTALL_BASE` 改为该盘内的目录，重新 `mktemp -d "$INSTALL_BASE/dashplay-install.XXXXXX"` 建 0700 私有 `WORK` 并重做空间检查。已有 `DP` 继续指向原来的工具目录，不搬走或覆盖既有文件；随后重新设置 `F50_WORK="$WORK/f50"`。无足够空间则停下，让用户提供备份盘。
+### F0 确认 B16 并检查工具（约 3 分钟）
 
 1. 电脑通过 USB 打开 `http://192.168.0.1/`，让用户在原厂后台登录，读取型号与完整固件版本 → 必须为 **ZTE F50、F50_FLYMODEM_ZYV1.0.0B16** → U30 Air、其他运营商定制版、非 B16 都不继续本节，按下一步处理。不要用文件名代替后台版本。**不需要用户在后台打开 USB 调试（`#usb_port` 等页面）**：本路线备份和 Root 都走断电重接的下载模式，ADB 由写入的 Root 镜像在启动后自己打开；不要让用户去开，也不要因为它关着就停下或改走别的路线。
 2. 非 B16 的调查结论（2026-10-14）：[Xio-Shark 原作者](https://github.com/Xio-Shark/f50-b16) 明确只支持 B16；[zte-f50-toolkit](https://github.com/dikeckaan/zte-f50-toolkit) 提供的是 **B09** 路线，不是已验证的“任意版本降到 B16”，且包含改基带/设备标识工具。当前未找到可核实、覆盖具体起始版本的 B16 降级路线。**不要试 B09 包、不要猜降级。** 记录用户完整版本后，可以只做调查：在网上查有没有针对这个具体版本的路线，交给用户一份报告，逐条写来源链接、作者、是否有作者或他人的实机记录（覆盖哪个起始版本）、要写哪些分区（是否碰基带、NV/IMEI、GPT）、能否先完整备份、出错后怎么恢复；没找到就如实说没找到。**调查阶段不下载其中的刷机包或工具、不运行其中的命令、不连 F50 写入**；报告交给用户后停下，由用户决定。本向导不执行报告里的任何路线；在它被本项目实机验证并写进本节之前，可以建议用户换 B16 的 F50，或改用 N1 / 玩客云。
-3. 在电脑建独立目录，获取本仓库工具（已有本仓库时直接把 `DP` 设成其绝对路径）：
+3. 先完成「下载工具与校验」（含 `mac-bootstrap.sh` 和它的 `export`），再建本节用的 Python 环境并检查（要 15 GB 空闲，不够就按上面换 `INSTALL_BASE` 重建 `WORK`）：
    ```sh
-   F50_WORK="$WORK/f50"
-   python3 "$DP/scripts/fetch-install-assets.py" f50 "$F50_WORK"
+   python3 -m venv "$WORK/venv"
+   "$WORK/venv/bin/python" -m pip install --only-binary=:all: --require-hashes -r "$DP/skills/dashplay-install/requirements-f50.txt"
+   "$WORK/venv/bin/python" "$DP/scripts/f50-install.py" check "$WORK"
    ```
-   → 四项均 `SHA256_OK` → 下载失败只重试网络；`HASH_MISMATCH` 停下，不改清单去迁就下载。下载来源和全部 SHA-256 在本 skill 的 [downloads.json](downloads.json)；这是对应**项目作者发布地址**，不是中兴官方刷机服务，也不把社区镜像称为厂商官方。
-4. 确认已执行“下载工具与校验”里的 `mac-bootstrap.sh` 和它给出的 `export PATH=...`：`python3 --version; command -v python3 spd_dump lz4` → Python 3.12.x，三个路径都在 `$WORK/python/bin` 或 `$DP/tools/mac-arm64` → 不是就回到那一步，不用系统或 Homebrew 的同名程序。Python 库用项目环境：`python3 -m venv "$WORK/venv"`，执行 `"$WORK/venv/bin/python" -m pip install --only-binary=:all: --require-hashes -r "$DP/skills/dashplay-install/requirements-f50.txt"` → 固定版本及官方 PyPI wheel 摘要全部通过；失败停止，不去掉摘要校验或改共享环境；然后执行 `export PATH="$WORK/venv/bin:$PATH"`、`python3 -c "import sys,cryptography; print(sys.executable)"` → 显示 `$WORK/venv/bin/python3` 且导入成功；后续命令都在这个终端运行。导入失败或路径不是此 venv 则停止，不能换用共享 Python。ADB 若未安装：`python3 "$DP/scripts/fetch-install-assets.py" adb-mac "$WORK/adb"`，`unzip "$WORK/adb/platform-tools-darwin.zip" -d "$WORK/adb"`，本次 PATH 加 `$WORK/adb/platform-tools` → `adb version` 正常。Google 的 latest 地址若已更新而摘要不符，停下审核新版，不能绕过摘要。
-5. 使用仓库自带的只读原始分区读取版 spd_dump（不执行上游一键脚本）：
-   ```sh
-   SPD="$DP/tools/mac-arm64/spd_dump"
-   "$SPD" --help 2>&1 | head -1
-   ```
-   → 输出 `branch:pinned-raw-read, sha1:d24c21a0c93a545c0130668caa1826d59ceebe48` → 不是就停下，不能换成其他 fork 或自己下载的版本。它由 `scripts/build-mac-tools.sh` 从固定提交的 [spreadtrum_flash](https://github.com/TomKing062/spreadtrum_flash) 源码、`patches/spreadtrum-read-user-area.patch` 和 libusb 1.0.29 编出，`mac-bootstrap.sh` 已核对摘要；该补丁只增加 `user_partition` 原始读取，不改变写入。
+   → `F50_OK check`：固定下载（[downloads.json](downloads.json) 里的项目作者地址和 SHA-256，不是中兴官方）、仓库自带的 spd_dump/lz4、ADB 和本机 ADB 密钥都已就绪。摘要不符会停下，不改清单迁就下载。
 
-### F1 下载模式完整备份
+### F1 备份并 Root（一次断电重接，约 8 分钟）
 
-备份按分区表的原始偏移读取主副 GPT 和 75 个分区中的 69 个（约 3.3 GiB，几分钟），包括 NV/IMEI、基带、全部启动分区；不用 `r all`/`all_lite`，命名 NV 读取可能替换分区、去头。跳过的是安卓用户数据与日志：userdata、cache、blackbox、fulldumpdb、sysdumpdb、uboot_log（约 27 GiB，要多读四十分钟）。本路线从不写这些分区，2026-10-14 恢复原厂 B16 也只写回 boot/trustos/misc，再用后台“恢复出厂设置”重建了用户数据；所以开始前请用户记下原厂后台里改过的设置（WiFi 名称和密码等），以后要回原厂时这些需要重新设置。eMMC boot0/boot1/RPMB 不在用户区内，下载通路未覆盖，不能声称可恢复所有硬件故障。SD 卡如有数据先用读卡器另备份，不能把“授权清空”当成已经备份。
+先告诉用户两件事，等用户说好：
+- 备份读取约 3.3 GiB（NV/IMEI、基带、全部启动分区、主副 GPT），跳过安卓用户数据和日志（约 27 GiB；以后回原厂用后台「恢复出厂设置」重建）。**请先记下原厂后台里改过的设置**（WiFi 名称和密码等）。备份只留在这台电脑，不上传。
+- 命令开始后要做一次：**断开 F50 全部电源（拔掉 USB 线），再插回电脑**；之后约 8 分钟不要碰它。
 
-1. `mkdir "$F50_WORK/discovery"; cd "$F50_WORK/discovery"`；先运行 `"$SPD" --wait 600 --kickto 2 exec path . partition_list partition_list.xml reset`，然后单独请用户：**断开 F50 全部电源，再用已确认的数据口接回电脑。** → 应看到 FDL2、分区表、`pgpt.bin`、reset ACK，退出 0。若模式切换报告 `LIBUSB_ERROR_IO`：只在系统 USB 枚举已变成 `1782:4d00` 时，等枚举稳定后执行一次 `"$SPD" --wait 10 exec path . partition_list partition_list.xml reset`（标准 CHECK_BAUD；不用 `--reconnect`）。仍失败就停止，保留日志，不轮试 kick0/kick1 或短接。
-2. `python3 "$DP/scripts/f50-backup.py" plan "$F50_WORK/discovery/pgpt.bin" "$F50_WORK/backup" "$SPD"` → `PLAN_READY 69 of 75 partitions`，跳过的正好是上面 6 个，检查计划所需空间 → CRC/布局不符或数量不同停下问用户，不手改 GPT，不改跳过名单。
-3. `sh "$F50_WORK/backup/backup.sh" > "$F50_WORK/backup/download.log" 2>&1`，再次只请用户断电重接 → 命令退出 0、后台恢复安卓 → 读取失败保留目录，不能进入 root。
-4. `python3 "$DP/scripts/f50-backup.py" verify "$F50_WORK/backup"` → **`BACKUP_VERIFIED 69 of 75 partitions`**，生成 `verified.json`，主副 GPT 相互验证、boot/trustos/misc 重复读相同 → 少一个文件、长度不对或哈希不一致都停止。备份只留用户电脑，目录 0700，不上传、不放公开仓库。
+`"$WORK/venv/bin/python" "$DP/scripts/f50-install.py" flash "$WORK"` → `F50_OK flash`：备份 69 of 75 个分区并核对通过；用这台 F50 自己的 TrustOS 和本机 ADB 公钥做出 Root，只写 boot_b、trustos_b，每次写后读回 A/B 两槽和 GPT；重启后 ADB 是 root、B16、B 槽。读回不符会停下且不重启，**这时让用户保持 F50 通电连接**，不拔线硬试。
 
-### F2 用本机备份制作 Root，逐步写后读回
+### F2 SD 卡装 OpenWrt，保留安卓 B（约 10 分钟）
 
-1. `adb start-server` → 存在 `$HOME/.android/adbkey.pub` → 没有就 `mkdir -p "$HOME/.android" && adb keygen "$HOME/.android/adbkey"` 生成这台电脑自己的密钥，再确认公钥存在；仍没有就停下排查 ADB，不能拿别人公钥。离线制作：
-   ```sh
-   python3 "$DP/scripts/prepare-f50-root-candidate.py" "$F50_WORK/magisk.img" "$F50_WORK/Magisk_28103.apk" "$HOME/.android/adbkey.pub" "$F50_WORK/boot-root.img"
-   python3 "$DP/scripts/prepare-f50-trustos.py" "$F50_WORK/backup/trustos_b.bin" "$F50_WORK/backup/sml_b.bin" "$F50_WORK/trustos-root.bin"
-   python3 "$DP/scripts/f50-root-plan.py" prepare "$F50_WORK/backup" "$F50_WORK/boot-root.img" "$F50_WORK/trustos-root.bin" "$F50_WORK/root-session"
-   ```
-   → ramdisk 往返通过、`packaging_matches_device_backups=true`、签名验证通过、`ROOT_PLAN_READY` → 任一失败都停止。TrustOS 必须来自**这台设备自己的** trustos/sml；不下载别人 tos.bin。补丁将两个已审核的 AVB 错误返回改为成功；离线验证不等于这台设备已实测可启动。
-2. **写入范围必须包括可能影响 A/B 两槽的 boot 和 trustos**。此下载固件存在槽映射/复制现象，`w boot_b` 不保证只变 B；因此计划读取物理 GPT 偏移、同时检查 A/B，禁止宣称“未改 A”。保持同一个交互 FDL 会话：`cd "$F50_WORK/root-session"; "$SPD" --wait 600 --kickto 2 exec`，请用户断电重接 → 等 `FDL2 >`。失败按 F1 的单次标准握手退路；没有 FDL2 就不发写命令。
-3. 在这个 FDL 终端逐行输入 `stage-before.txt` 的命令（**这些是 spd_dump 命令，不是 shell 脚本**；用另一主机终端查看文本）。每行结束等 `FDL2 >`。再在另一终端执行 `python3 "$DP/scripts/f50-root-plan.py" check "$F50_WORK/root-session" before` → `READBACK_OK before` → 不符即停止，不写。
-4. 同样逐行输入 `stage-boot.txt`，它只下发一次 `w boot_b root-boot.img`，随后完整读回 A/B boot、A/B trustos、misc、主副 GPT；主机执行 `python3 "$DP/scripts/f50-root-plan.py" check "$F50_WORK/root-session" boot`→ `READBACK_OK boot` → 不符即停，**不再写、不 reset、不拔线硬试**，保存现场问用户。
-5. 同样输入 `stage-trustos.txt`，主机执行 `python3 "$DP/scripts/f50-root-plan.py" check "$F50_WORK/root-session" trustos` → `READBACK_OK trustos` → 不符同上。只有两阶段都通过，才在 FDL 终端输入 `reset`，等 ACK/退出。
-6. 安卓启动后 `adb connect 192.168.0.1:5555`，`adb -s 192.168.0.1:5555 shell 'id; getprop sys.boot_completed; getprop ro.boot.slot_suffix; getprop ro.build.display.id'` → uid=0、1、`_b`、B16 → 连接失败、非 root、非 B16、非 B 槽都停止，不改槽假装满足前置。再次提醒当前 TCP ADB 无可靠认证，勿接共享 WiFi。
+请用户**插入已同意清空的 SD 卡**，再运行 `"$WORK/venv/bin/python" "$DP/scripts/f50-install.py" openwrt "$WORK"` → `F50_OK openwrt`：先试运行确认只写 SD 卡、boot_a 和 misc 的 32 字节，再安装、核对安卓 boot_b 没变，切到 OpenWrt 25.12（内核 5.4、SD 根、A 槽），防火墙检查通过，默认从 OpenWrt 启动（连续 5 次起不来自动回安卓，不 lock）。后台 `http://192.168.77.1/`，root 密码在 `$WORK/f50/private/openwrt-root-password.txt`，**不贴进聊天**；电脑之后用本次生成的密钥登录，不再用密码。以后默认进哪个系统，装好并真实出画后在「收尾检查」问用户。
 
-### F3 SD 安装 OpenWrt，保留 Android B
+### F3 装 DashPlay 和蓝牙（约 5 分钟，要 SIM 卡上网）
 
-1. `python3 "$DP/scripts/prepare-mu300-panel-installer.py" "$F50_WORK/openwrt-k5.4.zip" "$F50_WORK/openwrt-luci-rootfs.tar.gz" "$F50_WORK/mu300-panel.zip"` → 输出派生包 SHA-256，ZIP 校验通过 → 不匹配停止。此派生器只切面板 rootfs，保留上游 root/槽位/SD 防护；不是执行早期会缩 userdata 的 PC 安装器。
-2. 请用户插入已授权清空的 SD 卡。`adb -s 192.168.0.1:5555 shell 'cat /proc/partitions; readlink -f /dev/block/by-name/boot_a; readlink -f /dev/block/by-name/boot_b'` → `mmcblk1p1` 容量与用户 SD 卡相符，A/B 对应不同块设备 → 不符停下，不用 eMMC 代替 SD。
-3. `adb -s 192.168.0.1:5555 push "$F50_WORK/mu300-panel.zip" /data/local/tmp/mu300-panel.zip`。在电脑保存以下 **非秘密** 配置为 `$F50_WORK/mu300-install.conf`：
-   ```text
-   MU300_STORAGE=sd
-   MU300_SD_ERASE=yes
-   MU300_BOOT_OS=openwrt-luci
-   MU300_BOOT=android
-   MU300_BOOT_ATTEMPTS=5
-   MU300_HOTSPOT=yes
-   MU300_DRY_RUN=1
-   ```
-   `adb -s 192.168.0.1:5555 push "$F50_WORK/mu300-install.conf" /data/adb/mu300-install.conf`；`adb -s 192.168.0.1:5555 shell 'chown 0:0 /data/adb/mu300-install.conf; chmod 600 /data/adb/mu300-install.conf; /data/adb/magisk/magisk --install-module /data/local/tmp/mu300-panel.zip'`。
-   → 显示 Android B、Linux A、SD 卡、只写 SD/boot_a/misc，最后 `Dry run: nothing was written`（Magisk 外层可非零退出，按文本确认）→ 若要写内部 userdata/GPT、不是 SD 或槽位不同，停止，不删保护检查。
-4. 备份 root 后的 boot_a/b、misc 到电脑：每个使用 `adb -s 192.168.0.1:5555 exec-out cat /dev/block/by-name/<分区> > "$F50_WORK/preinstall-<分区>.bin"`，三个文件大小分别应为 64 MiB、64 MiB、1 MiB。准备已确认，删除配置文件中 **仅** `MU300_DRY_RUN=1` 这一行，重新 push/chown/chmod，执行相同 `magisk --install-module`。→ 完成安装并输出密码保存位置 → 出错停止，不立刻 reboot。登录密码从输出提示的本机私有位置读取，不贴聊天。
-5. `adb -s 192.168.0.1:5555 exec-out cat /dev/block/by-name/boot_b` 保存为 `postinstall-boot_b.bin`，用 `cmp "$F50_WORK/preinstall-boot_b.bin" "$F50_WORK/postinstall-boot_b.bin"` → 无输出且退出 0，安装器的 boot_a/misc 校验通过 → 任何校验失败不重启。执行 `adb -s 192.168.0.1:5555 shell sh /data/adb/modules/mu300_linux_switch/switch.sh` → 设备重启到 OpenWrt；如果模块目录不存在，不猜另一个路径，先 `adb -s 192.168.0.1:5555 shell ls /data/adb/modules` 核对安装是否成功。
-6. SSH 到 `192.168.77.1`（root，使用刚才生成的密码），运行 `cat /etc/openwrt_release; uname -r; df -h /; cat /run/mu300/linux-slot` → OpenWrt 25.12.x、5.4、SD 根、a；后台能登录。`fw4 check` → 正常；若明确是 5.4 的 flowtable 错误，`uci set firewall.@defaults[0].flow_offloading=0; uci commit firewall; /etc/init.d/firewall restart`，再检查；不能关闭整个防火墙。`mu300-next-boot linux` → `default boot: linux`：安装和调试期间断电或重启仍回到 OpenWrt，连续 5 次启动失败自动回 Android；不执行 lock。以后开机默认进哪个系统，装好并真实出画后在「收尾检查」问用户再定。
-7. 进入下一节安装 DashPlay 插件，再放认证文件、配对；特斯拉直接完成「特斯拉」一节。保留备份和 SD，不宣称未做的冷启动/上车验收已经通过。
+先说明会往 F50 装 Python、Java 等约 225 MB，得到同意后运行 `"$WORK/venv/bin/python" "$DP/scripts/f50-install.py" dashplay "$WORK"` → `F50_OK dashplay`：从 openwrt-dashplay 最新发布下载并校验四个包，装好，搭好 F50 专用的私有蓝牙（不装系统 bluez-daemon），确认日志里 `bluetooth powered`。没网时停下：请用户插好能上网的 SIM 卡再运行。
+
+接着：
+- 认证文件：先按「放认证文件」开头说明共用实验身份的风险，再运行 `"$WORK/venv/bin/python" "$DP/scripts/f50-install.py" identity "$WORK"`（用户已有两个文件时在末尾加它们所在的目录）→ `F50_OK identity`。它做的就是那一节的第 1–3 步。
+- 特斯拉：做「特斯拉」一节（F50 那一项用 `tesla` 步骤）。其他车：设置页 `http://192.168.77.1:18080/` 添加 iPhone，车机连 F50 的 WiFi 打开 `https://192.168.77.1:18443/`；打不开见「车机打不开画面时」。
+- 保留备份（`$WORK/f50`）和 SD 卡；没做的冷启动、上车验收不宣称通过。
 
 ## 已有 OpenWrt：安装 DashPlay 插件（F50 / 路由器）
 
@@ -276,7 +249,7 @@ DashPlay 在 OpenWrt 上是插件。设备必须已经运行 OpenWrt 25.12（用
    `apk update && apk add --allow-untrusted /tmp/dashplay-jre-*_$(cat /etc/apk/arch).apk /tmp/dashplay-2*.apk /tmp/luci-*.apk`
    （包没有签名，所以要 `--allow-untrusted`。）
 3. **蓝牙**（无线 CarPlay 需要）：
-   - F50：**不要**装系统的 `bluez-daemon`（会带入和 F50 内核不匹配的模块）。依次执行：`python3 /opt/dashplay/board_zte_f50.py --setup`；`uci set dashplay.main.bluetooth_service='/usr/bin/python3 /opt/dashplay/board_zte_f50.py'`；`uci set dashplay.main.dbus_address='unix:path=/var/run/dashplay/bluetooth/system_bus_socket'`；`uci commit dashplay && /etc/init.d/dashplay restart`。→ 设置页能添加 iPhone、日志没有 Bluetooth adapter did not power on → 失败查 `/var/run/dashplay/supervisor.log`，不改装系统 BlueZ。
+   - F50：用上一节的 `f50-install.py dashplay`，它已包含下面三步和蓝牙；**不要**装系统的 `bluez-daemon`（会带入和 F50 内核不匹配的模块）。
    - 其他路由器：`apk add bluez-daemon`；用 USB 蓝牙棒再加 `kmod-btusb`。没有蓝牙就只能有线。
    - 有线（数据线）需要路由器的 USB 口能当主机：`apk add kmod-tun`。F50 不支持有线。
 4. **WiFi**：在路由器后台「服务 → DashPlay」选交给 iPhone 的 WiFi（默认自动选第一个 5 GHz 热点）。网络本身用户怎么设就怎么用，不要改他的网络配置。
@@ -364,7 +337,8 @@ DashPlay 在 OpenWrt 上是插件。设备必须已经运行 OpenWrt 25.12（用
 特斯拉模式是已有网络方式上的开关：F50/OpenWrt 自己提供热点和上网；N1/玩客云用方式二或方式三，方式一不适用。开启时默认音乐、通话与 Siri 走车机蓝牙，并显示全屏按钮；N1/玩客云可在「声音」单独调整。F50 插卡已实测；N1 方式三的 A、B 手工方案已于 2026-10-15 实测，正式版本待复测，玩客云与特斯拉方式二未测。特斯拉能访问的地址必须实际核对，不能只看开关或把网关地址当盒子地址。
 
 1. **按设备与方式启用**，先告诉用户本分支会改变哪个网络、需要重连哪个热点：
-   - **F50 / OpenWrt**：在当前 SSH 会话执行 `uci set dashplay.main.tesla_mode=1 && uci commit dashplay && /etc/init.d/dashplay restart`。**插了能上网的 SIM 卡时**，同一条命令前先加 `uci set dashplay.main.answer_tesla_checks=0 &&`（关闭「替特斯拉回答联网检查」：有卡就有真网，不需要代答；2026.10.15 的程序只用 1.1.1.1 判断上游，有的运营商挡这个地址，会误判成没网并关掉上游 DNS，证书申请随之失败）；没插卡保持默认 `auto`。重启后执行 `nslookup duckdns.org 127.0.0.1` → 返回地址 → 否则先查 `uci get dashplay.main.answer_tesla_checks` 与 WAN，不继续申请证书。约半分钟后局域网地址变为 `100.96.0.1`，SSH 可能断开；电脑重连原热点后用 `ssh root@100.96.0.1`。执行 `ip -4 addr show br-lan` → 有 `100.96.0.1/24`；设置页无网段冲突红字 → 否则停下保存不含密码的网络状态，不改运营商网口。`uci show wireless | grep -E "country|channel"` 核对 WiFi；已有实车记录中 CN/149 可见、信道 36 不可见。仅在用户实际位于 CN、当地允许该频段且同意时，按输出中实际 radio 名执行 `uci set wireless.<radio>.country=CN; uci set wireless.<radio>.channel=149; uci commit wireless; wifi reload`，重连并再次核对 country/channel 与车机热点列表；其他地区按该地区官方频谱要求核对，不硬套 CN。
+   - **F50**：`"$WORK/venv/bin/python" "$DP/scripts/f50-install.py" tesla "$WORK" --sim yes`（插了能上网的 SIM 卡；没插用 `--sim no`）→ `F50_OK tesla`。插卡时它先关掉「替特斯拉回答联网检查」（有卡就有真网；2026.10.15 程序只看 1.1.1.1，有的运营商挡它会误判没网），再开特斯拉模式；局域网约半分钟后变成 `100.96.0.1`，中途出现 `ACTION` 就请用户拔插一次 USB 线让电脑重新取地址；然后核对 `br-lan` 是 `100.96.0.1/24`、插卡时上游 DNS 可用、接收端带 `--tesla`，并显示 WiFi 的国家和信道。已有实车记录里 CN/149 车机看得到、信道 36 看不到：**仅在用户实际位于中国、同意时**再运行一次并加 `--cn-149`；其他地区按当地规定，不硬套。之后电脑用 `ssh -i "$WORK/f50/private/ssh-key" root@100.96.0.1` 登录。F50 跳过下面第 2 步（脚本已核对），从第 3 步继续。
+   - **其他 OpenWrt 路由器**：在当前 SSH 会话执行 `uci set dashplay.main.tesla_mode=1 && uci commit dashplay && /etc/init.d/dashplay restart`（插了能上网的 SIM 卡时，前面先加 `uci set dashplay.main.answer_tesla_checks=0 &&`），约半分钟后局域网变成 `100.96.0.1`，电脑重连后 `ssh root@100.96.0.1`，`ip -4 addr show br-lan` → 有 `100.96.0.1/24`。
    - **N1 / 玩客云方式三**：首次设置选“车机连盒子热点”，在当前设置页“车”勾选“特斯拉模式”并保存。约 1 分钟后电脑重连已保存名称/密码的盒子热点，按设置页实际地址 SSH；执行 `ip -4 addr` → 热点网卡默认 `100.96.0.1/24`，冲突时为提示的共享空间备用 /24 → 不符停下看设置页提示，不重复切网段。
    - **N1 / 玩客云方式二**：先查看随身 WiFi 的型号官方手册和后台 LAN 设置，确认允许修改 LAN/DHCP；没有此功能即停止本路线，告知用户可改选方式三，不能声称 DashPlay 会代改随身 WiFi。经用户同意，在其后台将 LAN 设为 `100.96.0.1/24`、DHCP 池设为 `100.96.0.100–100.96.0.200`，确认该段不与其他接口冲突再保存；字段/含义不匹配时停下核对该型号文档。电脑、盒子和车机都重连随身 WiFi。由后台租约按已记录的盒子 MAC 找到**盒子的新 IP**，用该 IP SSH；网关 `100.96.0.1` 是随身 WiFi，不能拿来当 DashPlay 地址。在盒子设置页勾选“特斯拉模式”保存。随后 SSH 到该盒子执行：
      `python3 -c "import json,pathlib,ipaddress; a=json.loads(pathlib.Path('/opt/dashplay/state/car-lease.json').read_text())['address']; assert ipaddress.ip_address(a) in ipaddress.ip_network('100.64.0.0/10'); print(a)"`
