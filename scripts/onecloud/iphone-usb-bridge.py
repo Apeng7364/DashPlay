@@ -25,6 +25,7 @@ import time
 ROLE = Path("/sys/class/usb_role/c9040000.usb-role-switch/role")
 CARPLAY_CONFIGURATION = 6
 READ_CHUNK = 16384
+NCM_READ_CHUNK = 65536  # NTB16; iPhone sends ~32 KB transfers (drive F9).
 
 
 def log(text):
@@ -277,7 +278,7 @@ def main():
     def ncm_to_tap(index, endpoint):
         while True:
             try:
-                block = bulk(fd, endpoint, length=READ_CHUNK, timeout=1000)
+                block = bulk(fd, endpoint, length=NCM_READ_CHUNK, timeout=1000)
             except OSError as error:
                 if error.errno == errno.ETIMEDOUT:
                     continue

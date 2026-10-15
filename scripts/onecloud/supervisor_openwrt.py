@@ -29,6 +29,7 @@ from settings_page import SettingsPage
 import setup_wizard
 import diagnostics
 import own_domain
+from tesla_openwrt import OfflineChecks
 from platform_openwrt import OpenWrtPlatform, RUN
 
 DEFAULTS = {"enabled": "1", "wifi": "auto", "settings_port": "18080",
@@ -50,7 +51,7 @@ DEFAULTS = {"enabled": "1", "wifi": "auto", "settings_port": "18080",
             # the car and plays prompts louder. car_voice 1: calls and Siri too (the receiver offers no microphone).
             "car_music": "0", "car_voice": "0",
             # 1: Tesla mode: shared_lan, car_music, car_voice and the Tesla browser's fullscreen.
-            "tesla_mode": "0",
+            "tesla_mode": "0", "answer_tesla_checks": "auto",
             # A DuckDNS sub-domain and its token: the name becomes <sub-domain>.duckdns.org, with a Let's Encrypt
             # certificate the router obtains and renews itself (own_domain.py). Empty: off.
             "duckdns_domain": "", "duckdns_token": ""}
@@ -370,6 +371,7 @@ def main():
     state = root / "state"
     state.mkdir(mode=0o700, exist_ok=True)
     platform = OpenWrtPlatform(run=RUN)
+    platform.bluetooth_state = state
     stopped = threading.Event()
     reexec = []
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -396,6 +398,7 @@ def main():
     trusted = []   # the network the settings page serves, once the Wi-Fi is known (it starts after that)
     settings = SettingsPage(state, lambda: status, request_reexec, lambda: list(trusted), None, WIRED_STATUS,
                             managed={"by": "OpenWrt", "admin": "/cgi-bin/luci/admin/network/wireless"})
+    offline_checks = OfflineChecks(state, platform=platform)
     maintainer = []   # own_domain.Maintainer, when a DuckDNS name is set
 
     def say(text):
@@ -426,6 +429,7 @@ def main():
             + car_audio_args(config))
 
     try:
+        offline_checks.restore()  # restore a crashed run before updating own-name DNS records
         mark("supervisor start")
         # Full logs on the SD card / flash, so that a drive can be analysed after the power is cut.
         diagnostics.LogMirror(state / "logs", RUN, platform.boot_id(), journal=False).start(stopped)
@@ -499,8 +503,11 @@ def main():
         public_mode = config["public_ipv6"] if config["public_ipv6"] in ("1", "2") else "0"
 
         def point(public):
-            if point_name(config["name"], host, public, public_mode == "2"):
-                say(f"{config['name']} now points at "
+            # The public own name resolves normally online. OfflineChecks owns its A-mode answer.
+            upstream_name = config["tesla_mode"] == "1" and ddns is not None
+            if point_name(config["name"], None if upstream_name else host,
+                          None if upstream_name else public, public_mode == "2" and not upstream_name):
+                say("own name uses upstream DNS" if upstream_name else f"{config['name']} now points at "
                     + " and ".join(a for a in ([] if public and public_mode == "2" else [host]) + [public] if a))
 
         public = platform.public_ipv6(network["device"]) if named and public_mode != "0" else None
@@ -513,7 +520,7 @@ def main():
                       entries=([f"https://{config['name']}:18443/"] if named or (ddns and own_domain.serving(state)) else [])
                       + [f"https://{host}:18443/"])
         if ddns:
-            maintainer.append(own_domain.Maintainer(root, ddns, host, stopped, say))
+            maintainer.append(own_domain.Maintainer(root, ddns, host, stopped, say, tesla=config["tesla_mode"] == "1"))
             maintainer[0].start()
         if network["mode"] == "sta" and platform.zone_input(network["network"]) not in ("ACCEPT", None):
             # A client network usually sits in the wan zone, which rejects the iPhone's AirPlay connections.
@@ -525,6 +532,8 @@ def main():
         refresh_network_warning(shared_on, network["device"], status, base_warning)
         trusted[:] = trusted_networks(network)
         settings.start(port)
+        if offline_checks.update(config, network, status) and network.get("ifname"):
+            reconnect_clients(network["ifname"], say)
         diagnostics.start(stopped, diagnostics.DiagLog(state / "diag"), RUN / "receiver.log", platform, status,
                           state=state)
 
@@ -551,10 +560,14 @@ def main():
                 request_reexec("MFi identity added")
                 continue
             for name, child in platform.children:
+                if name == 'tesla-dns-log':
+                    continue  # optional diagnostic collector is retried by OfflineChecks
                 if child.poll() is not None:
                     raise RuntimeError(f"{name} exited with {child.returncode}")
             if time.monotonic() >= next_check:
                 next_check = time.monotonic() + RECHECK_EVERY
+                if offline_checks.update(config, network, status) and network.get("ifname"):
+                    reconnect_clients(network["ifname"], say)
                 refresh_network_warning(shared_on, network["device"], status, base_warning)
                 now, why = platform.handoff(config["wifi"])
                 if now is None or plan_of(now) != plan:
@@ -571,6 +584,7 @@ def main():
         stopped.set()
         for worker in maintainer:
             worker.join(10)   # acme.sh is stopped first: no signer left running into the restarted service
+        offline_checks.restore()
         settings.stop()
         platform.stop_all()
         say("DashPlay services stopped")

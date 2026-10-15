@@ -40,3 +40,5 @@ playport-viewer-drive-fixes.patch
 playport-viewer-tesla.patch
 playport-view-areas.patch
 playport-car-bluetooth.patch
+playport-tesla-offline-fullscreen.patch
+playport-startup-timing.patch

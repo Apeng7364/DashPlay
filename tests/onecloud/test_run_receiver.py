@@ -41,6 +41,9 @@ class BrowserAccessTest(unittest.TestCase):
     def test_tesla_mode_brings_the_car_music_with_it(self):
         self.assertEqual(self.page_flags(tesla=True), {"carMusic": True, "tesla": True})
 
+    def test_tesla_browser_can_leave_audio_in_the_webpage(self):
+        self.assertEqual(self.page_flags(tesla_browser=True), {"tesla": True, "carMusic": False})
+
     def test_rejects_an_unexpected_token(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(ValueError):

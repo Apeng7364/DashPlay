@@ -1,0 +1,217 @@
+"""Phone sharing state machine and actual adapter command order with fake kernel I/O."""
+import ipaddress
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/onecloud'))
+from phone_uplink import PhoneUplink, JoinedPhoneAP, station_mac
+from platform_debian import DebianPlatform
+import setup_wizard
+
+class PhoneUplinkTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        self.state = Path(tmp.name)
+        (self.state/'uplink-hotspot.json').write_text('{"ssid":"Phone","passphrase":"synthetic-pass"}')
+        self.p = Mock()
+        self.p.concurrent_ap.return_value = 1
+        self.p.find_hotspot.return_value = (True, True, '')
+        self.p.join_wifi.return_value = True
+        self.p.local_addresses.return_value = []
+        self.p.frequency.return_value = 5745
+        self.p.uplink_gateway.return_value = '192.0.2.1'
+        self.p.add_phone_ap.return_value = True
+        self.p.start_ap.return_value = True
+        self.p.connected.return_value = True
+        self.p.ap_ready.return_value = True
+        self.now = 0
+        self.status = {'tesla':True,'own_name':'example.duckdns.org'}
+        self.receiver = Mock()
+        self.u = PhoneUplink(self.p, self.state, ipaddress.ip_interface('100.96.0.1/24'),
+                            {'ssid':'Box','passphrase':'synthetic-box'},149,40,Mock(),self.receiver,
+                            self.status, say=lambda _:None, clock=lambda:self.now)
+
+    def online(self):
+        self.now = 5; self.u.tick()
+        self.assertEqual(self.status['uplink']['phase'], 'online')
+
+    def test_start_offline_then_join_same_channel_and_forward(self):
+        self.u.tick(); self.p.find_hotspot.assert_not_called()
+        self.online()
+        calls = [c[0] for c in self.p.mock_calls]
+        self.assertLess(calls.index('prepare_phone_uplink'), calls.index('join_wifi'))
+        self.assertLess(calls.index('join_wifi'), calls.index('add_phone_ap'))
+        self.assertLess(calls.index('add_phone_ap'), calls.index('enable_phone_nat'))
+        self.assertEqual(self.p.configure_hotspot.call_args.args[:2], (149,20))
+        self.p.n_only_ap.assert_called_once()
+        self.assertEqual(self.p.start_dhcp.call_args.kwargs['upstream'], '192.0.2.1')
+        self.assertEqual(self.p.start_dhcp.call_args.args[2], [], 'online DNS must forward even own domain')
+        self.receiver.assert_called_with(149)
+        self.assertFalse(self.status['tesla_offline'])
+
+    def test_loss_and_changed_channel_remove_nat_and_restore_checks(self):
+        for change in ('loss','channel'):
+            self.p.connected.return_value=True; self.p.frequency.return_value=5745
+            self.now = self.u.next_try; self.u.tick()
+            if change == 'loss': self.p.connected.return_value=False
+            else: self.p.frequency.return_value=2412
+            self.u.tick()
+            self.assertEqual(self.u.phase,'offline')
+            self.p.cleanup_phone_uplink.assert_called()
+            self.assertIsNone(self.p.start_dhcp.call_args.kwargs['upstream'])
+            self.assertIn(setup_wizard.TESLA_CHECK_NAMES[0], self.p.start_dhcp.call_args.args[2])
+            self.assertGreater(self.u.next_try,self.now)
+
+    def test_missing_hotspot_never_tears_down_ap_and_retries(self):
+        self.p.find_hotspot.return_value = (True,False,'')
+        self.now=5; self.u.tick()
+        self.p.stop_child.assert_not_called()
+        self.p.find_hotspot.return_value=(True,True,'')
+        self.now=self.u.next_try; self.u.tick()
+        self.assertEqual(self.u.phase,'online')
+
+    def test_two_ap_failures_fall_back_and_auth_failure_does_too(self):
+        self.p.start_ap.side_effect=[False,False,True]
+        self.now=5; self.u.tick()
+        self.assertEqual(self.p.start_ap.call_count,3)
+        self.assertEqual(self.u.phase,'offline')
+        self.p.start_ap.side_effect=None; self.p.join_wifi.return_value=False
+        self.now=self.u.next_try; self.u.tick()
+        self.assertEqual(self.u.phase,'offline')
+        self.u.close(); self.p.cleanup_phone_uplink.assert_called()
+
+    def test_mac_pair_is_stable_distinct_and_unicast(self):
+        for mac in ('00:00:5e:00:53:01','02:00:5e:00:53:01'):
+            derived=station_mac(mac)
+            self.assertNotEqual(derived,mac)
+            self.assertEqual(int(derived[:2],16)&3,2)
+            self.assertEqual(derived,station_mac(mac))
+
+    def test_platform_mac_order_nat_cleanup_and_restart_recovery(self):
+        p=DebianPlatform('wlan-test',self.state,self.state/'sta.network')
+        def run(argv, **kwargs):
+            return Mock(returncode=0,stdout=json.dumps([{'address':'00:00:5e:00:53:01','permaddr':'00:00:5e:00:53:01'}]))
+        real_read=Path.read_text
+        def read(path,*a,**k):
+            return '0\n' if str(path)=='/proc/sys/net/ipv4/ip_forward' else real_read(path,*a,**k)
+        with patch('platform_debian.subprocess.run', side_effect=run) as command, patch.object(Path,'read_text',read), \
+                patch('shutil.which', return_value=None):
+            p.prepare_phone_uplink(); p.add_phone_ap(); p.enable_phone_nat(ipaddress.ip_network('100.96.0.0/24'))
+            commands=[c.args[0] for c in command.call_args_list]
+            sta=['ip','link','set','dev','wlan-test','address','02:00:5e:00:53:01']
+            ap=['iw','dev','wlan-test','interface','add','ap0','type','__ap']
+            self.assertLess(commands.index(sta),commands.index(ap))
+            self.assertIn(['ip','link','set','dev','ap0','address','00:00:5e:00:53:01'],commands)
+            p2=DebianPlatform('wlan-test',self.state,self.state/'sta.network')
+            p2.cleanup_phone_uplink()
+            commands=[c.args[0] for c in command.call_args_list]
+            self.assertIn(['sysctl','-w','net.ipv4.ip_forward=0'],commands)
+            adds=[c for c in commands if c[0]=='iptables' and '-I' in c]
+            deletes=[c for c in commands if c[0]=='iptables' and '-D' in c]
+            self.assertEqual(len(adds),3)
+            self.assertEqual(sorted([['-D' if v=='-I' else v for v in c] for c in adds]),sorted(deletes))
+            self.assertFalse((self.state/'phone-uplink.json').exists())
+
+    def test_shared_managed_ap_limit_does_not_mean_concurrency(self):
+        from platform_debian import supports_sta_ap
+        text = ('valid interface combinations:\n\t\t * #{ managed, AP } <= 1, #{ P2P-client, P2P-GO } <= 1,\n'
+                '\t\t   total <= 3, #channels <= 2\n')
+        self.assertEqual(supports_sta_ap(text), 0)
+
+    def test_overlapping_phone_network_falls_back_without_nat(self):
+        self.p.local_addresses.return_value = [ipaddress.ip_interface('100.96.0.8/24')]
+        self.now = 5; self.u.tick()
+        self.assertEqual(self.u.phase, 'offline')
+        self.p.enable_phone_nat.assert_not_called()
+
+    def test_other_cars_get_phone_sharing_without_tesla_dns(self):
+        self.status['tesla'] = False
+        self.now = 5; self.u.tick()
+        self.assertEqual(self.u.phase, 'online')
+        self.assertEqual(self.p.start_dhcp.call_args.args[2], [])
+        self.p.connected.return_value = False; self.u.tick()
+        self.assertFalse(self.status['tesla_offline'])
+        self.assertEqual(self.p.start_dhcp.call_args.args[2], [])
+
+    def test_nat_follows_ethernet_or_wifi_routes_and_excludes_client_ap(self):
+        p = DebianPlatform('wlan-test', self.state)
+        rules = p.phone_nat_rules(ipaddress.ip_network('192.0.2.0/24'))
+        for table, rule in rules:
+            self.assertNotIn('wlan-test', rule)
+            self.assertIn('192.0.2.0/24', rule)
+        self.assertIn(['!', '-o', 'ap0'], [rules[0][1][i:i+3] for i in range(len(rules[0][1])-2)])
+        self.assertIn(['!', '-i', 'ap0'], [rules[2][1][i:i+3] for i in range(len(rules[2][1])-2)])
+
+    def test_n_only_config_keeps_both_bands(self):
+        p=DebianPlatform('wlan-test',self.state)
+        with patch('platform_debian.wifi_driver',return_value='brcmfmac'):
+            for channel, band in [(149,'a'),(6,'g')]:
+                p.configure_hotspot(channel,20,'Box','synthetic-box'); p.n_only_ap()
+                conf=(self.state/'hostapd.conf').read_text()
+                self.assertIn('hw_mode='+band,conf); self.assertIn('ieee80211n=1',conf)
+                self.assertNotIn('ieee80211ac',conf)
+
+class JoinedPhoneAPTests(unittest.TestCase):
+    setUp = PhoneUplinkTests.setUp
+    def test_direct_car_or_mifi_preserves_viewer_side_and_hands_box_credentials(self):
+        from supervisor import handed_hotspot, joined_receiver_network
+        direct = JoinedPhoneAP(self.p, self.u.address, self.u.box, Mock())
+        self.assertTrue(direct.prepare())
+        self.assertEqual(direct.start(), 149)
+        self.assertTrue(direct.active)
+        self.assertEqual(self.p.start_dhcp.call_args.args[2], ())
+        self.assertEqual(self.p.start_dhcp.call_args.kwargs['upstream'], '192.0.2.1')
+        self.assertEqual(handed_hotspot(self.state, False, direct=True), self.state/'hotspot.json')
+        args = joined_receiver_network(self.state, ('192.0.2.8',149,'wpa3'), 'wlan-test', direct_address=self.u.address.ip)
+        network = dict(zip(args[::2], args[1::2]))
+        self.assertEqual(network['--bind'], '100.96.0.1')
+        self.assertEqual(network['--interface'], 'ap0')
+        self.assertEqual(network['--web-host'], '0.0.0.0')
+        self.assertEqual(network['--security'], 'wpa2')
+        normal = joined_receiver_network(self.state, ('192.0.2.8',149,'wpa3'), 'wlan-test')
+        normal = dict(zip(normal[::2], normal[1::2]))
+        self.assertEqual(normal['--bind'], '192.0.2.8')
+        self.assertEqual(normal['--interface'], 'wlan-test')
+        self.assertEqual(normal['--security'], 'wpa3')
+        self.p.frequency.return_value = 2412
+        self.assertTrue(direct.changed())
+        direct.close()
+        self.p.cleanup_phone_uplink.assert_called_once()
+        self.assertFalse(direct.active)
+
+    def test_unsupported_adapter_and_collision_cannot_start_a_second_ap(self):
+        direct = JoinedPhoneAP(self.p, self.u.address, self.u.box, Mock())
+        self.p.concurrent_ap.return_value = 0
+        self.assertFalse(direct.prepare())
+        self.p.prepare_phone_uplink.assert_not_called()
+        self.p.concurrent_ap.return_value = 1
+        direct.prepare()
+        self.p.local_addresses.return_value = [ipaddress.ip_interface('100.96.0.8/24')]
+        with self.assertRaises(ValueError): direct.start()
+        self.p.add_phone_ap.assert_not_called()
+        direct.close()
+
+    def test_no_gateway_still_gives_direct_phone_link_without_fake_dns_or_nat(self):
+        direct = JoinedPhoneAP(self.p, self.u.address, self.u.box, Mock())
+        direct.prepare()
+        self.p.uplink_gateway.return_value = None
+        direct.start()
+        self.p.enable_phone_nat.assert_not_called()
+        self.p.n_only_ap.assert_called_once()
+        self.assertIsNone(self.p.start_dhcp.call_args.kwargs['upstream'])
+        self.assertEqual(self.p.start_dhcp.call_args.args[2], ())
+        self.p.connected.return_value = False
+        self.assertTrue(direct.changed())
+
+    def test_ap_failure_stays_on_the_same_channel_then_cleanup_restores_station(self):
+        direct = JoinedPhoneAP(self.p, self.u.address, self.u.box, Mock())
+        direct.prepare()
+        self.p.start_ap.return_value = False
+        with self.assertRaises(RuntimeError): direct.start()
+        self.assertEqual(self.p.start_ap.call_count, 2)
+        self.assertEqual(self.p.configure_hotspot.call_count, 1)
+        direct.close()
+        self.p.cleanup_phone_uplink.assert_called_once()

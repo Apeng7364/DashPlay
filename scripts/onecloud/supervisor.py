@@ -8,11 +8,14 @@ Three ways of use, chosen in first-run setup (setup_wizard.py, docs/三种使用
 - mifi: join the portable Wi-Fi the same way; wired CarPlay when the iPhone is plugged in, otherwise
   the iPhone is handed the same Wi-Fi over Bluetooth (wireless).
 - box_hotspot: raise the box hotspot (AP); the head unit and the iPhone join it; wired or wireless.
-In the two joining modes the box hotspot is only the fallback: when the hotspot is not found within
+The opt-in direct_phone validation path instead hands iPhone the box AP alongside either joined
+network; it keeps the viewer and domain on the upstream station address. By default,
+in the two joining modes the box hotspot is only the fallback: when the hotspot is not found within
 CAR_WAIT seconds, it opens so that a phone can reach the settings page, keeps scanning while idle and
 switches back once the hotspot appears. The settings page (port 80, settings_page.py) is served in
 every mode. Optional: a DuckDNS name with a Let's Encrypt certificate (state/ddns.json, own_domain.py)
-for car browsers that refuse the box's local CA.
+for car browsers that refuse the box's local CA. Remote debugging (debug_uplink.py): for a window opened on the
+settings page, any mode joins the owner's phone hotspot instead, wired CarPlay only, until the window ends or a reboot.
 """
 import argparse
 import ipaddress
@@ -28,6 +31,8 @@ import threading
 import time
 
 from boxnet import ensure_leaf
+import debug_uplink
+from phone_uplink import PhoneUplink, JoinedPhoneAP
 from mdns_name import NameResponder
 import own_domain
 from settings_page import SettingsPage, network_label
@@ -61,13 +66,7 @@ def hotspot_attempts(channel, width):
     return attempts
 
 
-def options(state):
-    """state/options.json (in state/, which program updates keep), {} when missing or unreadable."""
-    try:
-        value = json.loads((state / "options.json").read_text())
-    except (OSError, ValueError):
-        return {}
-    return value if isinstance(value, dict) else {}
+options = setup_wizard.options
 
 
 def idle_release(state, default=300):
@@ -84,13 +83,43 @@ def tesla_mode(state):
     return options(state).get("tesla") is True
 
 
+def handed_hotspot(state, debug, direct=False):
+    """The Wi-Fi file the receiver started on a joined hotspot reads (run-receiver.py --hotspot): the car hotspot
+    handed to the iPhone. Remote debugging hands nothing (--no-wireless) and may start in box-hotspot mode, which
+    has no car-hotspot.json: there the receiver exited at once and the service restarted every 25 s (2026-10-15)."""
+    return state / ("hotspot.json" if debug or direct else "car-hotspot.json")
+
+
+def joined_receiver_network(state, plan, interface, debug=False, direct_address=None, ap_interface='ap0'):
+    """AirPlay follows the iPhone; the viewer stays reachable from the upstream car side."""
+    bind, channel, security = plan
+    direct = direct_address is not None
+    return ['--bind', str(direct_address) if direct else bind, '--channel', str(channel),
+            '--security', 'wpa2' if direct else security, '--web-host', '0.0.0.0',
+            '--interface', ap_interface if direct else interface,
+            '--hotspot', str(handed_hotspot(state, debug, direct))]
+
+
+def hotspot_names(state, own_name, use):
+    """Names the box answers on its own hotspot (settings page, state/options.json "local_dns"): the own domain in
+    box-hotspot mode, so that a car whose browser gets no other DNS there (no internet, or it does not fall back to
+    its LTE, as the Xpeng did 2026-10-12) still opens it with the trusted certificate."""
+    chosen = options(state)
+    if use != "box_hotspot":
+        return []
+    checks = list(setup_wizard.TESLA_CHECK_NAMES) if chosen.get("tesla") else []
+    return checks + ([own_name] if own_name and (chosen.get("tesla") or chosen.get("local_dns")) else [])
+
+
 def car_audio_args(state):
     """run-receiver.py options for what goes over the car's own Bluetooth (settings page, state/options.json
     "car_music" / "car_voice"; found in a Tesla, 2026-10-14); Tesla mode is all of them."""
-    if tesla_mode(state):
-        return ["--tesla"]
     chosen = options(state)
-    return [flag for key, flag in (("car_music", "--car-music"), ("car_voice", "--car-voice")) if chosen.get(key) is True]
+    tesla = tesla_mode(state)
+    if tesla and all(chosen.get(key, True) is True for key in ("car_music", "car_voice")):
+        return ["--tesla"]
+    return (["--tesla-browser"] if tesla else []) + [flag for key, flag in (
+        ("car_music", "--car-music"), ("car_voice", "--car-voice")) if chosen.get(key, tesla) is True]
 
 
 def main():
@@ -116,7 +145,7 @@ def main():
             "passphrase" in hotspot and not 8 <= len(hotspot["passphrase"]) <= 63):
         raise ValueError("Invalid hotspot credentials")
     for relative in ["run-receiver.py", "phone-presence.py", "pair-phone.py", "pairing_window.py", "setup_wizard.py",
-                     "settings_ui.py", "mdns_name.py", "status_light.py", "platform_api.py", "platform_debian.py", "diagnostics.py", "iphone-usb-bridge.py", "linux-bt-bridge/bt-bridge"]:
+                     "settings_ui.py", "mdns_name.py", "debug_uplink.py", "status_light.py", "platform_api.py", "platform_debian.py", "diagnostics.py", "iphone-usb-bridge.py", "linux-bt-bridge/bt-bridge"]:
         if not (root / relative).is_file():
             raise RuntimeError("Missing runtime input: " + relative)
     identity = [root / "identity/offline-mfi/identity.pk8", root / "identity/offline-mfi/certificate.p7b"]
@@ -144,6 +173,8 @@ def main():
         else:
             raise RuntimeError("No Wi-Fi interface found")
     platform = get_platform(interface, run=RUN)
+    platform.bluetooth_state = state
+    platform.cleanup_phone_uplink()  # restore MAC/NAT after an interrupted previous run
     setup = setup_wizard.load(state)
     # Tesla mode: the box hotspot moves to setup_wizard.SHARED_LAN, which a Tesla's browser opens (2026-10-14).
     tesla = tesla_mode(state)
@@ -204,9 +235,10 @@ def main():
         reexec.append(reason)
         stopped.set()
 
-    def join_car_hotspot(car):
-        """Keep setup/lease decisions independent of the platform's association mechanism."""
-        if not platform.join_wifi(car, load_json("car-lease.json") or {}, wait_for, CAR_WAIT):
+    def join_car_hotspot(car, remember=True):
+        """Keep setup/lease decisions independent of the platform's association mechanism. remember: keep the
+        lease for the next start's early receiver (not for the phone hotspot of remote debugging)."""
+        if not platform.join_wifi(car, (load_json("car-lease.json") or {}) if remember else {}, wait_for, CAR_WAIT):
             setup = setup_wizard.load(state)
             if not setup.get("done") and setup.get("car") == car["ssid"]:
                 log = platform.join_log()
@@ -215,6 +247,8 @@ def main():
         freq = platform.frequency()
         address_now = platform.ipv4_address()
         found = platform.security(car["ssid"])
+        if not remember:
+            return address_now, channel_of(freq) if freq else 0, setup_wizard.handoff_security(found)
         lease_text = json.dumps({"ssid": car["ssid"], "address": address_now,
                                  "freq": freq, "security": found})
         temporary = state / "car-lease.json.tmp"   # replaced whole: a power cut must not leave it empty
@@ -236,11 +270,14 @@ def main():
     light = platform.status_light()
     scanner = setup_wizard.Scanner(interface, hotspot["ssid"], lambda: status["mode"], platform=platform)
     settings = SettingsPage(state, lambda: status, request_reexec, lambda: [ip.network for ip in platform.local_addresses()],
-                            scanner, WIRED_STATUS)
+                            scanner, WIRED_STATUS, run=RUN)
+    uplink = None
+    direct_ap = None
     maintainer = []   # own_domain.Maintainer, when a DuckDNS name is set
     try:
         mark("supervisor start")
         platform.prepare(wait_for)
+        platform.ensure_receiver_ipv6()
         light.show("starting")
         settings.start()
         # Kept on the eMMC so that a drive can be analysed after the car is switched off; started
@@ -266,7 +303,7 @@ def main():
             """DuckDNS record -> target (None: leave it) and the certificate, in the background. wifi: the joined
             Wi-Fi, whose public IPv6 address goes into the record too when the owner asked for it."""
             if ddns:
-                maintainer.append(own_domain.Maintainer(root, ddns, target, stopped, interface=wifi))
+                maintainer.append(own_domain.Maintainer(root, ddns, target, stopped, interface=wifi, tesla=tesla))
                 maintainer[0].start()
         if not (ddns and ddns.get("ipv6")):
             own_domain.unguard()   # the public IPv6 option was turned off: its firewall goes with it
@@ -276,10 +313,20 @@ def main():
         # a car hotspot that is not there; the saved one stays.
         car = (load_json("car-hotspot.json") if use in setup_wizard.JOINS and os.environ.get("DASHPLAY_SKIP_CAR") != "1"
                else None)
+        # Remote debugging: the owner's phone hotspot replaces the network of every mode for the window.
+        debug = debug_uplink.active(state, RUN)
+        status["debug"] = bool(debug)
+        if debug:
+            car = debug
+            print(f"remote debugging: joining the phone hotspot for {debug_uplink.remaining(RUN) / 60:.0f} min", flush=True)
+        # Opt-in validation path until real car-hotspot tests pass (design 6).
+        direct_requested = bool(car and not debug and options(state).get('direct_phone') is True)
+        direct_active = False
         WIRED_STATUS.unlink(missing_ok=True)
         # The cable is always offered; wireless (Bluetooth handoff) except in car_hotspot mode.
+        # Remote debugging hands the iPhone no Wi-Fi: the phone hotspot is the owner's, not the car's.
         usb_args = ["--wired", "--wired-status", str(WIRED_STATUS)] + (
-            [] if setup_wizard.wireless(setup) else ["--no-wireless"]) + [
+            [] if setup_wizard.wireless(setup, options(state)) and not debug else ["--no-wireless"]) + [
             # state/options.json "idle_release": seconds without a viewer before wireless CarPlay ends (0: never);
             # in state/, which program updates keep (they replace service.json).
             "--idle-release", str(idle_release(state)), *car_audio_args(state)]
@@ -287,10 +334,10 @@ def main():
         def receiver_argv(plan, wait=False):
             """plan: (bind address, channel, security) of the joined hotspot, which the iPhone is handed.
             The viewer listens on every address: the head unit comes through that hotspot."""
-            bind, plan_channel, security = plan
-            argv = ["python3", str(root / "run-receiver.py"), "--root", str(root), "--bind", bind, *phone_args,
-                    "--channel", str(plan_channel), "--security", security, "--web-host", "0.0.0.0",
-                    "--interface", interface, "--hotspot", str(state / "car-hotspot.json"), *usb_args]
+            argv = ["python3", str(root / "run-receiver.py"), "--root", str(root), *phone_args,
+                    *joined_receiver_network(state, plan, interface, debug,
+                                             address.ip if direct_active else None, platform.ap_interface),
+                    *([a for a in usb_args if a != '--no-wireless'] if direct_active and setup.get('iphone') != 'wired' else usb_args)]
             return argv + (["--bind-wait", str(BIND_WAIT)] if wait else [])
 
         # The JVM needs ~14 s on this CPU before its first invitation; joining the car hotspot takes
@@ -298,17 +345,38 @@ def main():
         # outcome restarts it (2026-10-11 boot profile).
         lease = load_json("car-lease.json") or {}
         predicted = None
-        if have_identity and car and lease.get("ssid") == car["ssid"] and lease.get("address") and lease.get("freq"):
+        if have_identity and car and not debug and not direct_requested and lease.get("ssid") == car["ssid"] and lease.get("address") and lease.get("freq"):
             predicted = (lease["address"], channel_of(lease["freq"]), setup_wizard.handoff_security(lease.get("security")))
             platform.allow_nonlocal_bind()
             start("receiver", receiver_argv(predicted, wait=True))
             mark(f"receiver launched early for {predicted[0]}")
-        joined = join_car_hotspot(car) if car else None
+        if direct_requested:
+            direct_ap = JoinedPhoneAP(platform, address, hotspot, wait_for)
+            try:
+                if not direct_ap.prepare():
+                    status['direct_phone'] = '无线驱动不支持同时连接和开热点，保留原连接方式'
+            except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
+                direct_ap.close()
+                status['direct_phone'] = '直连热点准备失败（' + type(error).__name__ + '），保留原连接方式'
+        joined = join_car_hotspot(car, remember=not debug) if car else None
+        if direct_ap and direct_ap.prepared:
+            if joined:
+                try:
+                    direct_ap.start()
+                    direct_active = True
+                    status['phone_interface'] = platform.ap_interface
+                    status['direct_phone'] = 'iPhone 直连盒子热点（待实车验证）；车机仍用上游地址'
+                except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
+                    direct_ap.close()
+                    status['direct_phone'] = '直连热点失败（' + type(error).__name__ + '），保留原连接方式'
+                    joined = join_car_hotspot(car)
+            else:
+                direct_ap.close()
         # Without wireless CarPlay (car_hotspot) the channel and security only matter for a Wi-Fi handoff
         # the receiver never makes: keep the early receiver while the address is the same. The Xpeng
         # car hotspot came up on 149 one drive and on 36 the next; restarting cost ~20 s (2026-10-12).
         keep_early = bool(predicted and joined and (joined == predicted or (
-            not setup_wizard.wireless(setup) and joined[0] == predicted[0])))
+            not setup_wizard.wireless(setup, options(state)) and joined[0] == predicted[0])))
         if predicted and not keep_early:
             stop_child("receiver")
             mark("early receiver stopped: " + ("network differs from last time" if joined else "hotspot not joined"))
@@ -331,13 +399,14 @@ def main():
             platform.quick_ack()
             status.update(mode="sta", ssid=car["ssid"], home=f"http://{sta_address}/", channel=sta_channel, entries=with_name([
                 f"https://{sta_address}:18443/", f"http://{sta_address}/ （本设置页）"]))
-            mark(f"{use} hotspot joined, viewer on {sta_address}")
-            if tesla and not setup_wizard.tesla_reaches(sta_address):
+            mark(f"{'debug' if debug else use} hotspot joined, viewer on {sta_address}")
+            if tesla and not debug and not setup_wizard.tesla_reaches(sta_address):
                 # A joined hotspot is numbered by its owner: only its own settings can move it.
                 status["tesla_warning"] = (f"{network_label(use)}分给盒子的地址是 {sta_address}，特斯拉浏览器打不开这类局域网地址。"
                                            f"在{network_label(use)}自己的后台把局域网地址改成 {setup_wizard.SHARED_LAN.ip}"
                                            "（100.64–100.127 开头的网段都行），再重新连接。")
-            keep_name(sta_address, interface)
+            # The DuckDNS record stays where the car finds the box: the phone hotspot is only for the owner.
+            keep_name(None if debug else sta_address, None if debug else interface)
         else:
             ensure_leaf(state, names, [str(address.ip)])
             if tesla_warning:
@@ -355,7 +424,7 @@ def main():
             def launch_receiver(ap_channel):
                 start("receiver", ["python3", str(root / "run-receiver.py"), "--root", str(root),
                                    "--bind", str(address.ip), *phone_args,
-                                   "--interface", interface, "--channel", str(ap_channel), *ap_security, *usb_args])
+                                   "--interface", platform.ap_interface, "--channel", str(ap_channel), *ap_security, *usb_args])
 
             launch_receiver(channel)
             mark("receiver launched")
@@ -379,13 +448,18 @@ def main():
             # DHCP only: no router or DNS option. (A head unit joining it may still treat it as its
             # default network and lose internet: box_hotspot mode says so; the other modes avoid it.)
             portal = setup_wizard.captive(setup, "ap")
-            platform.start_dhcp(address, portal)
+            platform.start_dhcp(address, portal, hotspot_names(state, own_name, use),
+                                query_log=state / "diag/tesla-dns.log" if tesla and use == "box_hotspot" else None)
+            status["tesla_offline"] = setup_wizard.tesla_offline(setup, options(state))
             if portal:
                 mark("first-run setup portal enabled")
+        if use == "box_hotspot" and (setup.get("done") or setup.get("confirmed")) and not debug and options(state)["car_internet"] == "phone_hotspot":
+            uplink = PhoneUplink(platform, state, address, hotspot, used[0], used[1], wait_for,
+                                 launch_receiver, status)
         bluetooth.join()
         if not bluetooth_ok:
             # Only wireless CarPlay needs Bluetooth (the invitation); car_hotspot mode runs on the cable.
-            if setup_wizard.wireless(setup):
+            if setup_wizard.wireless(setup, options(state)) or direct_active and setup.get('iphone') != 'wired':
                 raise RuntimeError("Bluetooth adapter did not power on")
             print("Bluetooth adapter did not power on; not needed without wireless CarPlay", flush=True)
         print(f"DashPlay services started ({status['mode']})", flush=True)
@@ -405,8 +479,16 @@ def main():
         if not have_identity:
             print("MFi identity missing: settings page only, CarPlay starts once the files are added", flush=True)
         while not stopped.wait(2):
+            if debug and not debug_uplink.remaining(RUN):
+                request_reexec("remote debugging ended")
+                continue
             if not have_identity and identity_ok():
                 request_reexec("MFi identity added")
+                continue
+            if uplink:
+                uplink.tick()
+            if direct_ap and direct_ap.changed():
+                request_reexec('direct phone AP lost upstream/channel; rebuild')
                 continue
             light.show("live" if phone_live() else "fallback" if fallback else "waiting")
             for name, child in children:
@@ -446,6 +528,10 @@ def main():
             worker.join(10)   # acme.sh is stopped first: no signer left running into the restarted service
         settings.stop()
         platform.stop_all()
+        if uplink:
+            uplink.close()
+        if direct_ap:
+            direct_ap.close()
         platform.remove_sta_network()
         platform.flush_address()
         print("DashPlay services stopped", flush=True)

@@ -18,10 +18,12 @@ import secrets
 import threading
 import urllib.parse
 
+import debug_uplink
 import own_domain
 from pairing_window import PairingWindow
 import settings_ui as ui
 import setup_wizard
+from setup_flow import FirstSetup, iphone_choices, limitations, validation_table
 import diagnostics
 
 MAX_BODY = 4096
@@ -104,11 +106,13 @@ def read_wired(path):
 
 class SettingsPage:
     def __init__(self, state: Path, status, on_change, allowed_networks, scanner=None, wired_status=None,
-                 managed=None):
+                 managed=None, run=None):
         """status() -> dict for display; on_change(reason) re-applies the configuration;
         wired_status: the receiver's wired CarPlay status file; managed: {"by": "OpenWrt", "admin": URL of
-        its Wi-Fi settings} when the system, not this page, sets up the network."""
+        its Wi-Fi settings} when the system, not this page, sets up the network; run: the service's runtime
+        directory, which holds the remote-debugging window (debug_uplink.py; offered only with it)."""
         self.managed = managed
+        self.run = run
         self.state = state
         self.pairing = PairingWindow(state.parent)
         self.car_file = state / "car-hotspot.json"
@@ -150,6 +154,9 @@ class SettingsPage:
                 self.wfile.write(data)
 
             def do_GET(self):
+                reply = page.tesla_check(self.headers.get("Host", ""))
+                if reply:
+                    return self._send(200, reply[0], "text/html", reply[1])
                 if not self._allowed():
                     return self._send(403, "forbidden")
                 target = page.captive_redirect(self.headers.get("Host", ""), self.path)
@@ -173,7 +180,7 @@ class SettingsPage:
                     return self._send(413, "too large")
                 form = {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(length).decode(),
                                                                  keep_blank_values=True).items()}
-                back = {"/car": "/?view=car&", "/hotspot": "/?view=hotspot&"}.get(self.path, "/?")
+                back = {"/setup-flow": "/?view=setup&", "/car": "/?view=car&", "/hotspot": "/?view=hotspot&"}.get(self.path, "/?")
                 try:
                     result = page.apply(self.path, form)
                 except ValueError as error:
@@ -195,6 +202,12 @@ class SettingsPage:
 
     def home(self):
         return self.status().get("home", "/")
+
+    def tesla_check(self, host):
+        status = self.status()
+        enabled = status.get("tesla_offline") if self.managed else setup_wizard.tesla_offline(
+            self.setup(), setup_wizard.options(self.state), status.get("uplink", {}).get("phase") == "online")
+        return setup_wizard.check_response(host) if enabled and status.get("mode") in ("ap", "openwrt") else None
 
     def captive_redirect(self, host, path):
         """While captive, any other host or path (OS connectivity probes) is sent to the setup page."""
@@ -237,6 +250,12 @@ class SettingsPage:
                 self.pairing.confirm(form.get("request_id", ""), action == "yes")
                 return "" if action == "yes" else "已拒绝这次配对。"
             raise ValueError("未知操作。")
+        if path == "/setup-flow":
+            self.check_nonce(form)
+            return FirstSetup(self).apply(form)
+        if path in ("/internet", "/iphone"):
+            self.check_nonce(form)
+            return self.save_connection(path, form)
         if path == "/setup":
             self.check_nonce(form)
             return self.apply_setup(form)
@@ -250,7 +269,8 @@ class SettingsPage:
                 record.unlink(missing_ok=True)
             # And the receiver's CarPlay pairings, else the box still knew the old iPhones after a reset.
             (self.state / "receiver/pairings.properties").unlink(missing_ok=True)
-            setup_wizard.save(self.state, {"done": False})
+            (self.state / "setup-draft.json").unlink(missing_ok=True)
+            setup_wizard.save(self.state, {"done": False, "wizard_version": 2})
             self.apply_later("setup reset")
             return ("page", self.notice_page(
                 "正在恢复首次设置", ("off", "热点", "已清除"), ("off", "iPhone", "已清除"),
@@ -281,11 +301,69 @@ class SettingsPage:
         if path == "/audio":
             self.check_nonce(form)
             return self.save_car_audio(form)
+        if path == "/debug" and self.run:
+            self.check_nonce(form)
+            return self.apply_debug(form)
         if path == "/retry":
             self.check_nonce(form)
             self.on_change("retry requested")
             return f"正在重新连接{network_label(self.setup().get('mode'))}。"
         raise ValueError("未知操作。")
+
+    def apply_debug(self, form):
+        """Remote debugging (debug_uplink.py): save the owner's phone hotspot, open or end the window."""
+        action = form.get("action")
+        saved = debug_uplink.hotspot(self.state) or debug_uplink.hotspot(self.state, filename="uplink-hotspot.json")
+        if action == "save":
+            ssid, password = _car_credentials(form, saved or {})
+            _save(self.state / debug_uplink.HOTSPOT, {"ssid": ssid, "passphrase": password})
+            return f"已保存手机热点「{ssid}」。要远程调试时再点「连手机热点调试」。"
+        if action == "forget":
+            (self.state / debug_uplink.HOTSPOT).unlink(missing_ok=True)
+            return "已删除保存的手机热点。"
+        if action == "start":
+            if not saved:
+                raise ValueError("先保存手机热点的名称和密码。")
+            _save(self.state / debug_uplink.HOTSPOT, saved)  # independent copy, may later use another phone
+            debug_uplink.start(self.run)
+            self.apply_later("remote debugging started")
+            box = self.status().get("box_ssid", "")
+            return ("page", self.notice_page(
+                "正在连接手机热点", ("wait", saved["ssid"], "约 1 分钟"), ("off", "车机画面", "调试期间暂停"),
+                [f"打开手机热点「{saved['ssid']}」，盒子约 1 分钟后连上它，并关掉自己的热点「{box}」。",
+                 "告诉帮你调试的人可以开始了；iPhone 插数据线时有线 CarPlay 照常可用。",
+                 f"调试中想恢复：给盒子拔电再插上，就回到原来的网络；或等 {debug_uplink.MINUTES} 分钟自动结束。"],
+                f"连不上手机热点时，盒子约 1 分钟后重新打开自己的热点「{box}」，并一直找手机热点，直到 {debug_uplink.MINUTES} 分钟到。"))
+        if action == "stop":
+            debug_uplink.stop(self.run)
+            self.apply_later("remote debugging stopped")
+            return "已结束远程调试，盒子约 1 分钟后回到原来的网络。"
+        raise ValueError("未知操作。")
+
+    def debug_block(self, nonce):
+        """Advanced: remote debugging over the owner's phone hotspot."""
+        saved = debug_uplink.hotspot(self.state) or debug_uplink.hotspot(self.state, filename="uplink-hotspot.json")
+        left = debug_uplink.remaining(self.run)
+        if left:
+            return (f'<div class=cell><span class=main><b>远程调试中</b><span>已连手机热点「{escape(saved["ssid"] if saved else "")}」</span>'
+                    f'</span><span class=value>还剩 {max(1, round(left / 60))} 分钟</span></div>'
+                    f'<form method=post action=/debug>{ui.hidden(nonce)}<button class="cell action" name=action value=stop>'
+                    '结束调试，回到原来的网络</button></form><p class=note>调试中想恢复：给盒子拔电再插上，就回到原来的网络；或等 30 分钟自动结束。</p>')
+        form = (f'<form method=post action=/debug>{ui.hidden(nonce)}<div class=group>'
+                '<label class=cell><span class=main><b>手机热点名称</b></span><input type=text name=ssid_manual '
+                f'value="{escape(saved["ssid"] if saved else "")}" required maxlength=32 autocapitalize=off '
+                'style="text-align:right"></label>'
+                '<label class=cell><span class=main><b>密码</b></span><input type=password name=password '
+                f'placeholder="{"留空表示不修改" if saved else "8–63 个字符"}" autocomplete=off style="text-align:right"></label>'
+                '</div><button class="btn plain" name=action value=save>保存</button></form>')
+        actions = ((f'<form method=post action=/debug>{ui.hidden(nonce)}<button class="cell action" name=action value=start '
+                    f'onclick="return confirm(\'盒子会关掉自己的热点 {debug_uplink.MINUTES} 分钟，车机画面暂停，确定？\')">'
+                    f'连手机热点调试 {debug_uplink.MINUTES} 分钟</button></form>'
+                    f'<form method=post action=/debug>{ui.hidden(nonce)}<button class="btn plain" name=action value=forget>'
+                    '删除保存的手机热点</button></form>') if saved else "")
+        return (f'<details><summary class=cell><span class=main><b>远程调试</b><span>车上出问题时，让盒子临时连你的手机热点上网</span></span>'
+                f'<span class=value>{escape(saved["ssid"] if saved else "未设置")}</span><span class=chev></span></summary>'
+                f'<div class=inner style="padding:0 0 12px">{form}<p class=note>调试中想恢复：给盒子拔电再插上，就回到原来的网络；或等 30 分钟自动结束。</p></div></details>{actions}')
 
     def save_ddns(self, form):
         """Own DuckDNS name (own_domain.py); a new name or turning it off drops the old name's certificate."""
@@ -349,11 +427,15 @@ class SettingsPage:
                   "CarPlay 网页负责画面和导航播报（播报会放大）。偶尔放歌没声音时，在 iPhone 控制中心把音频输出选成车机。"),
                  ("car_voice", "通话与 Siri 走车机蓝牙",
                   "通话和 Siri 用车机自己的麦克风和喇叭（iPhone 要先用蓝牙连上车机），不经过 CarPlay 网页。网页通话有回声时可以试试。"))
+    # Box-hotspot mode with one's own domain (supervisor.py hotspot_names, 2026-10-15).
+    LOCAL_DNS = ("local_dns", "盒子热点里解析自己的域名",
+                 "车机连盒子热点时，由盒子告诉它「自己的域名」就在这里，不靠车机自己的网络去查：车机没网也能用域名打开、"
+                 "没有证书警告。只在方式三、设置了自己的域名时有效。车机连着盒子热点时可能有别的联网功能受影响，实测后再决定是否常开。")
 
     def tesla_text(self, mode):
         """Tesla mode (supervisor.py tesla_mode): what it does in this way of use."""
         shared = setup_wizard.SHARED_LAN.ip
-        common = ("音乐、通话和 Siri 交给特斯拉蓝牙（相当于勾上下面两项），iPhone 用蓝牙连特斯拉并选为媒体来源；"
+        common = ("声音组默认选择特斯拉蓝牙，可单独修改，iPhone 用蓝牙连特斯拉并选为媒体来源；"
                   "全屏按钮经腾讯视频、1905 的跳转页去掉地址栏（特斯拉要能上网）。特斯拉的 WiFi 设置里要打开「行驶中保持连接」，"
                   "否则一出 P 挡画面就停。")
         if mode in setup_wizard.JOINS:
@@ -367,24 +449,101 @@ class SettingsPage:
         chosen = _load(self.options_file)
         chosen = dict(chosen) if isinstance(chosen, dict) else {}
         was_tesla = chosen.get("tesla") is True
-        for key in ("tesla", *(key for key, _title, _text in self.CAR_AUDIO)):
+        scope = form.get("scope")
+        keys = ("tesla",) if scope == "car" else ("car_music", "car_voice") if scope == "sound" else ("local_dns",) if scope == "dns" else ("tesla", "car_music", "car_voice", "local_dns")
+        for key in keys:
             chosen[key] = form.get(key) == "on"
+        if chosen.get("tesla") and self.setup().get("mode") == "car_hotspot":
+            raise ValueError("特斯拉没有车机热点，请先在网络里改用其他方式。")
+        if scope in (None, "car") and chosen.get("tesla") and not was_tesla:
+            chosen.update(car_music=True, car_voice=True)
         _save(self.options_file, chosen)
         self.apply_later("car audio changed")
-        if chosen["tesla"] != was_tesla and self.setup().get("mode") == "box_hotspot":
+        if chosen.get("tesla", False) != was_tesla and self.setup().get("mode") == "box_hotspot":
             address = setup_wizard.SHARED_LAN.ip if chosen["tesla"] else "盒子原来的地址"
             return (f"已保存。盒子约 1 分钟后重启服务，热点网段改为 {address}：车机和手机重新连一次盒子热点，"
                     f"设置页用 http://{setup_wizard.MDNS_NAME}/ 打开。")
         return "已保存，盒子约 1 分钟后重启服务生效。"
 
-    def car_audio_block(self, nonce):
+    def car_audio_block(self, nonce, scope=None):
         chosen = _load(self.options_file)
         chosen = chosen if isinstance(chosen, dict) else {}
-        rows = (("tesla", "特斯拉模式", self.tesla_text(self.setup().get("mode"))),) + self.CAR_AUDIO
+        vehicle = (("tesla", "特斯拉模式", self.tesla_text(self.setup().get("mode"))),)
+        local = () if chosen.get("tesla") else (self.LOCAL_DNS,)
+        rows = vehicle if scope == "car" else self.CAR_AUDIO if scope == "sound" else local if scope == "dns" else vehicle + self.CAR_AUDIO + local
         cells = "".join(f'<label class=cell><span class=main><b>{title}</b><span>{escape(text)}</span></span>'
                         f'<input type=checkbox name={key} value=on{" checked" if chosen.get(key) is True else ""}></label>'
                         for key, title, text in rows)
-        return f'<form method=post action=/audio>{ui.hidden(nonce)}{cells}<button class="cell action">保存</button></form>'
+        return f'<form method=post action=/audio>{ui.hidden(nonce, **({'scope': scope} if scope else {}))}{cells}<button class="cell action">保存</button></form>'
+
+    def save_connection(self, path, form):
+        chosen = setup_wizard.options(self.state)
+        setup = self.setup()
+        if path == '/iphone':
+            value = form.get('iphone')
+            draft = dict(chosen, **setup)
+            if value not in [key for key, *_ in iphone_choices(draft)]:
+                raise ValueError('前面的需求只能使用数据线；请先修改网络来源。')
+            setup_wizard.save(self.state, dict(setup, iphone=value))
+        else:
+            if setup.get('mode') != 'box_hotspot':
+                raise ValueError('只有盒子热点方式可设置车机上网。')
+            value = form.get('car_internet')
+            if value not in ('none', 'phone_hotspot'):
+                raise ValueError('请选择车机上网方式。')
+            chosen['car_internet'] = value
+            if value == 'phone_hotspot':
+                if form.get('uplink_phone') not in ('same', 'other'):
+                    raise ValueError('请选择哪部手机开热点。')
+                chosen['uplink_phone'] = form['uplink_phone']
+                old = _load(self.state / 'uplink-hotspot.json') or {}
+                # A new SSID must not silently reuse another hotspot's password.
+                if old.get('ssid') != form.get('ssid', '').strip():
+                    old = {}
+                ssid, password = _hotspot_credentials(form, old)
+                _save(self.state / 'uplink-hotspot.json', {'ssid': ssid, 'passphrase': password})
+                setup_wizard.save(self.state, setup)
+            _save(self.options_file, chosen)
+        self.apply_later('connection preference changed')
+        return '已保存，约 1 分钟后生效，期间 CarPlay 会断一下。'
+
+    def internet_block(self, nonce):
+        if self.setup().get('mode') != 'box_hotspot' or self.managed:
+            return ''
+        chosen = setup_wizard.options(self.state)
+        saved = _load(self.state / 'uplink-hotspot.json') or {}
+        current = self.status().get('uplink', {})
+        label = ('已连上 ' + current.get('ssid', '') + '，车机可上网' if current.get('phase') == 'online' else
+                 '没找到或无法连接 ' + saved.get('ssid', '手机热点') + '，已退回不上网' if chosen['car_internet'] == 'phone_hotspot' else
+                 '特斯拉：不上网（替特斯拉回答联网检查）' if chosen.get('tesla') else '不上网')
+        rows = ui.banner(label, 'ok' if current.get('phase') == 'online' else 'wait')
+        rows += f'<form method=post action=/internet>{ui.hidden(nonce)}'
+        for value, text in [('none', '不上网'), ('phone_hotspot', '借手机热点')]:
+            rows += f'<label class=cell><input type=radio name=car_internet value={value}{" checked" if chosen["car_internet"]==value else ""}>{text}</label>'
+        rows += (f'<label class=cell>热点名称<input name=ssid value="{escape(saved.get("ssid", ""))}" maxlength=32 aria-label=手机热点名称></label>'
+                 '<label class=cell>热点密码<input type=password name=password minlength=8 maxlength=63 autocomplete=new-password aria-label=手机热点密码></label>')
+        for value, title in [('same', '同一部 iPhone（有线、无线均可）'), ('other', '另一部手机（无线组合未实测）')]:
+            rows += f'<label class=cell><input type=radio name=uplink_phone value={value}{" checked" if chosen["uplink_phone"]==value else ""}>{title}</label>'
+        rows += '<button class="cell action">保存</button></form>'
+        return ui.group('车机上网', rows, '密码只写不读，留空沿用同名热点密码。手机需一直开热点，会用手机流量。找不到或掉线时退回不上网；特斯拉自带音乐、地图将不能联网，CarPlay 正常。')
+
+    def iphone_preference(self, nonce):
+        if self.managed:
+            return ''
+        setup = self.setup()
+        chosen = setup_wizard.options(self.state)
+        draft = dict(chosen, **setup)
+        direct_status = self.status().get('direct_phone')
+        rows = ui.banner(direct_status, 'wait') if direct_status else ''
+        rows += f'<form method=post action=/iphone>{ui.hidden(nonce)}'
+        for key, title, text in iphone_choices(draft):
+            rows += (f'<label class=cell><input type=radio name=iphone value={key}{" checked" if setup.get("iphone")==key else ""}>'
+                     f'<span class=main><b>{title}</b><span>{text}</span></span></label>')
+        rows += '<button class="cell action">保存</button></form>'
+        if not setup_wizard.wireless(dict(setup, iphone='any'), chosen):
+            rows += ui.banner('当前网络需求只能用数据线。要用无线，请修改网络来源。', 'wait')
+        return rows
+
 
     def save_hotspot(self, form):
         old = _load(self.hotspot_file) or {}
@@ -395,6 +554,8 @@ class SettingsPage:
     def apply_setup(self, form):
         action = form.get("action")
         setup = self.setup()
+        if setup.get("wizard_version") == 2 and not setup.get("confirmed"):
+            raise ValueError("请使用一步一问的首次设置并确认配置总结。")
         if action == "rescan":
             if self.scanner:
                 self.scanner.results(fresh=True)
@@ -428,6 +589,8 @@ class SettingsPage:
             self.apply_later("setup box hotspot set")
             return ("page", self.reconnect_page(ssid, "正在打开盒子热点", first=True))
         if action == "finish" and step == "phone":
+            if setup.get("wizard_version") == 2 and setup_wizard.wireless(setup, setup_wizard.options(self.state)) and not self.pairing.devices():
+                raise ValueError("选择了无线或都行，请先添加 iPhone；只用线可返回改为有线。")
             setup_wizard.save(self.state, dict(setup, done=True))
             return "设置完成。"
         raise ValueError("未知操作。")
@@ -510,8 +673,12 @@ class SettingsPage:
             notice = ui.banner(f"还缺 CarPlay 认证文件。把「AI 安装说明」交给你的 AI 助手，并告诉它：盒子地址 {host}，"
                                "用户名 root，密码 1234。文件放好后盒子会自动开始工作，网络和添加手机可以先设置。", "wait") + notice
         if self.managed:
+            notice += ui.banner(self.status().get("tesla_internet", ""))
+            notice += ui.banner(self.status().get("tesla_network_change", ""), "wait")
             return self.render_full(notice)
         setup = self.setup()
+        if params.get("view", [""])[0] == "setup" or setup.get("wizard_version") == 2 and not setup.get("confirmed") and not setup.get("done"):
+            return FirstSetup(self).render(notice)
         current = setup_wizard.step(setup, self.status().get("mode"))
         if current == "mode":
             return self.render_mode_step(notice)
@@ -594,7 +761,7 @@ class SettingsPage:
         mode = self.setup().get("mode")
         wired = self.wired_phase()
         waiting = wired in ("trust", "starting") or first and mode == "car_hotspot" and wired != "live"
-        if mode == "car_hotspot":
+        if not setup_wizard.wireless(self.setup(), setup_wizard.options(self.state)):
             return ui.wired_block(wired, "iPhone 用数据线", "这种使用方式只能用数据线（有线 CarPlay）。"), waiting, {}, wired
         foot = ("插着数据线时用有线；拔掉后改用下面的无线。"
                 + ("无线卡顿或连不上时请用数据线：有的随身 WiFi 不让设备互相访问。" if mode == "mifi" else ""))
@@ -612,7 +779,7 @@ class SettingsPage:
         if self.managed:
             foot = f"车机连接 WiFi「{escape(status.get('ssid', ''))}」后，在车机浏览器打开上面的地址。"
         elif status.get("mode") == "ap" and mode == "box_hotspot":
-            foot = f"车机连接盒子热点「{escape(status.get('box_ssid', ''))}」后，在车机浏览器打开上面的地址。车机连着它时不能上网。"
+            foot = f"车机连接盒子热点「{escape(status.get('box_ssid', ''))}」后，在车机浏览器打开上面的地址。是否能上网请看「车机上网」当前状态。"
         elif status.get("mode") == "ap":
             foot = "当前通过盒子热点连接。在连着盒子热点的设备上打开上面的地址。"
         else:
@@ -624,7 +791,8 @@ class SettingsPage:
         block, refresh, devices, wired = self.iphone_blocks(nonce, first=True)
         presence = self.pairing.presence()
         phase = self.pairing.status().get("phase", "closed")
-        ready = bool(devices) or wired == "live"
+        needs_pair = setup_wizard.wireless(self.setup(), setup_wizard.options(self.state))
+        ready = bool(devices) if needs_pair else True
         finish = (f'<form method=post action=/setup>{ui.hidden(nonce)}'
                   f'<button class="{"btn" if ready else "btn plain"}" name=action value=finish>'
                   f'{"完成设置" if ready else "稍后连接，先完成设置"}</button></form>')
@@ -633,7 +801,8 @@ class SettingsPage:
                 f'{self.chain(devices, presence, phase, wired)}'
                 f'{block}'
                 + self.entries_block(self.status(), pairing)
-                + (finish if ready or not pairing else ""))
+                + (finish if ready else "")
+                + (ui.banner("请先添加 iPhone，或者在设置中选择只用有线。", "wait") if not ready else ""))
         return ui.page("首次设置", body, refresh)
 
     def render_car_change(self, notice):
@@ -694,15 +863,23 @@ class SettingsPage:
                     + ("" if self.managed else
                     f'<form method=post action=/reset>{ui.hidden(nonce)}<button class="cell destructive" '
                     'onclick="return confirm(\'清除使用方式、热点和所有已添加的手机，回到首次设置？\')">重新进行首次设置</button></form>'))
+        notice += ui.banner("特斯拉建议回家插网线后设置自己的网址。", "wait") if setup_wizard.options(self.state).get("tesla") else ""
         body = (f'<h1 class=span>盒子设置</h1>{notice}{self.chain(devices, presence, phase, wired)}'
                 f'{fallback}<div>'
                 + self.entries_block(status, False)
-                + block + '</div><div>'
-                + ui.group("网络", network)
-                + (ui.group("车机打不开画面时", reach, reach_foot) if reach else "")
+                + ("" if self.managed else ui.group("车", self.car_audio_block(nonce, "car")))
+                + ui.group("网络", network + ("" if self.managed else '<a class=cell href="/?view=setup">修改使用方式（保留已添加的手机）</a>'))
+                + self.internet_block(nonce)
+                + ui.group("iPhone", self.iphone_preference(nonce) + block) + '</div><div>'
+                + ("" if self.managed else ui.group("声音", self.car_audio_block(nonce, "sound"), "约 1 分钟后生效，期间 CarPlay 会断一下。"))
+                + (ui.group("自己的网址", reach, reach_foot) if reach else "")
                 + ("" if self.managed else ui.banner(status.get("tesla_warning", ""), "bad")
-                   + ui.group("特斯拉与车机蓝牙", self.car_audio_block(nonce),
-                              "车机自己能用蓝牙连 iPhone 时可选；特斯拉模式已包含后两项。不勾选时，声音都从 CarPlay 网页出来。"))
+                   + (ui.group("域名解析", self.car_audio_block(nonce, "dns")) if not setup_wizard.options(self.state).get("tesla") and mode == "box_hotspot" else ""))
+                + validation_table()
+                + (ui.group("远程调试", self.debug_block(nonce),
+                            "盒子装了 Tailscale 时，连上手机热点后帮你调试的人就能远程登录。调试期间盒子不开自己的热点，"
+                            f"{debug_uplink.MINUTES} 分钟后或拔电重启后自动回到原来的网络。")
+                   if self.run and not self.managed else "")
                 + ui.group("高级", advanced, "" if self.managed else "重新进行首次设置可以更换使用方式，会保留盒子证书、自己的域名和盒子热点密码。")
                 + '</div>')
         return ui.page("盒子设置", body, refresh, wide=True)

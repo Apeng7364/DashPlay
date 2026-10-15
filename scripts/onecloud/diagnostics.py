@@ -312,6 +312,8 @@ def start(stopped, log: DiagLog, receiver_log: Path, platform, status, interval=
         while not stopped.wait(interval):
             try:
                 record = {"uptime": round(time.monotonic(), 1), "mode": status.get("mode")}
+                record.update({key: status[key] for key in ("uplink", "tesla_offline", "tesla_internet",
+                               "tesla_dns_log", "direct_phone", "phone_interface") if key in status})
                 record.update(platform.diagnostics())
                 record["net"] = net_counters()
                 if state is not None:
@@ -322,8 +324,9 @@ def start(stopped, log: DiagLog, receiver_log: Path, platform, status, interval=
                         record["tcp"] = tcp_stats(targets["phone"])
                         # mifi: a wireless iPhone's video is relayed by the portable Wi-Fi.
                         relayed = status.get("mode") == "sta"
-                        if relayed and int(time.monotonic()) % 30 < interval and getattr(platform, "interface", None):
-                            record["phone_rx"] = phone_traffic(platform.interface, targets["phone"])
+                        phone_interface = status.get('phone_interface') or getattr(platform, 'interface', None)
+                        if relayed and int(time.monotonic()) % 30 < interval and phone_interface:
+                            record["phone_rx"] = phone_traffic(phone_interface, targets["phone"])
                 lines = keep(tail.read())
                 if lines:
                     record["log"] = lines

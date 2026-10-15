@@ -70,24 +70,22 @@ class WizardStateTests(unittest.TestCase):
     def test_old_setup_files_migrate_to_the_car_hotspot_way(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
-            setup_wizard.save(state, {'done': False, 'car': 'skip'})
-            self.assertEqual(setup_wizard.load(state), {'done': False})
-            setup_wizard.save(state, {'done': False, 'role': 'car', 'car': 'xiaomi'})
-            self.assertEqual(setup_wizard.load(state), {'done': False, 'car': 'xiaomi', 'mode': 'car_hotspot'})
-            # A box set up as portable Wi-Fi has no car hotspot: first-run setup starts again.
-            setup_wizard.save(state, {'done': True, 'role': 'portable', 'hotspot': True})
-            self.assertEqual(setup_wizard.load(state), {'done': False})
-            setup_wizard.save(state, {'done': True, 'mode': 'mifi'})
-            self.assertEqual(setup_wizard.load(state), {'done': False, 'mode': 'mifi'})
-            setup_wizard.save(state, {'done': True, 'mode': 'box_hotspot', 'box': True})
-            self.assertEqual(setup_wizard.load(state), {'done': True, 'mode': 'box_hotspot', 'box': True})
-            setup_wizard.save(state, {'done': False, 'mode': 'other'})
-            self.assertEqual(setup_wizard.load(state), {'done': False})
+            cases = [
+                ({'done': False, 'car': 'skip'}, {'done': False, 'iphone': 'any'}),
+                ({'done': False, 'role': 'car', 'car': 'xiaomi'},
+                 {'done': False, 'car': 'xiaomi', 'mode': 'car_hotspot', 'iphone': 'wired'}),
+                ({'done': True, 'role': 'portable', 'hotspot': True}, {'done': True, 'iphone': 'any'}),
+                ({'done': True, 'mode': 'mifi'}, {'done': True, 'mode': 'mifi', 'iphone': 'any'}),
+                ({'done': True, 'mode': 'box_hotspot', 'box': True},
+                 {'done': True, 'mode': 'box_hotspot', 'box': True, 'iphone': 'any'}),
+                ({'done': False, 'mode': 'other'}, {'done': False, 'iphone': 'any'}),
+            ]
+            for old, expected in cases:
+                setup_wizard.save(state, old)
+                self.assertEqual(setup_wizard.load(state), expected)
             (state / 'car-hotspot.json').write_text('{}')
             setup_wizard.save(state, {'done': True, 'role': 'car'})
-            self.assertEqual(setup_wizard.load(state), {'done': True, 'mode': 'car_hotspot'})
-            setup_wizard.save(state, {'done': True, 'mode': 'mifi'})
-            self.assertEqual(setup_wizard.load(state), {'done': True, 'mode': 'mifi'})
+            self.assertEqual(setup_wizard.load(state), {'done': True, 'mode': 'car_hotspot', 'iphone': 'wired'})
 
     def test_car_hotspot_security(self):
         dump = ("BSS 02:00:00:00:00:a1(on wlan0) -- associated\n\tSSID: xiaomi\n\tRSN:\t * Version: 1\n"
@@ -109,9 +107,9 @@ class WizardStateTests(unittest.TestCase):
     def test_installed_box_without_setup_file_counts_as_done_only_with_car_hotspot(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
-            self.assertEqual(setup_wizard.load(state), {'done': False})
+            self.assertEqual(setup_wizard.load(state), {'done': False, 'wizard_version': 2, 'iphone': 'any'})
             (state / 'car-hotspot.json').write_text('{}')
-            self.assertEqual(setup_wizard.load(state), {'done': True, 'mode': 'car_hotspot'})
+            self.assertEqual(setup_wizard.load(state), {'done': True, 'mode': 'car_hotspot', 'iphone': 'wired'})
             setup_wizard.save(state, {'done': False})
             self.assertFalse(setup_wizard.load(state)['done'])
             self.assertEqual((state / 'setup.json').stat().st_mode & 0o777, 0o600)
@@ -138,6 +136,7 @@ class WizardPageTests(unittest.TestCase):
         self.page = SettingsPage(self.state, lambda: self.status, self.changes.append, lambda: [], FakeScanner(), self.wired)
         self.page.apply_later = self.changes.append
         self.nonce = self.page.pairing.nonce
+        setup_wizard.save(self.state, {"done": False})  # legacy unfinished setup
 
     def choose(self, mode):
         return self.page.apply('/setup', {'action': 'mode', 'mode': mode, 'nonce': self.nonce})
@@ -161,7 +160,7 @@ class WizardPageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.page.apply('/netmode', {'mode': 'relay', 'nonce': self.nonce})
         self.assertEqual(self.choose('mifi'), '')
-        self.assertEqual(setup_wizard.load(self.state), {'done': False, 'mode': 'mifi'})
+        self.assertEqual(setup_wizard.load(self.state), {'done': False, 'mode': 'mifi', 'iphone': 'any'})
         html = self.page.render('')
         self.assertIn('<h1>连接随身 WiFi</h1>', html)
         self.assertIn('选取随身 WiFi', html)
@@ -184,7 +183,7 @@ class WizardPageTests(unittest.TestCase):
         self.assertEqual(car_audio_args(self.state), [])
         self.page.apply('/audio', {'car_music': 'on', 'nonce': self.nonce})
         self.assertEqual(json.loads((self.state / 'options.json').read_text()),
-                         {'idle_release': 0, 'tesla': False, 'car_music': True, 'car_voice': False})
+                         {'idle_release': 0, 'tesla': False, 'car_music': True, 'car_voice': False, 'local_dns': False})
         self.assertEqual(car_audio_args(self.state), ['--car-music'])
         self.assertEqual(self.changes, ['car audio changed'])
         self.assertIn('name=car_music value=on checked', self.page.render(''))
@@ -207,6 +206,22 @@ class WizardPageTests(unittest.TestCase):
         # Saved again unchanged: no talk of a new address.
         self.assertNotIn('网段', self.page.apply('/audio', {'tesla': 'on', 'car_music': 'on', 'nonce': self.nonce}))
 
+    def test_box_answers_its_own_domain_on_its_hotspot_when_chosen(self):
+        # A car that gets no DNS of its own on the box hotspot (no internet; the Xpeng did not fall back to its
+        # LTE, 2026-10-12) still opens the own domain with the trusted certificate (2026-10-15).
+        import json
+        from supervisor import hotspot_names
+        setup_wizard.save(self.state, {'done': True, 'mode': 'box_hotspot', 'box': True})
+        self.assertIn('盒子热点里解析自己的域名', self.page.render(''))
+        self.assertEqual(hotspot_names(self.state, 'mycar.duckdns.org', 'box_hotspot'), [])
+        self.page.apply('/audio', {'tesla': 'on', 'local_dns': 'on', 'nonce': self.nonce})
+        self.assertIs(json.loads((self.state / 'options.json').read_text())['local_dns'], True)
+        self.assertNotIn('name=local_dns', self.page.render(''))
+        self.assertEqual(hotspot_names(self.state, 'mycar.duckdns.org', 'box_hotspot'), list(setup_wizard.TESLA_CHECK_NAMES) + ['mycar.duckdns.org'])
+        self.assertEqual(hotspot_names(self.state, None, 'box_hotspot'), list(setup_wizard.TESLA_CHECK_NAMES), 'checks without own domain')
+        self.assertEqual(hotspot_names(self.state, 'mycar.duckdns.org', 'mifi'), [],
+                         'a joined hotspot has its own DNS; the fallback hotspot is not where the car looks')
+
     def test_tesla_mode_on_a_joined_hotspot_says_where_the_address_is_set(self):
         self.set_up_done('mifi')
         self.assertIn('自己的后台把局域网地址改成 100.96.0.1', self.page.render(''))
@@ -222,7 +237,7 @@ class WizardPageTests(unittest.TestCase):
         # Already ours (a restart before the address was flushed): still the shared one.
         self.assertEqual(setup_wizard.box_hotspot_address(usual, True, [setup_wizard.SHARED_LAN])[0], setup_wizard.SHARED_LAN)
         kept, why = setup_wizard.box_hotspot_address(usual, True, [ipaddress.ip_interface('100.96.0.7/16')])
-        self.assertEqual(kept, usual)
+        self.assertEqual(str(kept), '100.97.0.1/24')
         self.assertIn('100.96.0.7/16', why)
         self.assertTrue(setup_wizard.tesla_reaches('100.96.0.23'))
         self.assertFalse(setup_wizard.tesla_reaches('192.168.0.5'))
@@ -274,7 +289,7 @@ class WizardPageTests(unittest.TestCase):
         self.assertIn('手机也连接「xiaomi」', html)
         self.assertEqual(read_json(self.state / 'car-hotspot.json'), {'ssid': 'xiaomi', 'passphrase': '12345678'})
         self.assertEqual((self.state / 'car-hotspot.json').stat().st_mode & 0o777, 0o600)
-        self.assertEqual(setup_wizard.load(self.state), {'done': False, 'mode': 'car_hotspot', 'car': 'xiaomi'})
+        self.assertEqual(setup_wizard.load(self.state), {'done': False, 'mode': 'car_hotspot', 'car': 'xiaomi', 'iphone': 'wired'})
         self.assertEqual(self.changes, ['setup car hotspot chosen'])
         self.assertNotIn('12345678', html)
 
@@ -311,7 +326,7 @@ class WizardPageTests(unittest.TestCase):
         self.assertIn('未启动', html)
         self.assertIn('只能用数据线', html)
         self.assertNotIn('value=start', html)   # no Bluetooth pairing in this way of use
-        self.assertIn('稍后连接，先完成设置', html)
+        self.assertIn('完成设置', html)
         save_json(self.wired, {'phase': 'cable'})
         html = self.page.render('')
         self.assertIn('等待插线', html)
@@ -364,7 +379,7 @@ class WizardPageTests(unittest.TestCase):
         kind, html = self.page.apply('/setup', {'action': 'hotspot', 'ssid': 'Box', 'password': 'boxpass1', 'nonce': self.nonce})
         self.assertIn('「Box」', html)
         self.assertEqual(read_json(self.state / 'hotspot.json'), {'ssid': 'Box', 'passphrase': 'boxpass1'})
-        self.assertEqual(setup_wizard.load(self.state), {'done': False, 'mode': 'box_hotspot', 'box': True})
+        self.assertEqual(setup_wizard.load(self.state), {'done': False, 'mode': 'box_hotspot', 'box': True, 'iphone': 'any'})
         self.assertEqual(self.changes, ['setup box hotspot set'])
         self.assertIsNone(self.page.captive_redirect('captive.apple.com', '/hotspot-detect.html'))
         self.status.update(box_ssid='Box', entries=['https://192.168.78.1:18443/'])
@@ -376,7 +391,7 @@ class WizardPageTests(unittest.TestCase):
         full = self.page.render('')
         self.assertIn('方式三：车机连盒子热点', full)
         self.assertNotIn('href="/?view=car"', full)
-        self.assertIn('车机连着它时不能上网', full)
+        self.assertIn('是否能上网请看「车机上网」当前状态', full)
         self.assertIn('盒子设置', self.page.render('view=car'))   # no car hotspot page in this way
 
     def test_pairing_cancel_and_car_page_errors_return_to_their_page(self):
@@ -454,9 +469,9 @@ class WizardPageTests(unittest.TestCase):
         for gone in ('car-hotspot.json', 'car-lease.json', 'network-mode.json', 'receiver/lockdown-pair-record.properties',
                      'receiver/lockdown-pair-record-00008030-001A2B3C4D5E802E.properties', 'receiver/pairings.properties'):
             self.assertFalse((self.state / gone).exists(), gone)
-        self.assertEqual(setup_wizard.load(self.state), {'done': False})
+        self.assertEqual(setup_wizard.load(self.state), {'done': False, 'wizard_version': 2, 'iphone': 'any'})
         self.assertEqual(self.changes, ['setup reset'])
-        self.assertIn('第 1 步，共 3 步', self.page.render(''))
+        self.assertIn('什么车？', self.page.render(''))
 
     def test_reset_all_keeps_only_boot_marker(self):
         presence = self.root / 'state/receiver/phone-presence.json'

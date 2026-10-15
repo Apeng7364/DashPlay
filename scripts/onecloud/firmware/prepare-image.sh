@@ -22,6 +22,11 @@ chmod 600 "$root/state/hotspot.json"
 rm -f "$root/playport/web/dist/receiver-access.js" "$root/playport/web/dist/receiver-access.json" "$root/playport/web/dist/temporary-metrics.js"
 rm -rf "$root/playport/web/dist/experiments"   # browser tests from development, not part of the product
 
+# Wired CarPlay needs IPv6 present when the JVM starts, even without Ethernet.
+# Keep Armbian's other IPv6 choices; lo alone is sufficient (2026-10-15).
+sed -i '/^[[:space:]]*net\.ipv6\.conf\.lo\.disable_ipv6[[:space:]]*=/d' /etc/sysctl.conf
+printf '\nnet.ipv6.conf.lo.disable_ipv6 = 0\n' >> /etc/sysctl.conf
+
 # System: no Bluetooth pairings, no per-box identity, no logs, no package caches.
 rm -rf /var/lib/bluetooth/*
 rm -f /etc/ssh/ssh_host_*            # dashplay-firstboot.service creates new ones

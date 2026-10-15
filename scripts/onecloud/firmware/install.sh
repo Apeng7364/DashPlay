@@ -36,7 +36,7 @@ java -version 2>&1 | grep -q 'version "21' || { echo "Java 21 missing: use a tri
 systemctl enable systemd-networkd
 if [ -d /etc/NetworkManager ]; then
     mkdir -p /etc/NetworkManager/conf.d
-    printf '# DashPlay manages these itself.\n[keyfile]\nunmanaged-devices=interface-name:wl*;interface-name:dpap0;interface-name:dpncm\n' \
+    printf '# DashPlay manages these itself.\n[keyfile]\nunmanaged-devices=interface-name:wl*;interface-name:dpap0;interface-name:ap0;interface-name:dpncm\n' \
         > /etc/NetworkManager/conf.d/dashplay-unmanaged.conf
 fi
 # Keep the persistent journal small on the 8 GB eMMC.

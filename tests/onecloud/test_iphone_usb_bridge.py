@@ -12,6 +12,18 @@ spec.loader.exec_module(bridge)
 
 
 class UsbRequestTests(unittest.TestCase):
+    def test_large_ntb_is_read_whole_with_all_datagrams(self):
+        frames = [bytes([i]) * 1400 for i in range(22)]
+        offset = 128
+        entries = b''.join(struct.pack('<HH', offset + i * 1400, 1400) for i in range(22))
+        table = struct.pack('<4sHH', b'NCM0', 8 + len(entries) + 4, 0) + entries + b'\0' * 4
+        header = struct.pack('<4sHHHH', b'NCMH', 12, 1, offset + 30800, 12)
+        block = header + table + b'\0' * (offset - 12 - len(table)) + b''.join(frames)
+        self.assertLess(len(block), bridge.NCM_READ_CHUNK)
+        self.assertEqual(list(bridge.ntb_datagrams(block)), frames)
+        self.assertNotEqual(list(bridge.ntb_datagrams(block[:16384])), frames)
+        self.assertEqual(bridge.READ_CHUNK, 16384, 'usbmux read size remains unchanged')
+
     def test_ioctl_numbers_follow_the_cpu(self):
         # struct usbdevfs_ctrltransfer / usbdevfs_bulktransfer end in a user pointer: 16 bytes on the
         # OneCloud's armv7, 24 on the N1's aarch64 (2026-10-12: a 4-byte pointer failed there).

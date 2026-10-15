@@ -5,10 +5,15 @@ No operations run at import time. Paths are injectable for isolated adapter test
 """
 import hashlib
 import ipaddress
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+import threading
 import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import subprocess
 import time
 
@@ -104,7 +109,9 @@ def supports_sta_ap(iw_list):
         total = re.search(r"total <= (\d+)", combination)
         channels = re.search(r"#channels <= (\d+)", combination)
         if (total and int(total.group(1)) >= 2 and any("managed" in kinds for kinds, _ in limits)
-                and any(re.search(r"\bAP\b", kinds) for kinds, _ in limits)):
+                and any(re.search(r"\bAP\b", kinds) for kinds, _ in limits)
+                and all(int(limit) >= sum(kind in {part.strip() for part in kinds.split(',')} for kind in ('managed', 'AP'))
+                        for kinds, limit in limits)):
             best = max(best, int(channels.group(1)) if channels else 1)
     return best
 
@@ -129,7 +136,7 @@ def wifi_interface(net=Path("/sys/class/net")):
         names = sorted(entry.name for entry in net.iterdir())
     except OSError:
         return None
-    return next((name for name in names if name != AP_VIF and
+    return next((name for name in names if name not in (AP_VIF, "ap0") and
                  ((net / name / "wireless").exists() or (net / name / "phy80211").exists())), None)
 
 
@@ -220,6 +227,7 @@ class DebianPlatform:
         # The box hotspot runs here: the Wi-Fi interface itself, or AP_VIF next to a car-hotspot client.
         self.ap_interface = interface
         self.children = []
+        self.bluetooth_state = None
 
     ap_vif = AP_VIF
     wifi_interface = staticmethod(wifi_interface)
@@ -260,7 +268,23 @@ class DebianPlatform:
             data["peers"] += parse_stations(self.iw("station", "dump"))
         return data
 
-    def start(self, name, argv):
+    def start(self, name, argv, query_log=None):
+        if query_log:
+            query_log.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+            self.children.append((name, child))
+            def drain():
+                handler = RotatingFileHandler(query_log, maxBytes=1_000_000, backupCount=1)
+                try:
+                    for line in iter(child.stdout.readline, b""):
+                        handler.emit(logging.LogRecord("dns", logging.INFO, "", 0,
+                                                       line.decode(errors="replace").rstrip(), (), None))
+                finally:
+                    child.stdout.close()
+                    handler.close()
+            threading.Thread(target=drain, name="dns-log", daemon=True).start()
+            return child
         with (self.run / (name + ".log")).open("w") as log:
             child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log,
                                      stderr=subprocess.STDOUT, start_new_session=True)
@@ -448,8 +472,11 @@ class DebianPlatform:
         return parse_scan(self.scan(ap=ap).stdout, own_ssid)
 
     def find_hotspot(self, ssid, frequency=None):
+        from setup_wizard import _unescape_ssid
         result = self.scan(ap=True, frequency=frequency)
-        found = bool(re.search(r"^\s*SSID: " + re.escape(ssid) + r"\s*$", result.stdout, re.M))
+        # iw escapes UTF-8 bytes; compare decoded names, preserving meaningful spaces.
+        found = any(_unescape_ssid(name) == ssid
+                    for name in re.findall(r"^\s*SSID: ?(.*)$", result.stdout, re.M))
         return result.returncode == 0, found, result.stderr
 
     def unique_wifi_address(self):
@@ -494,7 +521,17 @@ class DebianPlatform:
             print(f"bluetooth address unchanged: {type(error).__name__}", flush=True)
 
     def power_bluetooth(self):
-        self.unique_bluetooth_address()
+        identity = None
+        if self.bluetooth_state is not None:
+            from bluetooth_address import BluetoothIdentity
+            identity = BluetoothIdentity(self.bluetooth_state)
+            try:
+                identity.prepare()
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                print(f"bluetooth identity not ready: {type(error).__name__}", flush=True)
+                return False
+        else:
+            self.unique_bluetooth_address()
         if subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, timeout=10).returncode != 0:
             return False
         # A phone link left over from the previous run (service restart, network rebuild) fails every
@@ -504,6 +541,13 @@ class DebianPlatform:
         if connected.stdout.lstrip().startswith("Device "):
             subprocess.run(["bluetoothctl", "power", "off"], capture_output=True, timeout=10)
             if subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, timeout=10).returncode != 0:
+                return False
+        if identity:
+            try:
+                if not identity.verify():
+                    print("bluetooth address changed after power-on; refusing a mismatched invitation", flush=True)
+                    return False
+            except (OSError, ValueError, subprocess.SubprocessError):
                 return False
         # BlueZ names the adapter after the host ("onecloud"), which is what iPhones list under
         # Bluetooth. Set on every start: a reset or a fresh image clears BlueZ's stored alias.
@@ -529,6 +573,13 @@ class DebianPlatform:
         if (device / "power/control").exists():
             (device / "power/control").write_text("on\n")
 
+    def ensure_receiver_ipv6(self):
+        # JVM decides IPv6 availability at startup. dpncm appears later, too late
+        # when Armbian disabled IPv6 and there is no Ethernet link (drive F8).
+        result = subprocess.run(["sysctl", "-w", "net.ipv6.conf.lo.disable_ipv6=0"],
+                                capture_output=True, text=True, check=True, timeout=10)
+        print("receiver IPv6: " + result.stdout.strip(), flush=True)
+
     def allow_nonlocal_bind(self):
         Path("/proc/sys/net/ipv4/ip_nonlocal_bind").write_text("1\n")
 
@@ -551,18 +602,137 @@ class DebianPlatform:
             return False
         return hostapd.poll() is None
 
-    def start_dhcp(self, address, portal):
+    def start_dhcp(self, address, portal, names=(), query_log=None, upstream=None):
+        """names: answered with the box's address on its hotspot (the owner's own domain, so that a car without
+        internet finds it, 2026-10-15); every other name is REFUSED, which sends a resolver on to its next server."""
         network = address.network
         hosts = list(network.hosts())
         # First-run setup only: a router and a DNS server that answers every name with the box make
         # phones detect a captive portal and open the setup page by themselves.
-        dns = ([f"--port=53", f"--address=/#/{address.ip}", f"--dhcp-option=3,{address.ip}",
-                f"--dhcp-option=6,{address.ip}"] if portal else ["--port=0", "--dhcp-option=3", "--dhcp-option=6"])
+        if upstream:
+            dns = ["--port=53", "--no-resolv", "--no-hosts", f"--server={upstream}", "--server=223.5.5.5",
+                   *(f"--address=/{name}/{address.ip}" for name in names),
+                   f"--dhcp-option=3,{address.ip}", f"--dhcp-option=6,{address.ip}"]
+        elif portal:
+            dns = [f"--port=53", f"--address=/#/{address.ip}", f"--dhcp-option=3,{address.ip}",
+                   f"--dhcp-option=6,{address.ip}"]
+        elif names:
+            dns = ["--port=53", "--no-resolv", "--no-hosts", *(f"--address=/{name}/{address.ip}" for name in names),
+                   "--dhcp-option=3", f"--dhcp-option=6,{address.ip}"]
+        else:
+            dns = ["--port=0", "--dhcp-option=3", "--dhcp-option=6"]
         self.start("dnsmasq", ["dnsmasq", "--keep-in-foreground", "--conf-file=/dev/null", *dns,
                           f"--interface={self.ap_interface}", "--bind-interfaces", "--except-interface=lo",
                           f"--dhcp-range={hosts[9]},{hosts[99]},{network.netmask},12h",
                           "--dhcp-authoritative",
-                          f"--dhcp-leasefile={self.run / 'dnsmasq.leases'}", "--log-dhcp"])
+                          f"--dhcp-leasefile={self.run / 'dnsmasq.leases'}", "--log-dhcp",
+                          *(["--log-queries", "--log-facility=-"] if query_log else [])],
+                   **({"query_log": query_log} if query_log else {}))
+
+    def uplink_gateway(self):
+        result = subprocess.run(['ip', '-j', '-4', 'route', 'show', 'default', 'dev', self.interface],
+                                capture_output=True, text=True, check=True, timeout=5)
+        routes = json.loads(result.stdout)
+        return next((str(ipaddress.IPv4Address(route['gateway'])) for route in routes if route.get('gateway')), None)
+
+    def prepare_phone_uplink(self):
+        from phone_uplink import station_mac
+        # Journal before changing anything so a killed supervisor can undo it.
+        self.cleanup_phone_uplink()
+        result = subprocess.run(['ip', '-j', 'link', 'show', 'dev', self.interface],
+                                capture_output=True, text=True, check=True, timeout=5)
+        info = json.loads(result.stdout)[0]
+        original = info.get('permaddr') or info['address']
+        # Some N1 images ship a shared vendor MAC; preserve our existing per-box replacement.
+        if original.lower() in SHARED_WIFI_ADDRESSES:
+            original = info['address']
+        from setup_wizard import save_json
+        save_json(self.run / 'phone-uplink.json', {'mac': original, 'interface': self.interface,
+                  'forward': Path('/proc/sys/net/ipv4/ip_forward').read_text().strip(), 'network': None})
+        for args in (['down'], ['address', station_mac(original)]):
+            subprocess.run(['ip', 'link', 'set', 'dev', self.interface, *args], check=True, capture_output=True, timeout=5)
+
+    def add_phone_ap(self):
+        saved = json.loads((self.run / 'phone-uplink.json').read_text())
+        # STA already has a different MAC. ap0 gets the same MAC as the normal daily AP.
+        subprocess.run(['iw', 'dev', self.interface, 'interface', 'add', 'ap0', 'type', '__ap'],
+                       check=True, capture_output=True, timeout=10)
+        self.ap_interface = 'ap0'
+        self.release_phone_ap_from_networkmanager()
+        subprocess.run(['ip', 'link', 'set', 'dev', 'ap0', 'address', saved['mac']],
+                       check=True, capture_output=True, timeout=5)
+        return True
+
+    def release_phone_ap_from_networkmanager(self):
+        # Older installs exclude wl*/dpap0 but not ap0. NM can take it over after
+        # hostapd starts and remove its address. Claim only our new interface;
+        # do not reload NM, change Ethernet, or write permanent system settings.
+        if not shutil.which('nmcli'):
+            return
+        running = subprocess.run(['nmcli', '-t', '-f', 'RUNNING', 'general'],
+                                 capture_output=True, text=True, timeout=5,
+                                 env={**os.environ, 'LC_ALL': 'C'})
+        if running.stdout.strip() == 'not running':
+            return
+        if running.returncode or running.stdout.strip() != 'running':
+            raise RuntimeError('Cannot determine NetworkManager state')
+        # Its D-Bus device may appear slightly after iw creates the interface.
+        for attempt in range(10):
+            subprocess.run(['nmcli', 'device', 'set', 'ap0', 'managed', 'no'],
+                           capture_output=True, timeout=3)
+            state = subprocess.run(['nmcli', '-g', 'GENERAL.STATE', 'device', 'show', 'ap0'],
+                                   capture_output=True, text=True, timeout=3,
+                                   env={**os.environ, 'LC_ALL': 'C'})
+            if state.returncode == 0 and re.match(r'^10(?:\s|$)', state.stdout.strip()):
+                return
+            if attempt < 9:
+                time.sleep(0.2)
+        raise RuntimeError('NetworkManager did not release the phone hotspot interface')
+
+    def n_only_ap(self):
+        path = self.run / 'hostapd.conf'
+        path.write_text(''.join(line for line in path.read_text().splitlines(True)
+                                if not line.startswith(('ieee80211ac=', 'vht_', 'ht_capab='))))
+
+    def phone_nat_rules(self, network):
+        # Follow routing (Ethernet at home, phone Wi-Fi in the car), never translate back onto ap0.
+        return [(['-t', 'nat'], ['POSTROUTING', '-s', str(network), '!', '-o', 'ap0',
+                                '-m', 'comment', '--comment', 'dashplay-phone-uplink', '-j', 'MASQUERADE']),
+                ([], ['FORWARD', '-i', 'ap0', '!', '-o', 'ap0', '-s', str(network),
+                      '-m', 'comment', '--comment', 'dashplay-phone-uplink', '-j', 'ACCEPT']),
+                ([], ['FORWARD', '!', '-i', 'ap0', '-o', 'ap0', '-d', str(network),
+                      '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED',
+                      '-m', 'comment', '--comment', 'dashplay-phone-uplink', '-j', 'ACCEPT'])]
+
+    def enable_phone_nat(self, network):
+        from setup_wizard import save_json
+        path = self.run / 'phone-uplink.json'
+        saved = json.loads(path.read_text())
+        saved['network'] = str(network)
+        save_json(path, saved)
+        subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'], check=True, capture_output=True, timeout=5)
+        for table, rule in self.phone_nat_rules(network):
+            subprocess.run(['iptables', *table, '-I', *rule], check=True, capture_output=True, timeout=5)
+
+    def cleanup_phone_uplink(self):
+        path = self.run / 'phone-uplink.json'
+        if not path.exists():
+            return
+        saved = json.loads(path.read_text())
+        self.stop_child('wpa_supplicant')
+        self.remove_sta_network()
+        if saved.get('network'):
+            for table, rule in reversed(self.phone_nat_rules(ipaddress.ip_network(saved['network']))):
+                subprocess.run(['iptables', *table, '-D', *rule], capture_output=True, timeout=5)
+        subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=' + saved['forward']],
+                       capture_output=True, check=True, timeout=5)
+        subprocess.run(['iw', 'dev', 'ap0', 'del'], capture_output=True, timeout=5)
+        for args in (['down'], ['address', saved['mac']]):
+            subprocess.run(['ip', 'link', 'set', 'dev', saved['interface'], *args],
+                           check=True, capture_output=True, timeout=5)
+        subprocess.run(['ip', 'addr', 'flush', 'dev', saved['interface']], check=True, capture_output=True, timeout=5)
+        self.ap_interface = self.interface
+        path.unlink()
 
     def stop_all(self):
         for name, child in reversed(self.children):

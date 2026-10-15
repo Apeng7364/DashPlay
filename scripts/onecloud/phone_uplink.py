@@ -1,0 +1,190 @@
+"""Own the daily phone-uplink lifecycle; the box AP is always the fallback.
+
+Only Debian uses this controller. F50's current driver cannot do STA + AP.
+Switching networks is explicit: stop the old AP, re-associate clients for DHCP,
+keep the AP MAC, and undo our NAT/forwarding before returning to offline mode.
+"""
+import json
+from pathlib import Path
+import subprocess
+import time
+import setup_wizard
+
+HOTSPOT = 'uplink-hotspot.json'
+
+
+def hotspot(state):
+    import debug_uplink
+    return debug_uplink.hotspot(state, filename=HOTSPOT)
+
+
+def station_mac(permanent):
+    octets = bytearray.fromhex(permanent.replace(':', ''))
+    if len(octets) != 6 or octets[0] & 1:
+        raise ValueError('Invalid Wi-Fi permanent address')
+    octets[0] |= 2
+    result = ':'.join(f'{b:02x}' for b in octets)
+    if result == permanent.lower():
+        octets[-1] ^= 0x80
+    return ':'.join(f'{b:02x}' for b in octets)
+
+
+def start_shared_ap(platform, address, box, channel, width, wait_for, names=(), upstream=None,
+                    query_log=None, concurrent=False):
+    """One AP path for phone uplinks and joined car/MiFi uplinks (design 5.2a)."""
+    platform.configure_hotspot(channel, width, box['ssid'], box['passphrase'])
+    if concurrent:
+        platform.n_only_ap()
+    platform.set_ap_address(address)
+    for _ in range(2):
+        if platform.start_ap(wait_for):
+            break
+        platform.stop_child('hostapd')
+    else:
+        raise RuntimeError('hotspot failed twice')
+    platform.start_dhcp(address, False, names, upstream=upstream, query_log=query_log)
+
+
+class JoinedPhoneAP:
+    """Opt-in device validation of a direct iPhone AP beside a car/MiFi station.
+
+    Prepare before joining so the station and AP never share a MAC. The supervisor
+    owns reconnect/fallback; a changed upstream channel rebuilds this whole lifecycle.
+    No Tesla checks or own-name overrides are applied on the joined network.
+    """
+    def __init__(self, platform, address, box, wait_for):
+        self.platform, self.address, self.box, self.wait_for = platform, address, box, wait_for
+        self.prepared = self.active = False
+        self.frequency = None
+
+    def prepare(self):
+        if not self.platform.concurrent_ap():
+            return False
+        self.prepared = True  # cleanup even if journaling/preparation fails partway
+        self.platform.prepare_phone_uplink()
+        return True
+
+    def start(self):
+        p = self.platform
+        if not self.prepared:
+            raise RuntimeError('direct AP was not prepared before association')
+        if any(a.version == 4 and a.network.overlaps(self.address.network) for a in p.local_addresses()):
+            raise ValueError('upstream overlaps direct phone subnet')
+        self.frequency = p.frequency()
+        if not self.frequency:
+            raise RuntimeError('upstream has no channel')
+        upstream = p.uplink_gateway()
+        if not p.add_phone_ap():
+            raise RuntimeError('direct AP interface failed')
+        if upstream:
+            p.enable_phone_nat(self.address.network)
+        freq = int(self.frequency)
+        channel = (freq - 2407) // 5 if freq < 3000 else (freq - 5000) // 5
+        start_shared_ap(p, self.address, self.box, channel, 20, self.wait_for,
+                        upstream=upstream, concurrent=True)
+        self.active = True
+        return channel
+
+    def changed(self):
+        return self.active and (not self.platform.connected() or
+                               self.platform.frequency() != self.frequency or not self.platform.ap_ready())
+
+    def close(self):
+        if self.prepared:
+            for child in ('dnsmasq', 'hostapd'):
+                self.platform.stop_child(child)
+            self.platform.cleanup_phone_uplink()
+        self.prepared = self.active = False
+
+
+class PhoneUplink:
+    def __init__(self, platform, state, address, box, offline_channel, offline_width,
+                 wait_for, start_receiver, status, say=print, clock=time.monotonic):
+        self.platform, self.state, self.address, self.box = platform, Path(state), address, box
+        self.channel, self.width = offline_channel, offline_width
+        self.wait_for, self.start_receiver, self.status, self.say, self.clock = wait_for, start_receiver, status, say, clock
+        self.phase, self.frequency = 'offline', None
+        self.next_try, self.backoff = clock() + 5, 15
+        self.saved = hotspot(state)
+        self.set_status('offline', '先提供盒子热点，再寻找手机热点')
+
+    def set_status(self, phase, reason):
+        self.phase = phase
+        self.status['uplink'] = {'phase': phase, 'ssid': self.saved['ssid'] if self.saved else '', 'reason': reason}
+        self.status['tesla_offline'] = bool(self.status.get('tesla') and phase != 'online')
+        # No credentials in logs; diagnostics also records this dict.
+        self.say(f'phone uplink {phase}: {reason}')
+
+    def stop_network(self):
+        for child in ('receiver', 'dnsmasq', 'hostapd'):
+            self.platform.stop_child(child)
+
+    def start_ap(self, channel, width, names, upstream=None):
+        start_shared_ap(self.platform, self.address, self.box, channel, width, self.wait_for, names, upstream,
+                        query_log=self.state / 'diag/tesla-dns.log' if self.status.get('tesla') else None,
+                        concurrent=bool(upstream))
+        self.start_receiver(channel)
+        self.status['channel'] = channel
+
+    def fallback(self, reason):
+        self.stop_network()
+        self.platform.cleanup_phone_uplink()
+        names = list(setup_wizard.TESLA_CHECK_NAMES) if self.status.get('tesla') else []
+        if self.status.get('own_name') and (self.status.get('tesla') or setup_wizard.options(self.state).get('local_dns')):
+            names.append(self.status['own_name'])
+        self.start_ap(self.channel, self.width, names)
+        self.set_status('offline', reason)
+        self.next_try = self.clock() + self.backoff
+        self.backoff = min(self.backoff * 2, 300)
+
+    def tick(self):
+        p = self.platform
+        if self.phase == 'online':
+            if not p.connected():
+                self.fallback('手机热点掉线，已退回不上网')
+            elif p.frequency() != self.frequency:
+                self.fallback('手机热点信道改变，已退回不上网')
+            elif not p.ap_ready():
+                self.fallback('共享热点停止，已退回不上网')
+            return
+        if not self.saved or self.clock() < self.next_try:
+            return
+        self.next_try = self.clock() + self.backoff
+        try:
+            if not p.concurrent_ap():
+                self.set_status('offline', '无线驱动不支持同时连接和开热点')
+                self.next_try = self.clock() + 300
+                return
+            supported, found, _ = p.find_hotspot(self.saved['ssid'])
+            if not supported or not found:
+                self.set_status('offline', '没找到手机热点，保持不上网')
+                self.backoff = min(self.backoff * 2, 300)
+                return
+            self.set_status('connecting', '已找到手机热点，正在连接')
+            self.stop_network()
+            p.prepare_phone_uplink()
+            if not p.join_wifi(self.saved, {}, self.wait_for, 20):
+                raise RuntimeError('手机热点连接失败')
+            if any(a.version == 4 and a.network.overlaps(self.address.network) for a in p.local_addresses()):
+                raise ValueError('手机热点与盒子网段冲突')
+            self.frequency = p.frequency()
+            if not self.frequency:
+                raise RuntimeError('手机热点没有可用信道')
+            upstream = p.uplink_gateway()
+            if not upstream:
+                raise RuntimeError('手机热点没有网关')
+            if not p.add_phone_ap():
+                raise RuntimeError('无法创建共享热点')
+            p.enable_phone_nat(self.address.network)
+            freq = int(self.frequency)
+            channel = (freq - 2407) // 5 if freq < 3000 else (freq - 5000) // 5
+            # Real upstream: all names, including own domain and Tesla checks, resolve normally.
+            self.start_ap(channel, 20, [], upstream)
+            self.backoff = 15
+            self.set_status('online', '已连上手机热点，车机可上网')
+        except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
+            # Exception strings from commands can contain credentials; only report the category.
+            self.fallback('连接失败（' + type(error).__name__ + '），已退回不上网')
+
+    def close(self):
+        self.platform.cleanup_phone_uplink()

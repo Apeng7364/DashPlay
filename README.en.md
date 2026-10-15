@@ -12,6 +12,16 @@ DashPlay is built on [PlayPort](https://github.com/youcci/playport): patches plu
 
 The guide itself is in Chinese; assistants follow it in whatever language you write to them.
 
+For an N1, append the sentence that matches its current system. On stock firmware, connect a display and read the version on the Phicomm home screen.
+
+| N1 starting point | Sentence to add |
+|---|---|
+| Already running Linux | My N1 runs Linux and is reachable over Ethernet. I have a USB drive of at least 8 GB that can be erased. |
+| Stock Phicomm, version 2.19 or earlier | My N1 runs stock Phicomm firmware, version 2.19 or earlier. I have a display, a USB mouse and a USB drive of at least 8 GB that can be erased. |
+| Stock Phicomm, later than 2.19 | My N1 runs stock Phicomm firmware later than 2.19, for example 2.22. I have a display, a USB mouse, a USB-A male-to-male cable and a USB drive of at least 8 GB that can be erased. |
+
+The already-Linux route has been tested on an N1. Both stock-firmware routes come from public guides and have not been tested by this project. If the box runs Android TV or cannot boot, say so instead of choosing a Linux or stock starting point.
+
 > **This is not an Apple-certified product.** You have to supply your own accessory authentication identity; see "Authentication identity" below.
 
 ## Status

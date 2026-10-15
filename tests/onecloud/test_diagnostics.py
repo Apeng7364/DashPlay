@@ -97,6 +97,25 @@ class DiagLogTests(unittest.TestCase):
         self.assertEqual(records[1]['link'], {'signal': -60})
         self.assertEqual(records[1]['log'], ['x WARN something'])
 
+    def test_direct_phone_diagnostic_samples_ap_instead_of_upstream(self):
+        platform = Mock(interface='wlan-test')
+        platform.boot_id.return_value = 'abcdef01'
+        platform.diagnostics.return_value = {}
+        stopped = Mock(); stopped.wait.side_effect = [False, True]
+        log = diagnostics.DiagLog(self.dir)
+        status = {'mode':'sta', 'phone_interface':'ap0', 'direct_phone':'validation', 'tesla_dns_log':'stopped'}
+        # Run exactly one real loop iteration, synchronously, without network probes.
+        with patch('diagnostics.threading.Thread') as thread, patch('diagnostics.ping_targets', return_value={'phone':'192.0.2.2'}), \
+             patch('diagnostics.ping_stats', return_value=None), patch('diagnostics.tcp_stats', return_value=[]), \
+             patch('diagnostics.time.monotonic', return_value=30), patch('diagnostics.phone_traffic', return_value={'bytes':42}) as traffic:
+            thread.side_effect = lambda target, **kw: Mock(start=target)
+            diagnostics.start(stopped, log, Path(self.tmp.name)/'receiver.log', platform, status, state=Path(self.tmp.name))
+        traffic.assert_called_once_with('ap0', '192.0.2.2')
+        record = json.loads(log.text().splitlines()[-1])
+        self.assertEqual(record['phone_interface'], 'ap0')
+        self.assertEqual(record['direct_phone'], 'validation')
+        self.assertEqual(record['tesla_dns_log'], 'stopped')
+
 
 
 class LogMirrorTests(unittest.TestCase):

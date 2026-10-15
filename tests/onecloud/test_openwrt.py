@@ -174,6 +174,14 @@ def applied(uci, changes):
 class NameRecordTests(unittest.TestCase):
     """uci dashplay.main.public_ipv6: the name also (1) or only (2) answers with the router's public IPv6."""
 
+    def test_tesla_online_own_domain_returns_to_public_resolution(self):
+        start = applied(DHCP, name_changes(DHCP, NAME, LAN_IP, PUBLIC, only_public=True))
+        normal = applied(start, name_changes(start, NAME, None))
+        self.assertNotIn('dhcp.dashplay=', normal)
+        self.assertNotIn('dhcp.dashplay6=', normal)
+        self.assertNotIn('/' + NAME + '/', normal)
+        self.assertEqual(name_changes(normal, NAME, None), [])
+
     def test_the_lan_address_by_default(self):
         changes = name_changes(DHCP, NAME, LAN_IP)
         after = applied(DHCP, changes)

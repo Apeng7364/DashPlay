@@ -36,7 +36,7 @@ def durable_write(path, text):
         os.close(directory)
 
 
-def write_browser_access(root, token, settings_port=80, car_music=False, tesla=False):
+def write_browser_access(root, token, settings_port=80, car_music=False, tesla=False, tesla_browser=False):
     """Authorize viewers on the receiver LAN; admin login remains separate. car_music: the music goes over the car's
     own Bluetooth (the page leaves the media card and keys to the car, prompts louder); tesla: also the Tesla
     browser's ways (fullscreen through a listed video site)."""
@@ -48,7 +48,7 @@ def write_browser_access(root, token, settings_port=80, car_music=False, tesla=F
     # settings page (settings_page.py; port 80, or another one on OpenWrt, where LuCI has 80).
     (dist / "receiver-access.js").unlink(missing_ok=True)
     path = dist / "receiver-access.json"
-    flags = {**({"carMusic": True} if car_music or tesla else {}), **({"tesla": True} if tesla else {})}
+    flags = {**({"carMusic": bool(car_music or tesla)} if car_music or tesla or tesla_browser else {}), **({"tesla": True} if tesla or tesla_browser else {})}
     content = json.dumps({"token": token, "settingsPort": int(settings_port), **flags}) + "\n"
     temporary = path.with_suffix('.json.tmp')
     temporary.write_text(content)
@@ -99,6 +99,7 @@ def main():
                         help="music over the car's own Bluetooth: the page leaves the media card and keys to the car")
     parser.add_argument("--car-voice", action="store_true",
                         help="calls and Siri over the car's own Bluetooth: the receiver offers no microphone")
+    parser.add_argument("--tesla-browser", action="store_true", help="Tesla fullscreen without changing audio preferences")
     parser.add_argument("--tesla", action="store_true",
                         help="Tesla mode: --car-music, --car-voice and the Tesla browser's fullscreen")
     parser.add_argument("--idle-release", type=int, default=300,
@@ -140,7 +141,7 @@ def main():
     if not re.fullmatch(r"[0-9a-f]{32}", token):   # missing, or emptied by a power cut
         token = secrets.token_hex(16)
         durable_write(token_path, token + "\n")
-    write_browser_access(root, token, args.settings_port, args.car_music, args.tesla)
+    write_browser_access(root, token, args.settings_port, args.car_music, args.tesla, args.tesla_browser)
     env = dict(os.environ, BT_BRIDGE_PYTHON="/usr/bin/python3", BT_BRIDGE_READY_WAIT="15", BT_BRIDGE_CONNECT_TIMEOUT="8",
                BT_BRIDGE_RECOVERY_STATE=str(state / "bluetooth-recovery.stamp"),
                CARPLAY_PRESENCE_HELPER=str(root / "phone-presence.py"),

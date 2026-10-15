@@ -173,6 +173,30 @@ async def recover_stale_link(bus, adapter, target):
         return True
 
 
+async def clear_stale_request(bus, adapter, target):
+    """Opt-in: cancel a request BlueZ still holds for the disconnected phone; the pairing stays.
+
+    BlueZ answers InProgress br-connection-busy while it keeps a pending connect, SDP browse or
+    service queue for the device. With nothing connected that never clears by itself (N1, 2026-10-15:
+    every invitation failed until Device1.Disconnect). On a disconnected device Disconnect only
+    cancels those (BlueZ 5.82 device_request_disconnect); it is skipped while pairing or scanning.
+    """
+    if not os.environ.get('BT_BRIDGE_RECOVERY_STATE'):
+        return False
+    objects = (await call(bus, '/', 'org.freedesktop.DBus.ObjectManager',
+                          'GetManagedObjects', timeout=5))[0]
+    props = properties(objects, target, DEVICE)
+    controller = properties(objects, adapter, ADAPTER)
+    if (not props.get('Paired') or props.get('Blocked') or props.get('Connected') or
+            props.get('Adapter') != adapter or not controller.get('Powered') or controller.get('Discovering') or
+            controller.get('Pairable') or controller.get('Discoverable')):
+        return False
+    print('bt-bridge: BlueZ holds a stale request for the disconnected phone; cancelling it, pairing retained',
+          file=sys.stderr)
+    await call(bus, target, DEVICE, 'Disconnect', timeout=5)
+    return True
+
+
 async def connect(bus, objects, adapter, args, stopped, owner):
     if not properties(objects, adapter, ADAPTER).get('Powered'):
         raise BridgeError('adapter is powered off; enable it explicitly before connecting')
@@ -230,13 +254,15 @@ async def connect(bus, objects, adapter, args, stopped, owner):
             try:
                 await call(bus, target, DEVICE, 'ConnectProfile', 's', [UUID], args.timeout + 1)
             except BridgeError as error:
-                if not any(code in str(error) for code in ('br-connection-already-connected', 'br-connection-busy')):
+                if 'br-connection-busy' in str(error) and await clear_stale_request(bus, adapter, target):
+                    print('bt-bridge: retrying after cancelling the stale request', file=sys.stderr)
+                elif (any(code in str(error) for code in ('br-connection-already-connected', 'br-connection-busy'))
+                        and await recover_stale_link(bus, adapter, target)):
+                    # The adapter was power-cycled: retry here instead of failing the whole bootstrap,
+                    # which cost ~11 s of supervisor back-off on a returning phone (2026-10-11).
+                    print('bt-bridge: retrying after stale-link recovery', file=sys.stderr)
+                else:
                     raise
-                if not await recover_stale_link(bus, adapter, target):
-                    raise
-                # The adapter was power-cycled: retry here instead of failing the whole bootstrap,
-                # which cost ~11 s of supervisor back-off on a returning phone (2026-10-11).
-                print('bt-bridge: retrying after stale-link recovery', file=sys.stderr)
                 await asyncio.sleep(STALE_RETRY_DELAY)
                 await call(bus, target, DEVICE, 'ConnectProfile', 's', [UUID], args.timeout + 1)
             return await profile.ready

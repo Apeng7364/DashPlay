@@ -49,6 +49,7 @@ class BlueZTests(unittest.IsolatedAsyncioTestCase):
         self.unregistered = False
         self.mode = 'normal'
         self.powered = []
+        self.device_disconnects = []
         self.peer = None
         self.connected = asyncio.Event()
         self.tasks = []
@@ -72,13 +73,19 @@ class BlueZTests(unittest.IsolatedAsyncioTestCase):
         if message.member == 'DisconnectProfile':
             self.disconnected = True
             return Message.new_method_return(message)
-        if message.member == 'Set' and self.mode == 'stale-once':
+        if message.member == 'Set' and self.mode in ('stale-once', 'held-request'):
             self.powered.append(message.body[2].value)
+            return Message.new_method_return(message)
+        if message.member == 'Disconnect' and message.interface == 'org.bluez.Device1':
+            self.device_disconnects.append(message.path)
             return Message.new_method_return(message)
         if message.member == 'ConnectProfile':
             self.assertEqual(message.body, [UUID])
             if self.mode == 'stale-once' and not self.powered:
                 return Message.new_error(message, 'org.bluez.Error.Failed', 'br-connection-already-connected')
+            if self.mode == 'held-request' and not self.device_disconnects:
+                # BlueZ still holds a pending connect/browse for the disconnected phone (N1, 2026-10-15).
+                return Message.new_error(message, 'org.bluez.Error.InProgress', 'br-connection-busy')
             if self.mode == 'connect-reject':
                 return Message.new_error(message, 'org.bluez.Error.NotAvailable', 'test missing SDP service')
             if self.mode == 'connect-hang':
@@ -254,6 +261,29 @@ class BlueZTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b'retrying after stale-link recovery', err)
         self.assertIn(b'RFCOMM connected', err)
         self.assertNotIn(b'Traceback', err)
+
+    async def test_held_request_is_cancelled_without_power_cycle_or_unpairing(self):
+        self.mode = 'held-request'
+        self.data[DEVICE]['org.bluez.Device1']['Connected'] = Variant('b', False)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        stamp = Path(directory.name) / 'recovery.stamp'
+        process = await self.launch('--address', ADDRESS, env_extra={'BT_BRIDGE_RECOVERY_STATE': str(stamp)})
+        await asyncio.wait_for(self.connected.wait(), 5)
+        self.assertEqual(self.device_disconnects, [DEVICE])
+        self.assertEqual(self.powered, [])
+        process.send_signal(signal.SIGTERM)
+        out, err = await asyncio.wait_for(process.communicate(), 5)
+        self.assertIn(b'retrying after cancelling the stale request', err)
+        self.assertIn(b'RFCOMM connected', err)
+        self.assertNotIn(b'Traceback', err)
+
+    async def test_held_request_without_opt_in_still_fails_plainly(self):
+        self.mode = 'held-request'
+        code, out, err = await self.result('--address', ADDRESS)
+        self.assertEqual((code, out), (1, b''))
+        self.assertIn(b'br-connection-busy', err)
+        self.assertEqual((self.device_disconnects, self.powered), ([], []))
 
     async def test_peer_eof_and_stdin_eof(self):
         for mode in ('peer', 'stdin'):

@@ -59,6 +59,94 @@ class PlatformTests(unittest.TestCase):
             clock[0] += 125
             self.assertEqual([n['ssid'] for n in scan.results(fresh=True)], ['Car'])
 
+    def test_find_hotspot_decodes_iw_names_and_matches_exactly(self):
+        for name in ('测试热点', 'Phone’s WiFi', r'Phone\test', ' Phone '):
+            with self.subTest(name=name):
+                encoded = ''.join(f'\\x{byte:02x}' for byte in name.encode())
+                scan = f'BSS 02:00:00:00:00:01\n\tSSID: {encoded}\n\tsignal: -40 dBm\n'
+                with patch.object(self.platform, 'scan', return_value=Mock(returncode=0, stdout=scan, stderr='')) as run:
+                    self.assertEqual(self.platform.find_hotspot(name, 5745), (True, True, ''))
+                    run.assert_called_with(ap=True, frequency=5745)
+                    self.assertFalse(self.platform.find_hotspot(name + ' other')[1])
+
+    def test_find_hotspot_does_not_trim_a_different_name_or_hide_scan_failure(self):
+        with patch.object(self.platform, 'scan', return_value=Mock(
+                returncode=0, stdout='BSS 02:00:00:00:00:01\n\tSSID: Phone \n', stderr='')):
+            self.assertFalse(self.platform.find_hotspot('Phone')[1])
+        with patch.object(self.platform, 'scan', return_value=Mock(returncode=1, stdout='', stderr='scan failed')):
+            self.assertEqual(self.platform.find_hotspot('Phone'), (False, False, 'scan failed'))
+
+    def test_phone_ap_waits_for_networkmanager_release_before_assigning_mac(self):
+        (self.root / 'phone-uplink.json').write_text('{"mac":"00:00:5e:00:53:01"}')
+        states = iter(['100 (connected)', '10 (unmanaged)'])
+        def run(argv, **kwargs):
+            if argv[:2] == ['nmcli', '-t']:
+                return Mock(returncode=0, stdout='running\n')
+            if argv[:2] == ['nmcli', '-g']:
+                return Mock(returncode=0, stdout=next(states))
+            return Mock(returncode=0, stdout='')
+        with patch('shutil.which', return_value='/usr/bin/nmcli'), \
+                patch('platform_debian.subprocess.run', side_effect=run) as command, \
+                patch('platform_debian.time.sleep'):
+            self.assertTrue(self.platform.add_phone_ap())
+        calls = [c.args[0] for c in command.call_args_list]
+        release = ['nmcli', 'device', 'set', 'ap0', 'managed', 'no']
+        address = ['ip', 'link', 'set', 'dev', 'ap0', 'address', '00:00:5e:00:53:01']
+        self.assertEqual(calls.count(release), 2)
+        self.assertLess(calls.index(release), calls.index(address))
+        self.assertEqual(calls[-1], address)
+        self.assertFalse(any('--permanent' in c or 'reload' in c for c in calls))
+
+    def test_phone_ap_refuses_to_configure_when_networkmanager_keeps_ownership(self):
+        (self.root / 'phone-uplink.json').write_text('{"mac":"00:00:5e:00:53:01"}')
+        def run(argv, **kwargs):
+            return Mock(returncode=0, stdout='running' if argv[:2] == ['nmcli', '-t'] else '100 (connected)')
+        with patch('shutil.which', return_value='/usr/bin/nmcli'), \
+                patch('platform_debian.subprocess.run', side_effect=run) as command, \
+                patch('platform_debian.time.sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'NetworkManager'):
+                self.platform.add_phone_ap()
+        calls = [c.args[0] for c in command.call_args_list]
+        self.assertFalse(any(c[:3] == ['ip', 'link', 'set'] for c in calls))
+        self.assertEqual(self.platform.ap_interface, 'ap0')  # lifecycle cleanup can remove it
+        self.assertTrue((self.root / 'phone-uplink.json').exists())
+
+    def test_phone_ap_waits_for_networkmanager_to_discover_new_interface(self):
+        (self.root / 'phone-uplink.json').write_text('{"mac":"00:00:5e:00:53:01"}')
+        states = iter([Mock(returncode=10, stdout=''), Mock(returncode=0, stdout='10 (unmanaged)')])
+        def run(argv, **kwargs):
+            if argv[:2] == ['nmcli', '-t']:
+                return Mock(returncode=0, stdout='running')
+            if argv[:2] == ['nmcli', '-g']:
+                return next(states)
+            return Mock(returncode=10 if argv[:2] == ['nmcli', 'device'] else 0)
+        with patch('shutil.which', return_value='/usr/bin/nmcli'), \
+                patch('platform_debian.subprocess.run', side_effect=run), patch('platform_debian.time.sleep'):
+            self.assertTrue(self.platform.add_phone_ap())
+
+    def test_phone_ap_does_not_ignore_networkmanager_probe_error_or_timeout(self):
+        (self.root / 'phone-uplink.json').write_text('{"mac":"00:00:5e:00:53:01"}')
+        for response in (Mock(returncode=1, stdout=''), subprocess.TimeoutExpired('nmcli', 5)):
+            def run(argv, **kwargs):
+                if argv[0] == 'nmcli':
+                    if isinstance(response, Exception):
+                        raise response
+                    return response
+                return Mock(returncode=0)
+            with self.subTest(response=response), patch('shutil.which', return_value='/usr/bin/nmcli'), \
+                    patch('platform_debian.subprocess.run', side_effect=run) as command:
+                with self.assertRaises((RuntimeError, subprocess.TimeoutExpired)):
+                    self.platform.add_phone_ap()
+                self.assertFalse(any(c.args[0][:3] == ['ip', 'link', 'set'] for c in command.call_args_list))
+
+    def test_phone_ap_without_networkmanager_needs_no_extra_management(self):
+        (self.root / 'phone-uplink.json').write_text('{"mac":"00:00:5e:00:53:01"}')
+        for binary, running in ((None, None), ('/usr/bin/nmcli', 'not running')):
+            with self.subTest(binary=binary), patch('shutil.which', return_value=binary), \
+                    patch('platform_debian.subprocess.run', return_value=Mock(returncode=0, stdout=running)) as command:
+                self.assertTrue(self.platform.add_phone_ap())
+                self.assertFalse(any(c.args[0][:3] == ['nmcli', 'device', 'set'] for c in command.call_args_list))
+
     @patch('platform_debian.subprocess.run')
     def test_bluetooth_and_link_observation(self, run):
         run.return_value = Mock(returncode=0, stdout='Connected to synthetic\n freq: 5180\n')
@@ -199,6 +287,16 @@ class PlatformTests(unittest.TestCase):
             self.platform.start_dhcp(address, False)
             self.assertIn('--port=0', start.call_args.args[1])
             self.assertIn('--dhcp-option=3', start.call_args.args[1])
+            # The own domain only: the box is the hotspot's DNS server, still no router; no upstream, so every
+            # other name is REFUSED and a car's resolver moves on to its next server (dnsmasq 2.91 on the N1, 2026-10-15).
+            self.platform.start_dhcp(address, False, ['mycar.duckdns.org'])
+            argv = start.call_args.args[1]
+            for flag in ('--port=53', '--no-resolv', '--no-hosts', '--address=/mycar.duckdns.org/192.0.2.1',
+                         '--dhcp-option=3', '--dhcp-option=6,192.0.2.1'):
+                self.assertIn(flag, argv)
+            self.assertNotIn('--address=/#/192.0.2.1', argv)
+            self.platform.start_dhcp(address, True, ['mycar.duckdns.org'])
+            self.assertIn('--address=/#/192.0.2.1', start.call_args.args[1], 'first-run setup answers every name')
 
     def test_station_plus_ap_detection_from_iw_list(self):
         rebuilt = ('\tvalid interface combinations:\n\t\t * #{ managed } <= 1, #{ AP } <= 1,\n'

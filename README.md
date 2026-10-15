@@ -10,6 +10,16 @@ DashPlay 基于 [PlayPort](https://github.com/youcci/playport)，提供补丁和
 
 > 请在终端用 curl 下载 https://raw.githubusercontent.com/yizhixiaoheigou/DashPlay/main/skills/dashplay-install/SKILL.md 的原文并完整读完（不要用网页摘要工具，它可能给出旧版或删节版），再按它一步步帮我把 DashPlay 装好。
 
+如果是 N1，把符合现状的一句接在后面（原厂版本在接显示器后的斐讯首页查看）：
+
+| N1 现在的系统 | 补充给 AI 的话 |
+|---|---|
+| 已刷 Linux | 我的 N1 现在装的是 Linux，能用网线连上；我有一个 8 GB 以上、可以清空的 U 盘。 |
+| 斐讯原厂，2.19 及以下 | 我的 N1 是斐讯原厂系统，版本 2.19 或更低；我有显示器、USB 鼠标和一个 8 GB 以上、可以清空的 U 盘。 |
+| 斐讯原厂，高于 2.19 | 我的 N1 是斐讯原厂系统，版本高于 2.19（比如 2.22）；我有显示器、USB 鼠标、一根双公头 USB 线和一个 8 GB 以上、可以清空的 U 盘。 |
+
+N1 实机验证的是已刷 Linux 的路线；两条原厂路线来自公开实践，本项目尚未实测。安卓电视或开不了机时请直接说明，不要套用上表的 Linux 或原厂起点。
+
 > **这不是 Apple 认证产品。** 运行需要你自己提供配件认证身份，见下文“认证身份”。
 
 ## 当前状态

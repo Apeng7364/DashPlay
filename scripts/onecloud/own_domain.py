@@ -224,10 +224,16 @@ class Maintainer(threading.Thread):
     carries when the owner asked for it (config "ipv6") and the firewall is up; looked at every minute, so a new
     prefix (the hotspot reconnected) is followed."""
 
-    def __init__(self, root, config, address, stopped, say=print, interface=None):
+    def __init__(self, root, config, address, stopped, say=print, interface=None, tesla=False):
         super().__init__(name="own-domain", daemon=True)
         self.root, self.state = Path(root), Path(root) / "state"
         self.config, self.name, self.address = config, name_of(config), address
+        if tesla and address:
+            from setup_wizard import tesla_reaches
+            if not tesla_reaches(address):
+                self.address = None
+                write_status(self.state, name=self.name, record="blocked", warning="特斯拉无法打开当前地址，已保留原域名记录")
+                say("DuckDNS record kept: Tesla cannot reach the current address")
         self.stopped, self.say, self.interface = stopped, say, interface
         self.sent, self.sent_at = None, 0.0   # (address, ipv6) last accepted by DuckDNS, and when
 
@@ -369,6 +375,8 @@ def message(state, name, box_hotspot=False):
                 }.get(status.get("phase"), "等待申请正式证书：盒子联网后自动开始。")
         if box_hotspot:
             text += "盒子热点方式在车上没有网络：请在家插上网线开机申请。"
+    if status.get("record") == "blocked":
+        text += status.get("warning", "已保留原域名记录。")
     if status.get("record") == "failed":
         text += f"更新 {name} 的解析失败，盒子会继续重试。"
     text += {"ok": f"公网 IPv6 {status.get('ipv6')} 已登记，防火墙只让同一个 WiFi 里的设备连进盒子。",

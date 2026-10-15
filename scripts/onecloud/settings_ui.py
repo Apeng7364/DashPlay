@@ -9,6 +9,9 @@ the box hotspot has no internet, so no web fonts or external files.
 from html import escape
 
 STYLE = """
+.summary-row b{flex:0 0 85px}.cell.summary-row .value{white-space:normal;overflow-wrap:anywhere;min-width:0}.role+.role{margin-top:12px}
+.validation{width:100%;border-collapse:collapse;font-size:14px;overflow-wrap:anywhere}.validation td,.validation th{padding:10px;text-align:left;border-bottom:1px solid #8884}.validation caption{text-align:left;padding:12px 0;font-weight:600}
+
 :root{--bg:#F2F2F7;--cell:#FFFFFF;--sep:rgba(60,60,67,.18);--label:#000;--secondary:rgba(60,60,67,.6);
 --tint:#007AFF;--green:#34C759;--orange:#FF9500;--red:#FF3B30;--fill:rgba(120,120,128,.12);--press:#D1D1D6;
 color-scheme:light dark}

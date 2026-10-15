@@ -39,15 +39,52 @@ SHARED_LAN = ipaddress.IPv4Interface("100.96.0.1/24")
 SHARED_SPACE = ipaddress.IPv4Network("100.64.0.0/10")
 
 
+# F2, Tesla drive 2026-10-15: connman alone is insufficient.
+TESLA_CHECK_NAMES = ("connman.vn.cloud.tesla.cn", "www.baidu.cn", "www.qq.com", "www.tesla.cn")
+CONNMAN_BODY = b"<html>\n<head>\n</head>\n<body>\n</body>\n</html>\n\n"
+
+
+def options(state):
+    try:
+        value = json.loads((Path(state) / "options.json").read_text())
+    except (OSError, ValueError):
+        value = {}
+    value = dict(value) if isinstance(value, dict) else {}
+    if value.get("car_internet") not in ("none", "phone_hotspot"):
+        value["car_internet"] = "none"
+    # The identity is for explanatory text; both phones may use wireless CarPlay.
+    if value.get("uplink_phone") not in ("same", "other"):
+        value["uplink_phone"] = "same"
+    return value
+
+
+def tesla_offline(setup, chosen, online=False):
+    return chosen.get("tesla") is True and setup.get("mode") == "box_hotspot" and not online
+
+
+def check_response(host):
+    name = host.split(":", 1)[0].lower().rstrip(".")
+    if name == TESLA_CHECK_NAMES[0]:
+        return CONNMAN_BODY, {"X-ConnMan-Status": "online"}
+    if name in TESLA_CHECK_NAMES[1:]:
+        return b"<html><body>online</body></html>\n", {}
+    return None
+
+
 def box_hotspot_address(usual, tesla, local_addresses):
     """The box hotspot's address and why it is not the one asked for (None when it is): SHARED_LAN in Tesla mode,
     unless another interface (the Ethernet at home, say) already has an address in that network."""
     if not tesla:
         return usual, None
-    for other in local_addresses:
-        if other.version == 4 and other.ip != SHARED_LAN.ip and other.network.overlaps(SHARED_LAN.network):
-            return usual, f"另一个网口已在用 {other}，盒子热点仍用 {usual.ip}，特斯拉可能打不开"
-    return SHARED_LAN, None
+    # F13: a USB MiFi can occupy 100.96. Keep every interface working by choosing
+    # another /24 in shared space, never a private fallback (design 5.5, alternative 2).
+    occupied = [a.network for a in local_addresses if a.version == 4 and a.ip != SHARED_LAN.ip]
+    candidates = [SHARED_LAN] + [ipaddress.IPv4Interface(f"100.{n}.0.1/24") for n in range(97, 128)]
+    for candidate in candidates:
+        if not any(candidate.network.overlaps(network) for network in occupied):
+            warning = None if candidate == SHARED_LAN else f"100.96 网段被占用（{", ".join(str(a) for a in local_addresses)}），热点改用 {candidate.ip}；请重新连接热点"
+            return candidate, warning
+    raise RuntimeError("没有可用的特斯拉共享网段；保留域名记录，请断开冲突的上游")
 
 
 def tesla_reaches(address):
@@ -70,7 +107,7 @@ def load(state: Path):
     car_saved = (state / "car-hotspot.json").exists()
     if not isinstance(value, dict):
         # Installed before the wizard: set up exactly when a car hotspot is saved.
-        value = {"done": car_saved}
+        value = {"done": car_saved, **({} if car_saved else {"wizard_version": 2})}
     value = {key: item for key, item in value.items() if key not in ("role", "hotspot")}
     if value.get("car") == "skip":   # the old "use the box hotspot" choice
         value.pop("car")
@@ -79,8 +116,8 @@ def load(state: Path):
         # Before 2026-10-12 there was one way of use: the box joined the car hotspot.
         if car_saved or value.get("car"):
             value["mode"] = "car_hotspot"
-    if value.get("done") and (value.get("mode") is None or value["mode"] in JOINS and not car_saved):
-        value["done"] = False
+    if value.get("iphone") not in ("any", "wired", "wireless"):
+        value["iphone"] = "wired" if value.get("mode") == "car_hotspot" else "any"
     return value
 
 
@@ -100,11 +137,16 @@ def save(state: Path, value):
     save_json(state / "setup.json", value)
 
 
-def step(setup, network):
+def step(setup, network, draft=None):
     """mode -> car (box joins a hotspot) or box (box hotspot) -> phone -> done.
     network: "sta" once the box has joined the chosen hotspot, else "ap"/"starting"."""
     if setup.get("done"):
         return "done"
+    if setup.get("wizard_version") == 2 and not setup.get("confirmed"):
+        if draft is None:
+            return "vehicle"
+        from setup_flow import sequence
+        return next((s for s in sequence(draft) if s not in draft.get("answered", [])), "summary")
     mode = setup.get("mode")
     if mode not in MODES:
         return "mode"
@@ -115,7 +157,7 @@ def step(setup, network):
 
 def open_hotspot(setup):
     """The box hotspot has no password only until the network step of first-run setup is done."""
-    return step(setup, "ap") in ("mode", "car", "box")
+    return step(setup, "ap") in ("vehicle", "mode", "car", "box")
 
 
 def captive(setup, network):
@@ -123,9 +165,9 @@ def captive(setup, network):
     return network == "ap" and open_hotspot(setup)
 
 
-def wireless(setup):
-    """Whether the iPhone may use wireless CarPlay: not in car_hotspot mode (cable only)."""
-    return setup.get("mode") != "car_hotspot"
+def wireless(setup, chosen=None):
+    # 2026-10-15 home test: the same iPhone can host the uplink AND join ap0 for wireless CarPlay.
+    return setup.get("mode") != "car_hotspot" and setup.get("iphone") != "wired"
 
 
 from platform_api import get_platform
