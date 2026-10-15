@@ -55,13 +55,28 @@ class BluetoothIdentityTests(unittest.TestCase):
 
     def test_failed_write_and_post_power_change_block_wireless_startup(self):
         p=DebianPlatform('wlan-test',run=self.root); p.bluetooth_state=self.state
-        with patch('bluetooth_address.BluetoothIdentity') as cls, patch('platform_debian.subprocess.run') as run:
+        with patch('bluetooth_address.BluetoothIdentity') as cls, patch('platform_debian.subprocess.run') as run, \
+                patch('platform_debian.shutil.which', return_value='/usr/bin/btmgmt'):
             cls.return_value.prepare.side_effect=RuntimeError('not ready')
             self.assertFalse(p.power_bluetooth()); run.assert_not_called()
             cls.return_value.prepare.side_effect=None; cls.return_value.verify.return_value=False
             run.return_value=subprocess.CompletedProcess([],0,'','')
             self.assertFalse(p.power_bluetooth())
             self.assertFalse(any('system-alias' in c.args[0] for c in run.call_args_list))
+
+    def test_without_btmgmt_the_adapter_still_powers_on(self):
+        # F50: the board helper fixes the address at btattach and its private BlueZ puts only bluetoothctl on
+        # PATH. 2026.10.15 waited for btmgmt every try and gave up after 60 s: wired only on a wireless-only box.
+        p=DebianPlatform('wlan-test',run=self.root); p.bluetooth_state=self.state
+        def run(argv, **kwargs):
+            if argv[0] == 'btmgmt': raise FileNotFoundError(argv[0])
+            return subprocess.CompletedProcess(argv,0,'','')
+        with patch('platform_debian.shutil.which', side_effect=lambda name: None if name == 'btmgmt' else '/usr/bin/'+name), \
+                patch('bluetooth_address.subprocess.run', side_effect=run), \
+                patch('platform_debian.subprocess.run', side_effect=run) as calls:
+            self.assertTrue(p.power_bluetooth())
+        self.assertIn(['bluetoothctl', 'power', 'on'], [c.args[0] for c in calls.call_args_list])
+        self.assertFalse((self.state/'bluetooth-identity.json').exists())
 
     def test_cached_public_address_success_does_not_mean_controller_changed(self):
         self.bond(self.old)

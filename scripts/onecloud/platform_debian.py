@@ -522,7 +522,11 @@ class DebianPlatform:
 
     def power_bluetooth(self):
         identity = None
-        if self.bluetooth_state is not None:
+        # Without btmgmt the address is not ours to manage: the F50's board helper fixes it at btattach and its
+        # private BlueZ puts only bluetoothctl on PATH (2026.10.15 retried btmgmt for 60 s there: wired only).
+        if self.bluetooth_state is None:
+            self.unique_bluetooth_address()
+        elif shutil.which("btmgmt"):
             from bluetooth_address import BluetoothIdentity
             identity = BluetoothIdentity(self.bluetooth_state)
             try:
@@ -530,8 +534,6 @@ class DebianPlatform:
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
                 print(f"bluetooth identity not ready: {type(error).__name__}", flush=True)
                 return False
-        else:
-            self.unique_bluetooth_address()
         if subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, timeout=10).returncode != 0:
             return False
         # A phone link left over from the previous run (service restart, network rebuild) fails every
