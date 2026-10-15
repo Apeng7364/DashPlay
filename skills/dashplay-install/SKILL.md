@@ -198,7 +198,13 @@ N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
 
 **风险先说清楚：这条路线会降低启动校验；断电、版本不符或写错可能变砖，最坏需要拆机短接。Root 后的 TCP ADB 不验证客户端身份，只在电脑直连的 USB 网络里用，结束后留在 OpenWrt。** 先取得针对这台设备、SD 卡清空及启动分区的授权。其他设备的 NV、IMEI、基带、GPT 绝不能写入。
 
-准备：F50 插卡版（装插件时要用 SIM 卡上网）、可清空的 8 GB 以上 SD 卡（有数据先用读卡器另备份）、能传数据的 USB 线、**Apple Silicon Mac**（`uname -m` 为 `arm64`；Intel Mac、Windows、Linux 停下问用户换 Mac，不套用 Windows 一键 root 脚本）。F50 有两个 USB 口，用能在电脑上打开原厂后台的那个；另一口无反应先换口。全程约 30 分钟，其中机器自己跑约 25 分钟。
+准备：F50 插卡版（装插件时要用 SIM 卡上网）、可清空的 8 GB 以上 SD 卡（有数据先用读卡器另备份）、能传数据的 USB 线、**Apple Silicon Mac**（`uname -m` 为 `arm64`；其他电脑先看下面「不是 Apple Silicon Mac 时」）。F50 有两个 USB 口，用能在电脑上打开原厂后台的那个；另一口无反应先换口。全程约 30 分钟，其中机器自己跑约 25 分钟。
+
+**不是 Apple Silicon Mac 时**（Windows、Linux、Intel Mac）：本节的刷机工具和命令目前只在 Apple Silicon Mac 上实测过，先如实告诉用户，不要说已经支持。首选办法是借一台 Apple Silicon Mac，或请有 Mac 的朋友帮忙做完本节；F50 装好以后，日常使用、改设置、升级插件都不需要 Mac。用户坚持用自己的电脑时，可以把下面的方向告诉他，或在他同意后自己去查证；这些都没经过本项目验证，出了问题本向导兜不了底：
+- 刷机工具 `spd_dump` 是开源的（[TomKing062/spreadtrum_flash](https://github.com/TomKing062/spreadtrum_flash)，本项目固定在提交 `d24c21a`，加了 `patches/spreadtrum-read-user-area.patch`，构建方法见 `scripts/build-mac-tools.sh`），要在那台电脑上自己编译；`scripts/f50-install.py` 里的工具路径和下载模式交互是按 Mac 写的，要相应改。
+- Windows：F50 在下载模式下的 USB ID 是 `1782:4D00`，spd_dump 经 libusb 访问它，要给这个设备装 WinUSB 驱动，常用开源的 [Zadig](https://zadig.akeo.ie/)（只给 `1782:4D00` 换驱动，别动其他设备）。展锐官方的串口驱动是给厂商刷机工具用的，不能代替 WinUSB。
+- Linux：不用装驱动，但要用 root 运行，或加一条 udev 规则让普通用户能访问 `1782:4D00`。
+- 不管哪种电脑，本节的规则照旧：先完整备份并核对，两槽都读回，看到异常就停；不用网上来源不明的一键 root 脚本或别人的备份，不写 NV、IMEI、基带、GPT。
 
 **全程用仓库里的 `scripts/f50-install.py`，一步一条命令，不要自己另写脚本代替它。** 备份、写入、两槽读回核对、装 OpenWrt、装插件和蓝牙的检查都在里面，这些检查就是本节原来的手工步骤。你的工作是：每条命令前把要用户做的事讲清楚、等用户说好，再运行，把结果转告用户。
 - 每条命令最后一行是 `F50_OK <步骤>`（成功，进下一步）或 `F50_STOP <步骤>: 原因`（停下：把原因原样告诉用户，不重试、不换办法、不自己改设备，`$WORK/f50` 整个目录保留）。中途的 `ACTION:` 行是要用户做的事。
