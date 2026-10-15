@@ -155,13 +155,17 @@ class Work:
 
 
 def wait_port(host, port, seconds):
+    """The box answers on its own link: our end of the connection is in its /24. A proxy or VPN in TUN mode accepts
+    TCP to every address (our end is then its tunnel address, e.g. 198.18.0.1), which is not the box coming up."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection((host, port), timeout=3):
-                return True
+            with socket.create_connection((host, port), timeout=3) as s:
+                if s.getsockname()[0].rsplit('.', 1)[0] == host.rsplit('.', 1)[0]:
+                    return True
         except OSError:
-            time.sleep(3)
+            pass
+        time.sleep(3)
     return False
 
 

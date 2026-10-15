@@ -130,6 +130,22 @@ class InstallerTests(unittest.TestCase):
         with self.assertRaisesRegex(install.Stop, 'misc verify failed'):
             install.arm_linux(failing)
 
+    def test_a_proxy_answering_for_every_address_is_not_the_box(self):
+        # 2026-10-15: a Mac proxy in TUN mode (utun, 198.18.0.1) accepted TCP to any address, so 192.168.77.1:22
+        # "answered" before OpenWrt was up and the first login failed
+        class Proxied:
+            def __init__(self, *a, **kw): pass
+            def getsockname(self): return ('198.18.0.1', 50000)
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        with patch.object(install.socket, 'create_connection', Proxied), patch.object(install.time, 'sleep'):
+            self.assertFalse(install.wait_port('192.168.77.1', 22, 0.05))
+
+        class Direct(Proxied):
+            def getsockname(self): return ('192.168.77.2', 50000)
+        with patch.object(install.socket, 'create_connection', Direct):
+            self.assertTrue(install.wait_port('192.168.77.1', 22, 1))
+
     def test_stages_need_the_one_before(self):
         # Work puts the pinned tools first on PATH, for the stage's own commands only
         with tempfile.TemporaryDirectory() as d, patch.dict(os.environ):
