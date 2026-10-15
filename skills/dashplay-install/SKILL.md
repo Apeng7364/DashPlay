@@ -12,7 +12,7 @@ description: 帮完全不懂技术的用户把 DashPlay（网页 CarPlay）装�
 **先确认读到的是完整原文**：用终端 `curl -fsSL https://raw.githubusercontent.com/yizhixiaoheigou/DashPlay/main/skills/dashplay-install/SKILL.md` 取原文阅读，不用网页摘要/抓取工具（它们可能给出缓存的旧版或删节版）。原文从「开始前」一直到最后一节「排错」，中间有「斐讯 N1」「玩客云」「ZTE F50 从原厂 B16 到 OpenWrt」「放认证文件（所有设备）」「特斯拉」等章节；缺任何一节就重新获取，不凭残缺内容动手。只依据本文件和它指向的项目文件，不依据这台电脑上碰巧留下的工具、网络设置或其他项目的历史记录来推断步骤。
 
 项目地址：
-- 主仓库（玩客云、N1 刷机包，程序本身）：<https://github.com/yizhixiaoheigou/DashPlay>，发布页 `/releases/latest`
+- 主仓库（玩客云、N1 刷机包，程序本身）：<https://github.com/yizhixiaoheigou/DashPlay>，发布页 `/releases/latest`（补丁版可能不带刷机包，见“下载工具与校验”）
 - OpenWrt 软件包（F50 和其他 OpenWrt 路由器）：<https://github.com/yizhixiaoheigou/openwrt-dashplay>，发布页 `/releases/latest`
 - 详细参考：主仓库 `docs/DashPlay玩客云固件使用说明.md`（用户手册）、`docs/DashPlay-AI安装说明.md`（认证文件与车机浏览器问题）、openwrt-dashplay 的 `README.md`
 
@@ -67,7 +67,7 @@ description: 帮完全不懂技术的用户把 DashPlay（网页 CarPlay）装�
 
 ## 下载工具与校验（电脑上先做）
 
-命令中的 `<IP>`、`<日期>`、`<架构>` 是占位符：用实际检测结果替换，不照着尖括号执行。每个小步骤只有“应该看到什么”满足后才能继续；不符先按该项退路处理。
+命令中的 `<IP>`、`<日期>`、`<版本>`、`<架构>` 是占位符：用实际检测结果替换，不照着尖括号执行。每个小步骤只有“应该看到什么”满足后才能继续；不符先按该项退路处理。
 
 ```sh
 INSTALL_BASE="$HOME"  # 可改成用户指定且已挂载的工作盘目录
@@ -104,6 +104,10 @@ Mac 的 N1/F50 ADB 前置：先 `command -v adb; command -v fastboot` → 两者
 
 DashPlay 的镜像/程序包从本项目官方 GitHub Release 下载，按该版本同名 `.sha256` 校验；OpenWrt 包使用同版本 `SHA256SUMS`。先选定一个版本并记录 tag、下载 URL 和完整 SHA-256，再下载，不混合 latest 在不同时间的资产。校验不一致重新下载一次；仍不一致停止。macOS/Linux：在下载目录 `shasum -a 256 -c <校验文件>` → 每个目标 `OK`；Windows：`Get-FileHash -Algorithm SHA256 <文件>` → 与官方校验文件完整 64 位相同。无校验文件/发布 API `digest` 时停下，不以自己下载后算出的摘要充当独立核对。
 
+N1/玩客云刷机包：只改程序的补丁版不带刷机包（发布说明写明沿用哪一版），所以不要只看 latest，用这条命令找最近一个带它的正式版（玩客云把 `DashPlay_n1-` 换成 `DashPlay_onecloud-`）：
+`python3 -c "import json,sys,urllib.request as u; p=sys.argv[1]; rs=[r for r in json.load(u.urlopen('https://api.github.com/repos/yizhixiaoheigou/DashPlay/releases?per_page=30',timeout=60)) if not r['draft'] and not r['prerelease']]; r=next(r for r in rs if any(a['name'].startswith(p) for a in r['assets'])); print('IMAGE', r['tag_name'], 'NEWEST', rs[0]['tag_name']); print('\n'.join(a['browser_download_url'] for a in r['assets'] if a['name'].startswith(p)))" DashPlay_n1-`
+→ 第一行 `IMAGE <刷机包版本> NEWEST <最新正式版>`，下面两行是镜像和 `.sha256` 地址，记下两个版本 → 网络失败重试；没有输出地址就停下。两个版本不同时，盒子刷好、首次设置并出画后，按「升级已装好的盒子 → N1 / 玩客云」换上 NEWEST 版本的程序包（盒子是新装的，备份一样要做）。
+
 ## 升级已装好的盒子（保留首次设置、配对、认证和热点密码）
 
 先 `ssh root@<盒子IP> 'test -f /etc/openwrt_release && cat /etc/openwrt_release || cat /etc/os-release'` → OpenWrt 走 apk，Armbian/Debian 的 N1/玩客云走程序包。**升级不要重刷整机镜像、不要再跑 install.sh、不要清空 state/identity。** 新版声明系统依赖变化时先停下核对迁移说明，不能把程序升级当系统升级。
@@ -136,7 +140,7 @@ DashPlay 的镜像/程序包从本项目官方 GitHub Release 下载，按该版
 
 N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
 
-1. **下载**：从主仓库发布页下载 `DashPlay_n1-<日期>.img.xz` 和同名 `.sha256`，按“下载工具与校验”校验并解压出 `.img`。
+1. **下载**：按“下载工具与校验”找到最近带刷机包的版本，下载 `DashPlay_n1-<版本>.img.xz` 和同名 `.sha256`，校验并解压出 `.img`。
 2. **写 U 盘**（8 GB 以上，会清空）：
    **请把一个不用的 U 盘插到电脑上。**
    - macOS：`diskutil list external` 找到 U 盘（核对容量），请用户确认是 `/dev/diskN`；然后 `diskutil unmountDisk /dev/diskN` 并执行 `sudo dd if=DashPlay_n1-<日期>.img of=/dev/rdiskN bs=4m`（要电脑密码；你的终端输不了密码时按规则 7 请用户在「终端」App 执行，下面的读回核对同样处理）。`dd` 退出 0 后，把下列代码保存为 `$WORK/check-usb.py`，执行 `sudo python3 "$WORK/check-usb.py" <镜像绝对路径> /dev/rdiskN` → `USB_READBACK_OK` 才执行 `diskutil eject /dev/diskN`；读取错误或不一致停止，不拿它启动盒子。
@@ -178,7 +182,7 @@ N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
 
 玩客云要配一个 RTL8821CU 的 USB 无线网卡（WiFi 和蓝牙二合一，USB ID `0bda:c820`），**必须用 12 V 电源**（5 V 的 USB 转 DC 线会让网卡反复掉线）。刷机用 Amlogic 的 USB Burning Tool，**只能在 Windows 上运行**；用户没有 Windows 电脑时，请他借一台或用虚拟机，你远程指导。
 
-1. **下载**：从主仓库发布页下载 `DashPlay_onecloud-<日期>.burn.img.xz` 和 `.sha256`，校验并解压出 `.burn.img`。
+1. **下载**：按“下载工具与校验”找到最近带刷机包的版本，下载 `DashPlay_onecloud-<版本>.burn.img.xz` 和 `.sha256`，校验并解压出 `.burn.img`。
 2. **刷机**（会清空玩客云）：`python3 "$DP/scripts/fetch-install-assets.py" onecloud "$WORK/onecloud-tools"` → `SHA256_OK USB_Burning_Tool_v2.1.3.exe`。这是 [苏洋原作者实机教程](https://soulteary.com/2025/01/08/lightweight-server-under-fifty-yuan-wanke-cloud-speed-running-guide-1.html) 所附工具（下载地址与 SHA-256 在 downloads.json），不是 Amlogic 官网直链。Windows 安装此工具及附带驱动，导入 DashPlay `.burn.img`，勾选擦除 flash/bootloader（这是整机包），不要导入 N1 镜像。
    - 以前刷过 Armbian 等系统的玩客云，也照这样线刷（DashPlay 刷机包整片覆盖）。
    - 原厂机通常需要拆壳短接，已刷过可进烧录模式的机器不一定要再次短接。按上述原作者的 [整板照片](https://attachment.soulteary.com/2025/01/08/boards.jpg) 和 [短接标注图](https://attachment.soulteary.com/2025/01/08/short-circuit.jpg) 逐点核对：V1.0 是无 SD 槽旁 V1.3 标记的旧板，短接点在背面白色线框附近；V1.3 的 SD 槽旁有明显 V1.3，点在带主芯片一面 RX 标记附近未焊焊盘。只凭“附近”不能动手：AI 打开原文两幅对应板型图片，与用户主板照片核对两点。图打不开、点位不一致、丝印不是这两种或用户不会认，**停下问用户要清晰板照**；不要猜引脚，更不能让用户“自己查好再试”。

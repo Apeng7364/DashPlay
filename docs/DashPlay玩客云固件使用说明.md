@@ -7,6 +7,8 @@ DashPlay 让没有 CarPlay 的车用车机浏览器显示 iPhone 的 CarPlay。i
 
 ## 1. 刷机
 
+刷机包在 [发布页](https://github.com/yizhixiaoheigou/DashPlay/releases)。只改程序的补丁版（如 2026.10.15.1）不带刷机包，用发布说明里写的那一版；刷好、首次设置后，再让 AI 助手按装机向导「升级已装好的盒子」换上最新程序（设置和配对保留）。
+
 ### 玩客云
 
 1. 用 Amlogic USB Burning Tool 线刷 `DashPlay_onecloud-20261012.burn.img`（下载的 `.xz` 先解压）（和刷 Armbian 一样：短接、双公头 USB 线接刷机口）。玩客云板型不同，短接点按你的板子资料。
