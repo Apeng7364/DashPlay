@@ -2,8 +2,10 @@
 """Plan/verify a raw F50 user-area backup. No device writes or subprocess execution.
 
 plan PRIMARY_GPT OUTPUT_DIR SPD_DUMP creates backup.sh (run after authorization).
-verify OUTPUT_DIR checks every partition and both GPTs. Never call r all a full backup:
-it omits userdata/cache, and named NV reads may alias/strip their header.
+verify OUTPUT_DIR checks every planned partition and both GPTs. Reads raw offsets, never r all/all_lite:
+named NV reads may alias/strip their header.
+Skips SKIPPED (about 27 GiB of the 31 GB user area, ~40 minutes of reading): the installation never writes
+them, and the 2026-10-14 restoration to stock B16 rebuilt them with the stock factory reset.
 """
 import argparse
 import hashlib
@@ -14,6 +16,8 @@ import shlex
 import struct
 import zlib
 
+# Android user data and logs, rebuilt by a factory reset; everything else, NV/modem and both GPTs included, is read.
+SKIPPED = ('userdata', 'cache', 'blackbox', 'fulldumpdb', 'sysdumpdb', 'uboot_log')
 
 def require(ok, why):
     if not ok:
@@ -63,7 +67,8 @@ def plan(primary, out, tool):
     (out/'discovery-gpt.bin').write_bytes(raw)
     end = (h['other']+1)*512
     tail_size = ((len(entries)+511)//512 + 1)*512
-    items = [dict(name='primary_gpt',offset=0,size=len(raw)), *parts,
+    kept = [p for p in parts if p['name'] not in SKIPPED]
+    items = [dict(name='primary_gpt',offset=0,size=len(raw)), *kept,
              dict(name='secondary_gpt',offset=end-tail_size,size=tail_size)]
     commands = [str(tool.resolve()), '--wait','600','--kickto','2','exec','path','.']
     for p in items:
@@ -72,12 +77,13 @@ def plan(primary, out, tool):
             commands += ['read_part','user_partition',str(p['offset']),str(p['size']),p['name']+'.verify.bin']
     commands += ['reset']
     (out/'plan.json').write_text(json.dumps(dict(disk_bytes=end, items=items,
-        tool_sha256=hashlib.sha256(tool.read_bytes()).hexdigest(),
+        tool_sha256=hashlib.sha256(tool.read_bytes()).hexdigest(), skipped=[p['name'] for p in parts if p not in kept],
         uncovered=['eMMC boot0/boot1/RPMB (not user area)', 'SD card']),indent=2)+'\n')
     script = '#!/bin/sh\nset -eu\ncd -- '+shlex.quote(str(out.resolve()))+'\nexec '+shlex.join(commands)+'\n'
     (out/'backup.sh').write_text(script)
     (out/'backup.sh').chmod(0o700)
-    print(f"PLAN_READY {len(parts)} partitions; need {sum(p['size'] for p in items)} bytes plus repeated reads")
+    print(f"PLAN_READY {len(kept)} of {len(parts)} partitions, skipped {' '.join(p['name'] for p in parts if p not in kept)}; "
+          f"need {sum(p['size'] for p in items)} bytes plus repeated reads")
 
 
 def verify(out):
@@ -97,6 +103,8 @@ def verify(out):
     primary = (out/'primary_gpt.bin').read_bytes()
     h, entries, parts = layout(primary)
     require(primary == (out/'discovery-gpt.bin').read_bytes(), "GPT changed since discovery")
+    kept = [p for p in parts if p['name'] not in SKIPPED]
+    require({p['name'] for p in kept} <= {p['name'] for p in plan['items']}, "plan misses a partition")
     tail = (out/'secondary_gpt.bin').read_bytes()
     b = header(tail[-512:])
     require(b['current'] == h['other'] and b['other'] == 1, "GPT headers not reciprocal")
@@ -104,7 +112,7 @@ def verify(out):
     require(tail[:len(entries)] == entries and b['entries_crc'] == h['entries_crc'], "GPT tables differ")
     require(b['table']*512 == plan['disk_bytes']-len(tail), "backup table offset differs")
     (out/'verified.json').write_text(json.dumps(result,indent=2)+'\n')
-    print(f"BACKUP_VERIFIED {len(parts)} partitions; boot0/boot1/RPMB and SD not included")
+    print(f"BACKUP_VERIFIED {len(kept)} of {len(parts)} partitions; {' '.join(plan['skipped'])}, boot0/boot1/RPMB and SD not included")
 
 
 if __name__ == '__main__':

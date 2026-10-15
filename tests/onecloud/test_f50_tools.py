@@ -36,16 +36,30 @@ def synthetic_gpt():
 
 
 class BackupTests(unittest.TestCase):
-    def test_all_partitions_including_userdata_use_raw_offsets(self):
+    def test_reads_raw_offsets_and_skips_only_user_data_and_logs(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d);(p/'gpt').write_bytes(synthetic_gpt());(p/'tool').write_text('offline fixture')
             backup.plan(p/'gpt',p/'out',p/'tool')
             text=(p/'out/backup.sh').read_text()
-            self.assertIn('userdata.bin',text)
+            self.assertNotIn('userdata.bin',text)
             self.assertIn('read_part user_partition 1048576 4096 boot_a.bin',text)
             self.assertIn('boot_a.verify.bin',text)
+            self.assertIn('sml_b.bin',text)
             self.assertNotIn(' w ',text)
             self.assertNotIn(' r all',text)
+            plan=json.loads((p/'out/plan.json').read_text())
+            self.assertEqual(plan['skipped'],['userdata'])
+            # Everything planned, read twice where required, verifies; a missing partition does not.
+            raw=(p/'gpt').read_bytes()
+            tail=raw[1024:1024+128*8]+b'\0'*(plan['items'][-1]['size']-128*8-512)+bytearray(raw[512:1024])
+            hdr=bytearray(tail[-512:]);struct.pack_into('<QQ',hdr,24,4095,1);struct.pack_into('<Q',hdr,72,4095-(len(tail)-512)//512)
+            hdr[16:20]=b'\0'*4;struct.pack_into('<I',hdr,16,zlib.crc32(hdr[:92]));tail=tail[:-512]+bytes(hdr)
+            for item in plan['items']:
+                data={'primary_gpt':raw,'secondary_gpt':tail}.get(item['name'],b'x'*item['size'])
+                for suffix in ('.bin','.verify.bin'):(p/'out'/(item['name']+suffix)).write_bytes(data)
+            backup.verify(p/'out')
+            (p/'out/sml_b.bin').unlink()
+            with self.assertRaises(FileNotFoundError):backup.verify(p/'out')
     def test_rejects_corrupt_header_and_partition_table(self):
         for position in (512+40,1024+56):
             raw=bytearray(synthetic_gpt());raw[position] ^= 1

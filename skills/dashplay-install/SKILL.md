@@ -21,7 +21,7 @@ description: 帮完全不懂技术的用户把 DashPlay（网页 CarPlay）装�
 - 你需要能在用户电脑上执行命令（Claude Code、Codex 这类）。如果你只能聊天、不能执行命令，告诉用户换一个能执行命令的 AI 助手，或者你把每条命令写出来让他复制执行，并请他把结果贴回来。
 - macOS：**不在系统里安装任何东西**（不装 Xcode、Homebrew，不改系统 Python）。下面“下载工具与校验”用 macOS 自带的 `curl`、`tar`、`shasum` 把仓库、一个独立的 Python 3.12 和预编译小工具都放进同一个工作目录，用完整个目录可删。
 - Windows 上用 PowerShell：Windows 10/11 自带 `ssh`、`scp`；`.xz` 用下面的 Python 命令解压，不额外下载解压工具。先 `Get-Command python,curl.exe,tar,ssh,scp`，再 `python --version` → 全部存在、Python ≥3.11 → 缺 Python 时说明要装它，用户同意后 `winget install -e --id Python.Python.3.12`，请用户关掉再重新打开 PowerShell 后重新检查；没有 winget、安装失败或缺 `curl.exe`/`tar`（Windows 10 1803 之前）就停下说明。Windows 的下文 `python3` 一律写 `python`。
-- 盒子安装通常约 30–60 分钟，F50 全量备份可能数小时；用户需要准备：设备的电源，N1 还要一个 8 GB 以上的 U 盘，玩客云还要一台 Windows 电脑、一根双公头 USB 线和一把螺丝刀或撬片。
+- 盒子安装通常约 30–60 分钟，F50 备份约十分钟；用户需要准备：设备的电源，N1 还要一个 8 GB 以上的 U 盘，玩客云还要一台 Windows 电脑、一根双公头 USB 线和一把螺丝刀或撬片。
 
 ## 与用户相处的规则
 
@@ -177,14 +177,14 @@ N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
 
 **风险先说清楚：这条路线会降低启动校验；断电、版本不符或写错可能变砖，最坏需要拆机短接。Root 阶段的 TCP ADB 实测不验证客户端身份，即使 `ro.adb.secure=1` 也不能当成已认证；只在隔离的电脑直连网络操作，结束后留在 OpenWrt。** 先取得针对这台设备、SD 卡清空及启动分区的授权。其他设备的 NV、IMEI、基带、GPT 绝不能写入。
 
-准备：F50、可清空的 8 GB 以上 SD 卡、能传数据的 USB 线、电脑至少 70 GB 空闲空间。下面的主机命令已按 Apple Silicon Mac 整理（`uname -m` 应为 `arm64`；Intel Mac 停下问用户：预编译的 spd_dump、lz4 和固定的 Python 依赖只有 arm64 版本）；Windows/Linux 若没有已验证的 USB/编译环境，停下问用户换到 Mac，不擅自套用 Windows 一键 root 脚本。F50 有两个 USB 口，使用能在电脑上打开原厂后台的那个；另一口无枚举时先换口，不当成设备坏了。
+准备：F50、可清空的 8 GB 以上 SD 卡、能传数据的 USB 线、电脑至少 15 GB 空闲空间。下面的主机命令已按 Apple Silicon Mac 整理（`uname -m` 应为 `arm64`；Intel Mac 停下问用户：预编译的 spd_dump、lz4 和固定的 Python 依赖只有 arm64 版本）；Windows/Linux 若没有已验证的 USB/编译环境，停下问用户换到 Mac，不擅自套用 Windows 一键 root 脚本。F50 有两个 USB 口，使用能在电脑上打开原厂后台的那个；另一口无枚举时先换口，不当成设备坏了。
 
 ### F0 识别与下载
 
-开始前检查**实际备份目录所在磁盘**：`python3 -c 'import shutil,sys; n=shutil.disk_usage(sys.argv[1]).free; print("FREE_BYTES",n); sys.exit(0 if n >= 70_000_000_000 else 1)' "$WORK"` → 退出 0 → 才能做全量备份。退出非 0 时不要清理用户文件：用 `df -h` 找用户允许的工作盘，把 `INSTALL_BASE` 改为该盘内的目录，重新 `mktemp -d "$INSTALL_BASE/dashplay-install.XXXXXX"` 建 0700 私有 `WORK` 并重做空间检查。已有 `DP` 继续指向原来的工具目录，不搬走或覆盖既有文件；随后重新设置 `F50_WORK="$WORK/f50"`。无足够空间则停下，让用户提供备份盘。
+开始前检查**实际备份目录所在磁盘**：`python3 -c 'import shutil,sys; n=shutil.disk_usage(sys.argv[1]).free; print("FREE_BYTES",n); sys.exit(0 if n >= 15_000_000_000 else 1)' "$WORK"` → 退出 0 → 才能做备份。退出非 0 时不要清理用户文件：用 `df -h` 找用户允许的工作盘，把 `INSTALL_BASE` 改为该盘内的目录，重新 `mktemp -d "$INSTALL_BASE/dashplay-install.XXXXXX"` 建 0700 私有 `WORK` 并重做空间检查。已有 `DP` 继续指向原来的工具目录，不搬走或覆盖既有文件；随后重新设置 `F50_WORK="$WORK/f50"`。无足够空间则停下，让用户提供备份盘。
 
-1. 电脑通过 USB 打开 `http://192.168.0.1/`，让用户在原厂后台登录，读取型号与完整固件版本 → 必须为 **ZTE F50、F50_FLYMODEM_ZYV1.0.0B16** → U30 Air、其他运营商定制版、非 B16 都停下问用户。不要用文件名代替后台版本。
-2. 非 B16 的调查结论（2026-10-14）：[Xio-Shark 原作者](https://github.com/Xio-Shark/f50-b16) 明确只支持 B16；[zte-f50-toolkit](https://github.com/dikeckaan/zte-f50-toolkit) 提供的是 **B09** 路线，不是已验证的“任意版本降到 B16”，且包含改基带/设备标识工具。当前未找到可核实、覆盖具体起始版本的 B16 降级路线。**不要试 B09 包、不要猜降级；记录用户完整版本并停下问用户。**
+1. 电脑通过 USB 打开 `http://192.168.0.1/`，让用户在原厂后台登录，读取型号与完整固件版本 → 必须为 **ZTE F50、F50_FLYMODEM_ZYV1.0.0B16** → U30 Air、其他运营商定制版、非 B16 都不继续本节，按下一步处理。不要用文件名代替后台版本。**不需要用户在后台打开 USB 调试（`#usb_port` 等页面）**：本路线备份和 Root 都走断电重接的下载模式，ADB 由写入的 Root 镜像在启动后自己打开；不要让用户去开，也不要因为它关着就停下或改走别的路线。
+2. 非 B16 的调查结论（2026-10-14）：[Xio-Shark 原作者](https://github.com/Xio-Shark/f50-b16) 明确只支持 B16；[zte-f50-toolkit](https://github.com/dikeckaan/zte-f50-toolkit) 提供的是 **B09** 路线，不是已验证的“任意版本降到 B16”，且包含改基带/设备标识工具。当前未找到可核实、覆盖具体起始版本的 B16 降级路线。**不要试 B09 包、不要猜降级。** 记录用户完整版本后，可以只做调查：在网上查有没有针对这个具体版本的路线，交给用户一份报告，逐条写来源链接、作者、是否有作者或他人的实机记录（覆盖哪个起始版本）、要写哪些分区（是否碰基带、NV/IMEI、GPT）、能否先完整备份、出错后怎么恢复；没找到就如实说没找到。**调查阶段不下载其中的刷机包或工具、不运行其中的命令、不连 F50 写入**；报告交给用户后停下，由用户决定。本向导不执行报告里的任何路线；在它被本项目实机验证并写进本节之前，可以建议用户换 B16 的 F50，或改用 N1 / 玩客云。
 3. 在电脑建独立目录，获取本仓库工具（已有本仓库时直接把 `DP` 设成其绝对路径）：
    ```sh
    F50_WORK="$WORK/f50"
@@ -201,12 +201,12 @@ N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
 
 ### F1 下载模式完整备份
 
-备份覆盖 **GPT 内全部分区（包括 userdata/cache）和主副 GPT**，不是 `r all`/`all_lite`；后两者会跳过数据区，且命名 NV 读取可能替换分区、去头。eMMC boot0/boot1/RPMB 不在用户区内，下载通路未覆盖，不能声称可恢复所有硬件故障。SD 卡如有数据先用读卡器另备份，不能把“授权清空”当成已经备份。
+备份按分区表的原始偏移读取主副 GPT 和 75 个分区中的 69 个（约 3.3 GiB，几分钟），包括 NV/IMEI、基带、全部启动分区；不用 `r all`/`all_lite`，命名 NV 读取可能替换分区、去头。跳过的是安卓用户数据与日志：userdata、cache、blackbox、fulldumpdb、sysdumpdb、uboot_log（约 27 GiB，要多读四十分钟）。本路线从不写这些分区，2026-10-14 恢复原厂 B16 也只写回 boot/trustos/misc，再用后台“恢复出厂设置”重建了用户数据；所以开始前请用户记下原厂后台里改过的设置（WiFi 名称和密码等），以后要回原厂时这些需要重新设置。eMMC boot0/boot1/RPMB 不在用户区内，下载通路未覆盖，不能声称可恢复所有硬件故障。SD 卡如有数据先用读卡器另备份，不能把“授权清空”当成已经备份。
 
 1. `mkdir "$F50_WORK/discovery"; cd "$F50_WORK/discovery"`；先运行 `"$SPD" --wait 600 --kickto 2 exec path . partition_list partition_list.xml reset`，然后单独请用户：**断开 F50 全部电源，再用已确认的数据口接回电脑。** → 应看到 FDL2、分区表、`pgpt.bin`、reset ACK，退出 0。若模式切换报告 `LIBUSB_ERROR_IO`：只在系统 USB 枚举已变成 `1782:4d00` 时，等枚举稳定后执行一次 `"$SPD" --wait 10 exec path . partition_list partition_list.xml reset`（标准 CHECK_BAUD；不用 `--reconnect`）。仍失败就停止，保留日志，不轮试 kick0/kick1 或短接。
-2. `python3 "$DP/scripts/f50-backup.py" plan "$F50_WORK/discovery/pgpt.bin" "$F50_WORK/backup" "$SPD"` → `PLAN_READY`、75 个分区，检查计划所需空间 → CRC/布局不符或数量不是 75 停下问用户，不手改 GPT。
+2. `python3 "$DP/scripts/f50-backup.py" plan "$F50_WORK/discovery/pgpt.bin" "$F50_WORK/backup" "$SPD"` → `PLAN_READY 69 of 75 partitions`，跳过的正好是上面 6 个，检查计划所需空间 → CRC/布局不符或数量不同停下问用户，不手改 GPT，不改跳过名单。
 3. `sh "$F50_WORK/backup/backup.sh" > "$F50_WORK/backup/download.log" 2>&1`，再次只请用户断电重接 → 命令退出 0、后台恢复安卓 → 读取失败保留目录，不能进入 root。
-4. `python3 "$DP/scripts/f50-backup.py" verify "$F50_WORK/backup"` → **`BACKUP_VERIFIED 75 partitions`**，生成 `verified.json`，主副 GPT 相互验证、boot/trustos/misc 重复读相同 → 少一个文件、长度不对或哈希不一致都停止。备份只留用户电脑，目录 0700，不上传、不放公开仓库。
+4. `python3 "$DP/scripts/f50-backup.py" verify "$F50_WORK/backup"` → **`BACKUP_VERIFIED 69 of 75 partitions`**，生成 `verified.json`，主副 GPT 相互验证、boot/trustos/misc 重复读相同 → 少一个文件、长度不对或哈希不一致都停止。备份只留用户电脑，目录 0700，不上传、不放公开仓库。
 
 ### F2 用本机备份制作 Root，逐步写后读回
 
