@@ -58,5 +58,11 @@ for the program, BSD-2-Clause for the library; unmodified, source is the pinned 
 also downloads, without redistributing it, a standalone CPython 3.12 build from
 <https://github.com/astral-sh/python-build-standalone> (PSF and bundled-library licenses inside it).
 
+The **Windows helpers** in `tools/windows-x64/` are the same `spd_dump` (with
+`patches/spreadtrum-windows-libusb.patch` as well), libusb and lz4 from the same pinned sources,
+cross-compiled with MinGW-w64 by `scripts/build-windows-tools.sh`. On Windows the guide also downloads, without
+redistributing it, **Zadig** 2.9 <https://zadig.akeo.ie/> (GPL-3.0) to install the WinUSB driver for the F50
+in download mode.
+
 CarPlay, iPhone, AirPlay and MFi are trademarks of Apple Inc. This is an independent project; no
 Apple, PlayPort, DiPlay, xcertplay or WheelPlay affiliation or endorsement is implied.

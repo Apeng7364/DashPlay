@@ -146,6 +146,17 @@ class InstallerTests(unittest.TestCase):
         with patch.object(install.socket, 'create_connection', Direct):
             self.assertTrue(install.wait_port('192.168.77.1', 22, 1))
 
+    def test_command_output_that_is_not_the_locale_encoding_is_kept(self):
+        # 2026-10-16, Chinese Windows: text=True decoded "adb connect" with GBK, a byte it could not decode raised in
+        # subprocess's reader thread, stdout came back None and flash stopped after a good Root write
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ):
+            w = install.Work(d)
+            code = 'import sys; sys.stdout.buffer.write(b"connected \\x80\\xe4\\xb8\\xad\\n")'
+            out = w.run([sys.executable, '-c', code], log='adb.log').stdout
+            self.assertTrue(out.startswith('connected'))
+            self.assertIn('中', out)
+            self.assertIn('connected', (w.logs / 'adb.log').read_text(encoding='utf-8'))
+
     def test_stages_need_the_one_before(self):
         # Work puts the pinned tools first on PATH, for the stage's own commands only
         with tempfile.TemporaryDirectory() as d, patch.dict(os.environ):

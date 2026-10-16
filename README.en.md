@@ -2,49 +2,75 @@
 
 [中文](README.md)
 
-DashPlay turns a small Linux box with Wi-Fi and Bluetooth into a CarPlay receiver. The iPhone plugs into the box with a cable (wired CarPlay) or is guided onto Wi-Fi over Bluetooth (wireless CarPlay); the head unit, or any device, opens the box's web page in a browser and gets the picture, the sound and touch control.
+DashPlay turns a small Linux box with Wi-Fi and Bluetooth into a CarPlay receiver. The iPhone plugs into the box with a cable (wired CarPlay) or is guided onto Wi-Fi over Bluetooth (wireless CarPlay); the head unit, or any device, opens the box's web page in a browser and gets the picture, the sound and touch control. A car without CarPlay can try it as long as its head unit has a browser and can join Wi-Fi.
 
 DashPlay is built on [PlayPort](https://github.com/youcci/playport): patches plus the programs around it, namely wired CarPlay (the box as USB host), a Linux BlueZ Bluetooth bridge, a lean page for head-unit browsers with system media controls, first-run setup and a settings page, and a supervisor that starts everything at boot.
 
-**No technical background needed**: once you have a Phicomm N1, a OneCloud (玩客云), a ZTE F50 on stock B16 or OpenWrt or another OpenWrt router, send this sentence to your AI assistant (Claude Code, Codex, WorkBuddy, Doubao, DeepSeek and the like all work). It asks which device you have and installs DashPlay step by step, calling you only to plug or unplug power or tap something on your phone:
+> **This is not an Apple-certified product.** You have to supply your own accessory authentication identity; see "Authentication identity" below. Flashing carries a risk of bricking the device.
+
+## Installing
+
+**No technical background needed**: send this sentence to your AI assistant (Claude Code, Codex, WorkBuddy, Doubao, DeepSeek and the like, anything that can run commands on your computer). It asks you one thing at a time (the device, its current system, the car, whether the head unit can raise a hotspot, whether the head unit needs internet) and installs DashPlay step by step, calling you only to plug or unplug something or tap on your phone:
 
 > Please download https://raw.githubusercontent.com/yizhixiaoheigou/DashPlay/main/skills/dashplay-install/SKILL.md with curl in a terminal and read all of it (not through a web summarizer, which may return an old or shortened copy), then follow it step by step to install DashPlay for me.
 
-The guide itself is in Chinese; assistants follow it in whatever language you write to them.
+The guide itself is in Chinese; assistants follow it in whatever language you write to them. If your N1 runs stock Phicomm firmware or Android TV, or does not boot, just tell the assistant. The N1 route tested by this project starts from Linux; the two stock-firmware routes (2.19 or earlier, later than 2.19) come from public guides and have not been tested here.
 
-For an N1, append the sentence that matches its current system. On stock firmware, connect a display and read the version on the Phicomm home screen.
+## Which box
 
-| N1 starting point | Sentence to add |
-|---|---|
-| Already running Linux | My N1 runs Linux and is reachable over Ethernet. I have a USB drive of at least 8 GB that can be erased. |
-| Stock Phicomm, version 2.19 or earlier | My N1 runs stock Phicomm firmware, version 2.19 or earlier. I have a display, a USB mouse and a USB drive of at least 8 GB that can be erased. |
-| Stock Phicomm, later than 2.19 | My N1 runs stock Phicomm firmware later than 2.19, for example 2.22. I have a display, a USB mouse, a USB-A male-to-male cable and a USB drive of at least 8 GB that can be erased. |
+| | ZTE F50 (SIM version) | Phicomm N1 |
+|---|---|---|
+| Price (for reference) | about 400–500 CNY with a heatsink, plus mobile data | about 100 CNY, plus a 5 V to 12 V step-up cable |
+| Head unit internet | with a SIM card, everything in the car works online | the box has no internet of its own: join the car's hotspot if it has one, otherwise a portable Wi-Fi or a phone's hotspot |
+| Works without internet | yes (no SIM; the head unit's own apps stay offline; not yet tested in a car) | yes (tested in a car) |
+| iPhone | wireless only (the F50's USB port cannot take an iPhone) | wired and wireless, see below |
+| You need | an erasable SD card of 8 GB or more, a USB cable that carries data, a heatsink; a SIM card with data if the head unit should be online | an erasable USB drive of 8 GB or more, an Ethernet cable (the computer stays online through it while it is on the box's Wi-Fi); stock firmware also needs a display and a USB mouse, and later than 2.19 a USB-A male-to-male cable |
+| Computer | Mac (Apple silicon) or 64-bit Windows 10/11, 15 GB free | Mac / Windows / Linux |
+| Installation | done by the AI, about 25 minutes (measured) | about 30–60 minutes |
 
-The already-Linux route has been tested on an N1. Both stock-firmware routes come from public guides and have not been tested by this project. If the box runs Android TV or cannot boot, say so instead of choosing a Linux or stock starting point.
+The OneCloud (玩客云) runs the same program as the N1 and connects the same ways; it also needs an RTL8821CU USB adapter (Wi-Fi and Bluetooth in one) and a 12 V supply. Other routers already on OpenWrt 25.12 use the plugin in the sister repository [openwrt-dashplay](https://github.com/yizhixiaoheigou/openwrt-dashplay). Every option also needs an iPhone.
 
-> **This is not an Apple-certified product.** You have to supply your own accessory authentication identity; see "Authentication identity" below.
+## Connecting in the car
 
-## Status
+**F50**: the head unit and the iPhone join the F50's hotspot, and the iPhone goes wireless. With a SIM card the head unit is online; without one it still works, but the head unit's own apps stay offline.
 
-### Three ways of use (chosen in step 1 of first-run setup)
+**N1 / OneCloud**: chosen in first-run setup according to the head unit:
 
-| | 1: car hotspot | 2: portable Wi-Fi | 3: car joins the box hotspot |
-|---|---|---|---|
-| Connections | box joins the car's hotspot | box, head unit and iPhone join a portable Wi-Fi | box raises a hotspot; head unit and iPhone join it |
-| Head unit has internet | yes | yes (through the portable Wi-Fi) | no |
-| iPhone | cable only | cable when plugged in, wireless otherwise | cable when plugged in, wireless otherwise |
+| Situation | Connections | Head unit's own apps online | Wired | Wireless |
+|---|---|---|---|---|
+| ① Head unit can raise a hotspot (way 1) | box joins the car's hotspot | yes | ✅ | ❌ cable only for now |
+| ② You have a portable Wi-Fi (way 2) | box, head unit and iPhone join the portable Wi-Fi | yes, through the portable Wi-Fi | ✅ | ✅ |
+| ③ Head unit can only join Wi-Fi (way 3) | head unit and iPhone join the box hotspot `DashPlay` | no | ✅ | ✅ |
+| ③ plus a phone's hotspot | box joins a phone's hotspot and keeps `DashPlay` up for the head unit | yes, on the phone's data | ✅ | ✅ |
 
-Way 1 offers no wireless CarPlay: car hotspots relay the iPhone's picture between two clients at only about 0.1 Mbit/s (measured). While a cable is plugged in the box sends no wireless invitations; when it is unplugged the last iPhone is invited to go wireless at once, and plugging back in returns to wired.
+- ① is cable only for now, and only in this setup: a wireless iPhone would also have to join the car hotspot, which relays the picture between them at about 0.1 Mbit/s (measured in an Xpeng), so the program offers no wireless in ①. Letting the box raise its own hotspot for the iPhone would allow wireless later.
+- With a phone's hotspot, the phone keeps its hotspot on and pays the data; when the hotspot is not found the box falls back to ③. The hotspot can come from the same iPhone that runs CarPlay.
+- When both work: wired while a cable is plugged in; after unplugging, the last iPhone is invited to go wireless, and plugging back in returns to wired. Wireless needs one Bluetooth pairing first ("Add iPhone" on the settings page); after that it connects by itself.
+- If the portable Wi-Fi in ② isolates its clients, wireless stalls or fails; use a cable.
+
+**When the head unit cannot show the page or will not connect**, go by what you see, whatever the car (settings page group "When the head unit cannot open the picture"; steps in [AI install notes (Chinese)](docs/DashPlay-AI安装说明.md), section 4):
+
+- The head unit refuses Wi-Fi without internet: the box answers its connectivity check, CarPlay works, and the head unit's own apps stay offline while connected; for those, use a SIM card (F50) or a phone's hotspot (N1).
+- The browser refuses local addresses, or its certificate warning has no "continue": use your own address (free DuckDNS plus a real certificate; the AI walks you through signing up).
+- The connection drops when leaving Park: turn on "stay connected while driving" or similar in the head unit's Wi-Fi settings.
+- The head unit cannot see the box's 5 GHz hotspot: on the F50 / OpenWrt switch to channel 149, or else 2.4 GHz channel 6 (the N1 and OneCloud use 149 already).
+
+A Tesla runs into all four. Tell the AI it is a Tesla and it turns on "Tesla mode" (which covers the first two) and sets up your own address with you.
+
+## Hardware and tests
 
 ### Hardware
 
-- **OneCloud (S805, Armbian / Debian 13 armhf) with an RTL8821CU USB adapter** (Wi-Fi and Bluetooth in one, `0bda:c820`), 12 V supply: the main platform. Wired CarPlay uses the USB port away from the Ethernet port (OTG, switched to USB host). After flashing, a phone joins the box hotspot `DashPlay` for first-run setup, and the user's own AI assistant puts the authentication files in place. Flashing and use: [firmware guide (Chinese)](docs/DashPlay玩客云固件使用说明.md); steps for an AI: [AI install notes (Chinese)](docs/DashPlay-AI安装说明.md); firmware build tools: `scripts/onecloud/firmware/`.
+- **OneCloud (S805, Armbian / Debian 13 armhf) with an RTL8821CU USB adapter** (Wi-Fi and Bluetooth in one, `0bda:c820`), 12 V supply. Wired CarPlay uses the USB port away from the Ethernet port (OTG, switched to USB host). After flashing, a phone joins the box hotspot `DashPlay` for first-run setup, and the user's own AI assistant puts the authentication files in place. Flashing and use: [firmware guide (Chinese)](docs/DashPlay玩客云固件使用说明.md); steps for an AI: [AI install notes (Chinese)](docs/DashPlay-AI安装说明.md); firmware build tools: `scripts/onecloud/firmware/`.
 - **Phicomm N1 (S905D, aarch64, built-in BCM43455 Wi-Fi/Bluetooth)**: the image is a USB-stick image with DashPlay preinstalled (Debian trixie from [ophub amlogic-s9xxx-armbian](https://github.com/ophub/amlogic-s9xxx-armbian)); after booting from the stick, `armbian-install` copies it to the eMMC. Same [firmware guide](docs/DashPlay玩客云固件使用说明.md). Both USB ports are host ports, so the iPhone can use either. `scripts/onecloud/firmware/make-n1-image.sh` makes the image on an N1.
 - **Routers or portable Wi-Fi already running OpenWrt 25.12 (aarch64 / x86_64, including the ZTE F50)**: the OpenWrt plugin lives in the sister repository [openwrt-dashplay](https://github.com/yizhixiaoheigou/openwrt-dashplay) (apk packages and a package feed); the network stays configured in OpenWrt as usual. The plugin runs this repository's program, the `dashplay-bundle-<version>.tar` attached to each release. The [installation skill](skills/dashplay-install/SKILL.md) includes the stock F50 B16 backup, root and SD-card OpenWrt procedure and supporting scripts. This weakens boot verification and recovery may require opening the device. Stop on other firmware unless a reliable downgrade route is verified.
 
 ### Tested
 
-OneCloud: each way of use from factory reset through first-run setup (at home, with a phone hotspot standing in for the car hotspot and the portable Wi-Fi), switching between cable and wireless by plugging and unplugging, power cycles, reset. **On the road in an Xpeng, way 1 (wired)**: first-run setup, about 27 minutes continuous, power off and on, the picture back 8–12 s after switching screens, 30–50 fps with no dropped frames. Phicomm N1 way 1 at home (picture, touch, sound, artwork). Wired music is lossless 48 kHz (the page wraps it in FLAC for the media element); album information and artwork reach the system media controls, and the steering-wheel buttons change tracks. Several iPhones take turns (wireless). ZTE F50 (OpenWrt plugin) at home: CarPlay about 37–44 s after power-on; no invitations after the iPhone leaves the Wi-Fi, back in about 4 s when it returns; after a reboot the last iPhone is invited.
+- **In cars**: Xpeng, OneCloud way ① wired: first-run setup, about 27 minutes continuous, power off and on, the picture back 8–12 s after switching screens, 30–50 fps with no dropped frames. Tesla, F50 with a SIM card (wireless); N1 way ③ without internet (wired and wireless pictures, also after a reboot and after forgetting and re-adding the Wi-Fi) and way ③ with a phone's hotspot (wired). Both N1 setups were assembled by hand on the box at the time; they are in 2026.10.15 and the released version still has to be retested in a car.
+- **At home**: OneCloud, each way from factory reset through first-run setup (a phone hotspot standing in for the car hotspot and the portable Wi-Fi), switching between cable and wireless by plugging and unplugging, power cycles, reset; N1 way ① picture, touch, sound, artwork; N1 on the hotspot of the same iPhone, wireless CarPlay at about 30 fps; F50 in CarPlay about 37–44 s after power-on, no invitations after the iPhone leaves the Wi-Fi, back in about 4 s when it returns, and the last iPhone invited after a reboot; the F50 from stock B16 to Tesla mode with the installation skill, once from a Mac and once from Windows 11.
+- Wired music is lossless 48 kHz (the page wraps it in FLAC for the media element); album information and artwork reach the system media controls, and the steering-wheel buttons change tracks. Several iPhones take turns (wireless).
+- **Not yet tested in a car**: the F50 without a SIM card; ② on the road; wireless with a phone's hotspot; the stock-firmware N1 routes.
 
 ### Other Linux boxes
 

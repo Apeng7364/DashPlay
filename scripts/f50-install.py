@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ZTE F50 from stock B16 to OpenWrt with DashPlay, one command per stage (Apple Silicon Mac).
+"""ZTE F50 from stock B16 to OpenWrt with DashPlay, one command per stage (Apple Silicon Mac or Windows x64).
 
     python3 f50-install.py check    WORK            tools, pinned downloads, free space
     python3 f50-install.py flash    WORK            full backup and Root in ONE download-mode session
@@ -9,7 +9,8 @@
     python3 f50-install.py tesla    WORK --sim yes|no [--cn-149]
 
 WORK is the install directory of the skill (skills/dashplay-install/SKILL.md); this stage's files go to WORK/f50.
-Run it with WORK/venv/bin/python (the pinned requirements-f50.txt). Every stage prints progress, "ACTION: ..."
+Run it with the Python environment the skill sets up (WORK/venv, the pinned requirements-f50.txt). On Windows the F50 in
+download mode needs the WinUSB driver (Zadig, see the skill) before "flash". Every stage prints progress, "ACTION: ..."
 for what the owner has to do, and ends with "F50_OK <stage>" (exit 0) or "F50_STOP <stage>: <reason>" (exit 1).
 A stop changes nothing more and retries nothing: the files stay in WORK/f50 for whoever looks next.
 The checks are those of the skill's F0-F3 (it was the manual procedure, 2026-10-14): the device is only written
@@ -23,19 +24,21 @@ import json
 import os
 from pathlib import Path
 import platform
-import pty
+import queue
 import re
-import select
 import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import zipfile
 
 DP = Path(__file__).resolve().parents[1]
-SPD = DP / 'tools/mac-arm64/spd_dump'
+WINDOWS = os.name == 'nt'
+TOOLS = DP / ('tools/windows-x64' if WINDOWS else 'tools/mac-arm64')
+SPD = TOOLS / ('spd_dump.exe' if WINDOWS else 'spd_dump')
 SPD_VERSION = 'branch:pinned-raw-read, sha1:d24c21a0c93a545c0130668caa1826d59ceebe48'
 PROMPT = b'FDL2 >'    # spd_dump's interactive prompt, with the space
 ANDROID = '192.168.0.1:5555'
@@ -95,7 +98,7 @@ class Work:
         self.key = self.private / 'ssh-key'
         self.known_hosts = self.private / 'known_hosts'
         # pinned tools: the skill's bootstrap Python first, then this repository's arm64 builds
-        tools = [str(DP / 'tools/mac-arm64'), str(Path(sys.executable).parent), str(self.root / 'adb/platform-tools')]
+        tools = [str(TOOLS), str(Path(sys.executable).parent), str(self.root / 'adb/platform-tools')]
         os.environ['PATH'] = os.pathsep.join(tools + [os.environ.get('PATH', '')])
 
     def state(self):
@@ -113,9 +116,10 @@ class Work:
 
     def run(self, argv, log=None, check=True, **kw):
         """A host command; its output goes to logs/LOG (or is returned) and a failure stops the stage."""
-        result = subprocess.run([str(a) for a in argv], capture_output=True, text=True, **kw)
+        # not text=True: that decodes with the locale (GBK on Chinese Windows) and a byte it cannot read leaves stdout None
+        result = subprocess.run([str(a) for a in argv], capture_output=True, encoding='utf-8', errors='replace', **kw)
         if log:
-            with (self.logs / log).open('a') as f:
+            with (self.logs / log).open('a', encoding='utf-8') as f:
                 f.write(f'$ {" ".join(map(str, argv))}\n{result.stdout}{result.stderr}\n')
         if check and result.returncode != 0:
             tail = (result.stdout + result.stderr).strip().splitlines()[-5:]
@@ -141,7 +145,7 @@ class Work:
         argv = ['ssh', *self.ssh_options(), f'root@{host}', command]
         result = subprocess.run(argv, input=stdin, capture_output=True, timeout=timeout)
         out = result.stdout.decode(errors='replace')
-        with (self.logs / 'ssh.log').open('a') as f:
+        with (self.logs / 'ssh.log').open('a', encoding='utf-8') as f:
             f.write(f'$ ssh {host} {command[:200]}\n{out}{result.stderr.decode(errors="replace")}\n')
         if check and result.returncode != 0:
             tail = (out + result.stderr.decode(errors='replace')).strip().splitlines()[-5:]
@@ -170,64 +174,72 @@ def wait_port(host, port, seconds):
 
 
 class Fdl:
-    """One interactive spd_dump session: each command is sent once and its prompt awaited."""
+    """One interactive spd_dump session: each command is sent once and its prompt awaited. Pipes, not a terminal,
+    so the same code runs on Windows; spd_dump writes its log and the prompt to stderr, which is not buffered (on
+    Windows only with patches/spreadtrum-windows-libusb.patch: its C runtime buffers stderr on a pipe)."""
 
     def __init__(self, cwd, log):
         self.log = open(log, 'ab')
         self.buf = b''
         self.pos = 0
-        pid, fd = pty.fork()
-        if pid == 0:
+        self.chunks = queue.Queue()
+        self.proc = subprocess.Popen([str(SPD), '--wait', '600', '--kickto', '2', 'exec'], cwd=cwd, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+        threading.Thread(target=self.reader, daemon=True).start()
+
+    def reader(self):
+        while True:
             try:
-                os.chdir(cwd)
-                os.execv(str(SPD), [str(SPD), '--wait', '600', '--kickto', '2', 'exec'])
-            finally:
-                os._exit(127)
-        self.pid, self.fd = pid, fd
+                chunk = os.read(self.proc.stdout.fileno(), 65536)
+            except OSError:
+                chunk = b''
+            self.chunks.put(chunk)
+            if not chunk:
+                return
 
     def wait(self, seconds, what):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            ready, _, _ = select.select([self.fd], [], [], 0.5)
-            if ready:
-                try:
-                    chunk = os.read(self.fd, 65536)
-                except OSError:
-                    chunk = b''
-                if not chunk:
-                    raise Stop(f'spd_dump ended while waiting for {what}: see logs/fdl.log')
-                self.buf += chunk
-                self.log.write(chunk)
-                self.log.flush()
+            try:
+                chunk = self.chunks.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if not chunk:
+                raise Stop(f'spd_dump ended while waiting for {what}: see logs/fdl.log')
+            self.buf += chunk
+            self.log.write(chunk)
+            self.log.flush()
             if self.buf.find(PROMPT, self.pos) != -1:
                 self.pos = len(self.buf)
                 return
         raise Stop(f'no "FDL2 >" after {what} within {seconds} s: see logs/fdl.log')
 
-    def send(self, line, seconds=900):
+    def write(self, line):
         self.pos = len(self.buf)
-        os.write(self.fd, (line + '\n').encode())
+        self.proc.stdin.write((line + '\n').encode())
+        self.proc.stdin.flush()
+
+    def send(self, line, seconds=900):
+        self.write(line)
         self.wait(seconds, line)
 
     def close(self):
-        """Closing the terminal ends spd_dump (after a reset it has ended already); the F50 stays where it is."""
+        """Closing stdin ends spd_dump (after a reset it has ended already); the F50 stays where it is."""
         try:
-            os.close(self.fd)
+            self.proc.stdin.close()
         except OSError:
             pass
-        for _ in range(50):
-            if os.waitpid(self.pid, os.WNOHANG)[0]:
-                break
-            time.sleep(0.1)
-        else:
-            os.kill(self.pid, 15)
-            os.waitpid(self.pid, 0)
+        try:
+            self.proc.wait(5)
+        except subprocess.TimeoutExpired:
+            self.proc.terminate()
+            self.proc.wait()
         self.log.close()
 
 
 def check(w, args):
-    require(platform.system() == 'Darwin' and platform.machine() == 'arm64',
-            'the F50 route runs on an Apple Silicon Mac (pinned arm64 tools)')
+    require((platform.system(), platform.machine()) in (('Darwin', 'arm64'), ('Windows', 'AMD64')),
+            'the F50 route runs on an Apple Silicon Mac or 64-bit Windows (pinned tools)')
     free = shutil.disk_usage(w.root).free
     require(free >= 15_000_000_000, f'only {free // 10**9} GB free where WORK is; the backup needs 15 GB')
     out = w.run([sys.executable, DP / 'scripts/fetch-install-assets.py', 'f50', w.f50], log='check.log').stdout
@@ -236,12 +248,17 @@ def check(w, args):
     require(SPD_VERSION in shown.stdout + shown.stderr, 'spd_dump is not the pinned build of this repository')
     for tool in ('lz4', 'ssh', 'ssh-keygen'):
         require(shutil.which(tool), f'{tool} missing (run mac-bootstrap.sh and its export first)')
-    require(Path(shutil.which('lz4')).parent == DP / 'tools/mac-arm64', 'lz4 is not the pinned build')
+    require(Path(shutil.which('lz4')).parent == TOOLS, 'lz4 is not the pinned build')
     w.run([sys.executable, '-c', 'import cryptography'], log='check.log')
     if not shutil.which('adb'):
-        out = w.run([sys.executable, DP / 'scripts/fetch-install-assets.py', 'adb-mac', w.root / 'adb'], log='check.log').stdout
+        group, archive = ('adb-windows', 'platform-tools-windows.zip') if WINDOWS else ('adb-mac', 'platform-tools-darwin.zip')
+        out = w.run([sys.executable, DP / 'scripts/fetch-install-assets.py', group, w.root / 'adb'], log='check.log').stdout
         require('SHA256_OK' in out, 'ADB download not verified')
-        w.run(['unzip', '-oq', w.root / 'adb/platform-tools-darwin.zip', '-d', w.root / 'adb'])
+        with zipfile.ZipFile(w.root / 'adb' / archive) as z:
+            z.extractall(w.root / 'adb')
+        if not WINDOWS:
+            (w.root / 'adb/platform-tools/adb').chmod(0o755)
+        require(shutil.which('adb'), 'ADB not found after unpacking')
     w.run(['adb', 'version'], log='check.log')
     android = Path.home() / '.android'
     if not (android / 'adbkey.pub').exists():
@@ -313,15 +330,14 @@ def flash(w, args):
                 raise Stop(f'readback after "{stage}" does not match: no further write, no reset. Keep the F50 '
                            f'powered and connected, keep WORK/f50, and ask for help ({(out.stdout + out.stderr).strip()[-200:]})')
             say(f'readback {stage} ok')
-        fdl.pos = len(fdl.buf)
-        os.write(fdl.fd, b'reset\n')
+        fdl.write('reset')
         time.sleep(3)
     finally:
         fdl.close()
     say('rebooting into rooted Android (about 1 minute)')
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
-        connected = subprocess.run(['adb', 'connect', ANDROID], capture_output=True, text=True, timeout=30).stdout
+        connected = w.run(['adb', 'connect', ANDROID], log='adb.log', check=False, timeout=30).stdout
         if 'connected' in connected and 'failed' not in connected and 'cannot' not in connected:
             props = w.adb('shell', 'id; getprop sys.boot_completed; getprop ro.boot.slot_suffix; getprop ro.build.display.id',
                           check=False)
@@ -348,37 +364,6 @@ def check_dry_run(text):
     require(not re.search(r'^! ', text, re.M), 'installer reported an error')
 
 
-def ssh_first_login(w, host, password):
-    """The only password login: puts this install's public key on the box (dropbear)."""
-    key = (w.key.with_suffix('.pub')).read_text().strip()
-    require(re.fullmatch(r'ssh-ed25519 [A-Za-z0-9+/=]+ dashplay-install', key), 'unexpected SSH public key')
-    command = f"umask 077; mkdir -p /etc/dropbear; grep -qxF '{key}' /etc/dropbear/authorized_keys 2>/dev/null " \
-              f"|| echo '{key}' >> /etc/dropbear/authorized_keys; echo KEY_SET"
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.execvp('ssh', ['ssh', '-o', f'UserKnownHostsFile={w.known_hosts}', '-o', 'StrictHostKeyChecking=accept-new',
-                          '-o', 'PreferredAuthentications=password,keyboard-interactive', '-o', 'PubkeyAuthentication=no',
-                          '-o', 'ConnectTimeout=10', f'root@{host}', command])
-    buf, sent, deadline = b'', False, time.monotonic() + 60
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([fd], [], [], 0.5)
-        if not ready:
-            continue
-        try:
-            chunk = os.read(fd, 4096)
-        except OSError:
-            break
-        if not chunk:
-            break
-        buf += chunk
-        if not sent and b'assword' in buf:
-            os.write(fd, password.encode() + b'\n')
-            sent = True
-    os.close(fd)
-    os.waitpid(pid, 0)
-    require(b'KEY_SET' in buf, 'first SSH login with the installer password failed')
-
-
 # Magisk keeps a module installed from a running Android in modules_update until the next boot (modules/ holds only
 # module.prop and "update" until then), so right after the install the switch is in modules_update.
 SWITCH_PATHS = ('/data/adb/modules_update/mu300_linux_switch/switch.sh', '/data/adb/modules/mu300_linux_switch/switch.sh')
@@ -395,6 +380,27 @@ def arm_linux(w):
     # the device reboots at the end, so adb may report the lost connection: the text decides
     out = w.adb('shell', f'sh {found} 2>&1', check=False)
     require('mu300-linux:' not in out, f'switch refused: {out.strip().splitlines()[-1]}; Android is unchanged')
+
+
+def ubus(host, session, obj, method, params):
+    body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'call', 'params': [session, obj, method, params]}).encode()
+    request = urllib.request.Request(f'http://{host}/ubus', body, {'Content-Type': 'application/json'})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # the box, never a proxy
+    with opener.open(request, timeout=30) as r:
+        result = json.load(r).get('result') or [-1]
+    require(result[0] == 0, f'{obj}.{method} refused on the box (code {result[0]})')
+    return result[1] if len(result) > 1 else {}
+
+
+def ssh_first_login(w, host, password):
+    """The only password login, through LuCI's ubus (the same on Mac and Windows): puts this install's public key on
+    the box for dropbear, as root's session may (rpcd's default ACL for root)."""
+    key = w.key.with_suffix('.pub').read_text().strip()
+    require(re.fullmatch(r'ssh-ed25519 [A-Za-z0-9+/=]+ dashplay-install', key), 'unexpected SSH public key')
+    session = ubus(host, '0' * 32, 'session', 'login', {'username': 'root', 'password': password, 'timeout': 300})
+    sid = session['ubus_rpc_session']
+    ubus(host, sid, 'file', 'write', {'path': '/etc/dropbear/authorized_keys', 'data': key + '\n', 'append': True, 'mode': 0o600})
+    require('KEY_SET' in w.ssh(host, 'echo KEY_SET'), 'the SSH key was written but login with it failed')
 
 
 def openwrt(w, args):
@@ -425,7 +431,7 @@ def openwrt(w, args):
         # Magisk's outer status can be non-zero (the dry run exits 3): the text decides
         out = w.adb('shell', '/data/adb/magisk/magisk --install-module /data/local/tmp/mu300-panel.zip',
                     check=False, timeout=1800)
-        (w.logs / f'mu300-{"dry-run" if dry else "install"}.log').write_text(out)
+        (w.logs / f'mu300-{"dry-run" if dry else "install"}.log').write_text(out, encoding='utf-8')
         return out
 
     check_dry_run(install(True))
@@ -446,15 +452,16 @@ def openwrt(w, args):
     password = parse_password(password_file.read_text())
     say('switching to OpenWrt (about 1 minute)')
     arm_linux(w)
-    if not wait_port(OPENWRT, 22, 300):
+    if not wait_port(OPENWRT, 80, 300):
         action('拔下 F50 的 USB 线再插回电脑（让电脑重新取地址），然后等待。')
-        require(wait_port(OPENWRT, 22, 300), f'OpenWrt not reachable at {OPENWRT}:22')
+        require(wait_port(OPENWRT, 80, 300), f'OpenWrt not reachable at {OPENWRT}')
+    wait_port(OPENWRT, 22, 60)
     ssh_first_login(w, OPENWRT, password)
     info = w.ssh(OPENWRT, '. /etc/openwrt_release; echo "$DISTRIB_RELEASE"; uname -r; cat /run/mu300/linux-slot; df -h / | tail -1')
     release, kernel, slot = info.splitlines()[:3]
     require(release.startswith('25.12') and kernel.startswith('5.4') and slot.strip() == 'a',
             f'unexpected system: {release} {kernel} slot {slot}')
-    fw = subprocess.run(['ssh', *w.ssh_options(), f'root@{OPENWRT}', 'fw4 check'], capture_output=True, text=True)
+    fw = w.run(['ssh', *w.ssh_options(), f'root@{OPENWRT}', 'fw4 check'], check=False)
     if fw.returncode != 0:
         require('flowtable' in fw.stdout + fw.stderr, f'firewall check failed: {(fw.stdout + fw.stderr).strip()[-200:]}')
         w.ssh(OPENWRT, 'uci set firewall.@defaults[0].flow_offloading=0; uci commit firewall; /etc/init.d/firewall restart')
@@ -512,7 +519,8 @@ def dashplay(w, args):
             break
         time.sleep(5)
     require('bluetooth powered' in log, 'Bluetooth did not power on (wireless CarPlay needs it): see /var/run/dashplay/supervisor.log')
-    version = w.ssh(host, 'apk info -v dashplay 2>/dev/null | head -1').strip()
+    # apk 3's "info -v" prints the description; the installed package's full name is the first field of "list -I"
+    version = w.ssh(host, "apk list -I dashplay 2>/dev/null | awk '$1 ~ /^dashplay-[0-9]/ {print $1; exit}'").strip()
     w.done('dashplay', version=version)
     say(f'{version} running, Bluetooth on; settings page http://{host}:18080/')
 
@@ -539,8 +547,8 @@ def fetch_identity(out):
                     continue
                 out.mkdir(mode=0o700)
                 for n in names:
-                    with (out / n).open('xb') as f:
-                        os.fchmod(f.fileno(), 0o600)
+                    fd = os.open(out / n, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0), 0o600)
+                    with os.fdopen(fd, 'wb') as f:
                         f.write(z.read('assets/offline-mfi/' + n))
             (out / 'source.json').write_text(json.dumps(
                 {'tag': release['tag_name'], 'url': asset['browser_download_url'], 'sha256': want[7:]}) + '\n')

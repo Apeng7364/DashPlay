@@ -36,6 +36,18 @@
     "sha256": "ee39ad5967e95c2a07f04dbcbde96b1a0c916ba376096db5d2f498b7727a5d1d"
   },
   {
+    "group": "adb-windows",
+    "file": "platform-tools-windows.zip",
+    "url": "https://dl.google.com/android/repository/platform-tools_r37.0.1-win.zip",
+    "sha256": "45f4d63113e895ebde0c90f194099a4676b6ac653bd28d54314a9e022bbc1a99"
+  },
+  {
+    "group": "zadig",
+    "file": "zadig-2.9.exe",
+    "url": "https://github.com/pbatard/libwdi/releases/download/v1.5.1/zadig-2.9.exe",
+    "sha256": "4ecaa95df3da3621486a043aef8b3050b8bafe7c901402871e816229ef82039b"
+  },
+  {
     "group": "n1",
     "file": "boot.img",
     "url": "https://raw.githubusercontent.com/dreamrover/phicomm-n1/e9007301fcfc5beb2c2da51dab9e810cbb509322/firmware_2.19/boot.img",

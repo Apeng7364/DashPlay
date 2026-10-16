@@ -1,0 +1,105 @@
+diff --git a/common.c b/common.c
+index 960ea0c..078d4eb 100644
+--- a/common.c
++++ b/common.c
+@@ -2542,7 +2542,7 @@ void DestroyRecvThread(spdio_t *io) {
+ 	io->m_dwRecvThreadID = 0;
+ }
+ #else
+-#ifndef _MSC_VER
++#if !defined(_MSC_VER) && !_WIN32
+ pthread_t gUsbEventThrd;
+ libusb_hotplug_callback_handle gHotplugCbHandle = 0;
+ 
+@@ -2594,7 +2594,53 @@ void stopUsbEventHandle(void) {
+ 	int ret = pthread_join(gUsbEventThrd, NULL);
+ 	if (ret != 0) DBG_LOG("Failed to join thread, error: %d\n", ret);
+ }
+-#else
++#endif
++#if _WIN32 && !defined(_MSC_VER)
++// libusb has no hotplug on Windows. Poll the device list and report what HotplugCbFunc would: a 1782:4d00 that was
++// not there on the previous pass has arrived, one that is gone has left (devices present at the start are not
++// arrivals, as with LIBUSB_HOTPLUG_NO_FLAGS). libusb keeps one device object per connected device, so pointers compare.
++pthread_t gUsbEventThrd;
++
++static int isSprdDiag(libusb_device *dev) {
++	struct libusb_device_descriptor desc;
++	return !libusb_get_device_descriptor(dev, &desc) && desc.idVendor == 0x1782 && desc.idProduct == 0x4d00;
++}
++
++static int inList(libusb_device **list, libusb_device *dev) {
++	for (; list && *list; list++) if (*list == dev) return 1;
++	return 0;
++}
++
++void *UsbPollThrdFunc(void *param) {
++	libusb_device **prev = NULL;
++	if (libusb_get_device_list(NULL, &prev) < 0) prev = NULL;
++	while (bListenLibusb) {
++		usleep(50000);
++		libusb_device **now;
++		if (libusb_get_device_list(NULL, &now) < 0) continue;
++		for (libusb_device **d = now; *d; d++)
++			if (isSprdDiag(*d) && !inList(prev, *d) && !curPort) curPort = libusb_ref_device(*d);
++		for (libusb_device **d = prev; d && *d; d++)
++			if (!inList(now, *d) && curPort == *d) m_bOpened = -1;
++		if (prev) libusb_free_device_list(prev, 1);
++		prev = now;
++	}
++	if (prev) libusb_free_device_list(prev, 1);
++	return NULL;
++}
++
++void startUsbEventHandle(void) {
++	bListenLibusb = 1;
++	int ret = pthread_create(&gUsbEventThrd, NULL, UsbPollThrdFunc, NULL);
++	if (ret != 0) { bListenLibusb = 0; ERR_EXIT("Failed to create thread, error: %d\n", ret); }
++}
++
++void stopUsbEventHandle(void) {
++	bListenLibusb = 0;
++	int ret = pthread_join(gUsbEventThrd, NULL);
++	if (ret != 0) DBG_LOG("Failed to join thread, error: %d\n", ret);
++}
++#elif defined(_MSC_VER)
+ void startUsbEventHandle(void) {
+ 	DBG_LOG("startUsbEventHandle() is not supported in MSVC. Please use MSYS2 if you need it.\n");
+ }
+diff --git a/common.h b/common.h
+index 25fa1d8..4342464 100644
+--- a/common.h
++++ b/common.h
+@@ -61,7 +61,7 @@ void usleep(unsigned int us);
+ 
+ #if _WIN32
+ #define ERR_EXIT(...) \
+-	do { fprintf(stderr, __VA_ARGS__); if (m_bOpened == 1) system("pause"); exit(1); } while (0)
++	do { fprintf(stderr, __VA_ARGS__); exit(1); } while (0)
+ #else
+ #define ERR_EXIT(...) \
+ 	do { fprintf(stderr, __VA_ARGS__); exit(1); } while (0)
+diff --git a/spd_dump.c b/spd_dump.c
+index 5227a66..fd87ab9 100644
+--- a/spd_dump.c
++++ b/spd_dump.c
+@@ -130,6 +130,10 @@ int fdl2_executed = 0;
+ int selected_ab = -1;
+ uint64_t fblk_size = 0;
+ int main(int argc, char **argv) {
++#if _WIN32
++	setvbuf(stdout, NULL, _IONBF, 0);
++	setvbuf(stderr, NULL, _IONBF, 0);
++#endif
+ 	spdio_t *io = NULL; int ret, i, in_quote;
+ 	int wait = 30 * REOPEN_FREQ;
+ 	int argcount = 0, stage = -1, nand_id = DEFAULT_NAND_ID;
+@@ -250,7 +254,7 @@ int main(int argc, char **argv) {
+ 		stage = -1;
+ 	}
+ #else
+-	if (!libusb_has_capability(LIBUSB_CAP_HAS_HOTPLUG)) { DBG_LOG("hotplug unsupported on this platform\n"); bListenLibusb = 0; bootmode = -1; at = 0; }
++	if (!_WIN32 && !libusb_has_capability(LIBUSB_CAP_HAS_HOTPLUG)) { DBG_LOG("hotplug unsupported on this platform\n"); bListenLibusb = 0; bootmode = -1; at = 0; }
+ 	if (at || bootmode >= 0) {
+ 		startUsbEventHandle();
+ 		ChangeMode(io, wait / REOPEN_FREQ * 1000, bootmode, at);

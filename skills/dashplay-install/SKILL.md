@@ -94,9 +94,9 @@ $DP = Join-Path $WORK 'DashPlay-main'
 Test-Path "$DP/scripts/fetch-install-assets.py"
 ```
 
-→ 最后一行 `True` → 否则停止。下文 `$WORK`/`$DP` 在 PowerShell 同样可用；不要把 sh 的 `export`、`chmod`、反引号续行或 heredoc 直接贴进 PowerShell。每条外部命令检查 `$LASTEXITCODE` 为 0 才继续。
+→ 最后一行 `True` → 否则停止。**Windows 接着执行** `powershell -ExecutionPolicy Bypass -File "$DP\scripts\windows-bootstrap.ps1" "$WORK"` → 最后一行 `WINDOWS_READY`，倒数第二行是一句 `$env:Path = ...` → 执行这句。它下载固定版本的独立 Python 3.12 到 `$WORK\python`，核对仓库自带的 `tools\windows-x64\spd_dump.exe`、`lz4.exe`（构建方法见 `scripts/build-windows-tools.sh`），确认系统自带的 OpenSSH 客户端可用；输出 `STOP` 就停下，不改用别处的 Python 或工具。下文 `$WORK`/`$DP` 在 PowerShell 同样可用；不要把 sh 的 `export`、`chmod`、反引号续行或 heredoc 直接贴进 PowerShell。每条外部命令检查 `$LASTEXITCODE` 为 0 才继续。
 
-Mac 的 N1/F50 ADB 前置：先 `command -v adb; command -v fastboot` → 两者存在；缺少时执行 `python3 "$DP/scripts/fetch-install-assets.py" adb-mac "$WORK/adb"`，再 `unzip "$WORK/adb/platform-tools-darwin.zip" -d "$WORK/adb"`、`export PATH="$WORK/adb/platform-tools:$PATH"`、`adb version`、`fastboot --version` → 摘要通过、版本命令成功 → 否则停止。Linux/Windows 原厂 N1 路线需已有可工作的 ADB/fastboot；没有则停下明确换用本段支持的 Mac，不能临时找不明驱动包。
+Mac 的 N1 ADB 前置（F50 不用这段：`f50-install.py check` 会自己下载固定版本的 ADB，Mac、Windows 都一样）：先 `command -v adb; command -v fastboot` → 两者存在；缺少时执行 `python3 "$DP/scripts/fetch-install-assets.py" adb-mac "$WORK/adb"`，再 `unzip "$WORK/adb/platform-tools-darwin.zip" -d "$WORK/adb"`、`export PATH="$WORK/adb/platform-tools:$PATH"`、`adb version`、`fastboot --version` → 摘要通过、版本命令成功 → 否则停止。Linux/Windows 原厂 N1 路线需已有可工作的 ADB/fastboot；没有则停下明确换用本段支持的 Mac，不能临时找不明驱动包。
 
 解压镜像：把 `$IMAGE_XZ` 设为下载的 `.xz` 绝对路径，执行 `python3 -c "import lzma,shutil,sys; p=sys.argv[1]; a=lzma.open(p,'rb'); b=open(p[:-3],'xb'); shutil.copyfileobj(a,b); b.close(); a.close()" "$IMAGE_XZ"`（Windows 用 `python`）→ 退出 0、同目录出现去掉 `.xz` 后缀的镜像 → 失败保留现场，不拿部分文件刷写；目标已存在时先核对来源，不覆盖用户文件。
 
@@ -154,7 +154,7 @@ N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
      ```
    - Linux：`lsblk` 找到 U 盘并确认，`sudo dd if=… of=/dev/sdX bs=4M conv=fsync status=progress`。
    - Windows：没有安全的命令行方式，请用户安装 balenaEtcher（或 Rufus），你告诉他选哪个文件、哪个 U 盘。
-3. **从 U 盘启动**。先读用户已经说明的起点：README 的三句补充分别对应已有 Linux、斐讯原厂 ≤2.19、斐讯原厂 >2.19，已明确就直接走对应分支，不再重复问系统类型。只说“原厂高于 2.19”但没给精确版本时，只补问版本号；两条原厂路线都注明“来自公开实践，本项目未实测”。起点没说明时才问：**现在开机看到的是 Linux（Armbian/OpenWrt）、斐讯原厂界面、安卓电视桌面，还是根本起不来？** 不把所有“刷过系统”都当成 Linux。
+3. **从 U 盘启动**。先读用户已经说明的起点（已有 Linux、斐讯原厂 ≤2.19、斐讯原厂 >2.19），已明确就直接走对应分支，不再重复问系统类型。只说“原厂高于 2.19”但没给精确版本时，只补问版本号；两条原厂路线都注明“来自公开实践，本项目未实测”。起点没说明时才问：**现在开机看到的是 Linux（Armbian/OpenWrt）、斐讯原厂界面、安卓电视桌面，还是根本起不来？** 不把所有“刷过系统”都当成 Linux。
    - **Linux**（2026-10-14 实测：已有 Armbian、内核 6.12.111-ophub）：先记录当前可用的 SSH 地址、登录方法和网卡 MAC；不能登录就停下补齐，不能假设旧系统密码也是 1234。
      **请拔掉 N1 的电源，把 U 盘插到靠近 HDMI 的那个 USB 口，再接上电源，网线保持连接。**
      → 等待约 2 分钟。有 DashPlay 热点时按第 4 步连接；没有时用刚记录的旧系统以太网 SSH 地址和登录方法执行 `findmnt -no SOURCE /`，不要求旧系统先出现 DashPlay 热点。两种方式都不能登录则停下核对路由器租约与网线。若仍是旧 Linux 的 `/dev/mmcblk…`，先在旧系统执行 `lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT`，确认已出现与获准 U 盘容量一致的 `/dev/sd…`。U 盘不存在则停下检查插口/盘；U 盘存在则保留它，执行一次 `sync; reboot` 热重启，再按第 4 步核对根目录。仍进 eMMC 则停下保存 `findmnt`、`lsblk`、`cat /proc/cmdline`，不清空内置存储来强迫启动。
@@ -198,12 +198,11 @@ N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
 
 **风险先说清楚：这条路线会降低启动校验；断电、版本不符或写错可能变砖，最坏需要拆机短接。Root 后的 TCP ADB 不验证客户端身份，只在电脑直连的 USB 网络里用，结束后留在 OpenWrt。** 先取得针对这台设备、SD 卡清空及启动分区的授权。其他设备的 NV、IMEI、基带、GPT 绝不能写入。
 
-准备：F50 插卡版（装插件时要用 SIM 卡上网）、可清空的 8 GB 以上 SD 卡（有数据先用读卡器另备份）、能传数据的 USB 线、**Apple Silicon Mac**（`uname -m` 为 `arm64`；其他电脑先看下面「不是 Apple Silicon Mac 时」）。F50 有两个 USB 口，用能在电脑上打开原厂后台的那个；另一口无反应先换口。全程约 30 分钟，其中机器自己跑约 25 分钟。
+准备：F50 插卡版（装插件时要用 SIM 卡上网）、可清空的 8 GB 以上 SD 卡（有数据先用读卡器另备份）、能传数据的 USB 线、**Apple Silicon Mac 或 64 位 Windows 10/11**（Intel Mac、Linux 先看下面「其他电脑」；不套用网上的一键 root 脚本）。Windows 要装一次 USB 驱动（下面 F0 第 4 步）；Windows 版 2026-10-16 在一台 Windows 11 上实测过一次（六步全部通过），比 Mac 少验证，开始前告诉用户这一点。F50 有两个 USB 口，用能在电脑上打开原厂后台的那个；另一口无反应先换口。全程约 30 分钟，其中机器自己跑约 25 分钟。
 
-**不是 Apple Silicon Mac 时**（Windows、Linux、Intel Mac）：本节的刷机工具和命令目前只在 Apple Silicon Mac 上实测过，先如实告诉用户，不要说已经支持。首选办法是借一台 Apple Silicon Mac，或请有 Mac 的朋友帮忙做完本节；F50 装好以后，日常使用、改设置、升级插件都不需要 Mac。用户坚持用自己的电脑时，可以把下面的方向告诉他，或在他同意后自己去查证；这些都没经过本项目验证，出了问题本向导兜不了底：
-- 刷机工具 `spd_dump` 是开源的（[TomKing062/spreadtrum_flash](https://github.com/TomKing062/spreadtrum_flash)，本项目固定在提交 `d24c21a`，加了 `patches/spreadtrum-read-user-area.patch`，构建方法见 `scripts/build-mac-tools.sh`），要在那台电脑上自己编译；`scripts/f50-install.py` 里的工具路径和下载模式交互是按 Mac 写的，要相应改。
-- Windows：F50 在下载模式下的 USB ID 是 `1782:4D00`，spd_dump 经 libusb 访问它，要给这个设备装 WinUSB 驱动，常用开源的 [Zadig](https://zadig.akeo.ie/)（只给 `1782:4D00` 换驱动，别动其他设备）。展锐官方的串口驱动是给厂商刷机工具用的，不能代替 WinUSB。
-- Linux：不用装驱动，但要用 root 运行，或加一条 udev 规则让普通用户能访问 `1782:4D00`。
+**其他电脑**（Linux、Intel Mac）：本节的刷机工具和命令只在 Apple Silicon Mac 和 64 位 Windows 上实测过，先如实告诉用户，不要说已经支持。首选借一台这两种电脑，或请朋友帮忙做完本节；F50 装好以后，日常使用、改设置、升级插件都不需要它。用户坚持用自己的电脑时，可以把下面的方向告诉他，或在他同意后自己去查证；这些都没经过本项目验证，出了问题本向导兜不了底：
+- 刷机工具 `spd_dump` 是开源的（[TomKing062/spreadtrum_flash](https://github.com/TomKing062/spreadtrum_flash)，本项目固定在提交 `d24c21a`，加了 `patches/spreadtrum-read-user-area.patch`，构建方法见 `scripts/build-mac-tools.sh`），要在那台电脑上自己编译；`scripts/f50-install.py` 里的工具路径是按 Mac 和 Windows 写的，要相应改。
+- Linux：F50 在下载模式下的 USB ID 是 `1782:4D00`，不用装驱动，但要用 root 运行，或加一条 udev 规则让普通用户能访问它。
 - 不管哪种电脑，本节的规则照旧：先完整备份并核对，两槽都读回，看到异常就停；不用网上来源不明的一键 root 脚本或别人的备份，不写 NV、IMEI、基带、GPT。
 
 **全程用仓库里的 `scripts/f50-install.py`，一步一条命令，不要自己另写脚本代替它。** 备份、写入、两槽读回核对、装 OpenWrt、装插件和蓝牙的检查都在里面，这些检查就是本节原来的手工步骤。你的工作是：每条命令前把要用户做的事讲清楚、等用户说好，再运行，把结果转告用户。
@@ -215,13 +214,22 @@ N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
 
 1. 电脑通过 USB 打开 `http://192.168.0.1/`，让用户在原厂后台登录，读取型号与完整固件版本 → 必须为 **ZTE F50、F50_FLYMODEM_ZYV1.0.0B16** → U30 Air、其他运营商定制版、非 B16 都不继续本节，按下一步处理。不要用文件名代替后台版本。**不需要用户在后台打开 USB 调试（`#usb_port` 等页面）**：本路线备份和 Root 都走断电重接的下载模式，ADB 由写入的 Root 镜像在启动后自己打开；不要让用户去开，也不要因为它关着就停下或改走别的路线。
 2. 非 B16 的调查结论（2026-10-14）：[Xio-Shark 原作者](https://github.com/Xio-Shark/f50-b16) 明确只支持 B16；[zte-f50-toolkit](https://github.com/dikeckaan/zte-f50-toolkit) 提供的是 **B09** 路线，不是已验证的“任意版本降到 B16”，且包含改基带/设备标识工具。当前未找到可核实、覆盖具体起始版本的 B16 降级路线。**不要试 B09 包、不要猜降级。** 记录用户完整版本后，可以只做调查：在网上查有没有针对这个具体版本的路线，交给用户一份报告，逐条写来源链接、作者、是否有作者或他人的实机记录（覆盖哪个起始版本）、要写哪些分区（是否碰基带、NV/IMEI、GPT）、能否先完整备份、出错后怎么恢复；没找到就如实说没找到。**调查阶段不下载其中的刷机包或工具、不运行其中的命令、不连 F50 写入**；报告交给用户后停下，由用户决定。本向导不执行报告里的任何路线；在它被本项目实机验证并写进本节之前，可以建议用户换 B16 的 F50，或改用 N1 / 玩客云。
-3. 先完成「下载工具与校验」（含 `mac-bootstrap.sh` 和它的 `export`），再建本节用的 Python 环境并检查（要 15 GB 空闲，不够就按上面换 `INSTALL_BASE` 重建 `WORK`）：
+3. 先完成「下载工具与校验」（Mac 含 `mac-bootstrap.sh` 和它的 `export`，Windows 含 `windows-bootstrap.ps1` 和它的 `$env:Path` 那句），再建本节用的 Python 环境并检查（要 15 GB 空闲，不够就按上面换 `INSTALL_BASE` 重建 `WORK`）。Mac：
    ```sh
    python3 -m venv "$WORK/venv"
-   "$WORK/venv/bin/python" -m pip install --only-binary=:all: --require-hashes -r "$DP/skills/dashplay-install/requirements-f50.txt"
-   "$WORK/venv/bin/python" "$DP/scripts/f50-install.py" check "$WORK"
+   PY="$WORK/venv/bin/python"
+   "$PY" -m pip install --only-binary=:all: --require-hashes -r "$DP/skills/dashplay-install/requirements-f50.txt"
+   "$PY" "$DP/scripts/f50-install.py" check "$WORK"
+   ```
+   Windows（PowerShell；下文 `"$PY" ...` 的命令在 PowerShell 里都写成 `& $PY ...`）：
+   ```powershell
+   python -m venv "$WORK\venv"
+   $PY = "$WORK\venv\Scripts\python.exe"
+   & $PY -m pip install --only-binary=:all: --require-hashes -r "$DP\skills\dashplay-install\requirements-f50.txt"
+   & $PY "$DP\scripts\f50-install.py" check "$WORK"
    ```
    → `F50_OK check`：固定下载（[downloads.json](downloads.json) 里的项目作者地址和 SHA-256，不是中兴官方）、仓库自带的 spd_dump/lz4、ADB 和本机 ADB 密钥都已就绪。摘要不符会停下，不改清单迁就下载。
+4. **只有 Windows**：给刷机模式下的 F50 装 WinUSB 驱动（开源的 [Zadig](https://zadig.akeo.ie/)，固定版本和摘要；会改这台电脑的驱动，先得到用户同意）。`& $PY "$DP\scripts\fetch-install-assets.py" zadig "$WORK\zadig"` → `SHA256_OK zadig-2.9.exe`，然后请用户双击运行 `$WORK\zadig\zadig-2.9.exe`（要管理员权限），按顺序点：菜单 **Device → Create New Device**；名称填 `F50 download`；USB ID 两格填 `1782` 和 `4D00`；右边驱动选 **WinUSB**；点 **Install Driver**，等提示成功。不要给其他设备换驱动。之后 `flash` 若一直等不到设备，请用户在 F50 断电重接后打开 Zadig 的 **Options → List All Devices**，确认 ID 为 `1782 4D00` 的那一项驱动是 WinUSB，再重新运行。
 
 ### F1 备份并 Root（一次断电重接，约 8 分钟）
 
@@ -229,18 +237,18 @@ N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
 - 备份读取约 3.3 GiB（NV/IMEI、基带、全部启动分区、主副 GPT），跳过安卓用户数据和日志（约 27 GiB；以后回原厂用后台「恢复出厂设置」重建）。**请先记下原厂后台里改过的设置**（WiFi 名称和密码等）。备份只留在这台电脑，不上传。
 - 命令开始后要做一次：**断开 F50 全部电源（拔掉 USB 线），再插回电脑**；之后约 8 分钟不要碰它。
 
-`"$WORK/venv/bin/python" "$DP/scripts/f50-install.py" flash "$WORK"` → `F50_OK flash`：备份 69 of 75 个分区并核对通过；用这台 F50 自己的 TrustOS 和本机 ADB 公钥做出 Root，只写 boot_b、trustos_b，每次写后读回 A/B 两槽和 GPT；重启后 ADB 是 root、B16、B 槽。读回不符会停下且不重启，**这时让用户保持 F50 通电连接**，不拔线硬试。
+`"$PY" "$DP/scripts/f50-install.py" flash "$WORK"` → `F50_OK flash`：备份 69 of 75 个分区并核对通过；用这台 F50 自己的 TrustOS 和本机 ADB 公钥做出 Root，只写 boot_b、trustos_b，每次写后读回 A/B 两槽和 GPT；重启后 ADB 是 root、B16、B 槽。读回不符会停下且不重启，**这时让用户保持 F50 通电连接**，不拔线硬试。
 
 ### F2 SD 卡装 OpenWrt，保留安卓 B（约 10 分钟）
 
-请用户**插入已同意清空的 SD 卡**，再运行 `"$WORK/venv/bin/python" "$DP/scripts/f50-install.py" openwrt "$WORK"` → `F50_OK openwrt`：先试运行确认只写 SD 卡、boot_a 和 misc 的 32 字节，再安装、核对安卓 boot_b 没变，切到 OpenWrt 25.12（内核 5.4、SD 根、A 槽），防火墙检查通过，默认从 OpenWrt 启动（连续 5 次起不来自动回安卓，不 lock）。后台 `http://192.168.77.1/`，root 密码在 `$WORK/f50/private/openwrt-root-password.txt`，**不贴进聊天**；电脑之后用本次生成的密钥登录，不再用密码。以后默认进哪个系统，装好并真实出画后在「收尾检查」问用户。
+请用户**插入已同意清空的 SD 卡**，再运行 `"$PY" "$DP/scripts/f50-install.py" openwrt "$WORK"` → `F50_OK openwrt`：先试运行确认只写 SD 卡、boot_a 和 misc 的 32 字节，再安装、核对安卓 boot_b 没变，切到 OpenWrt 25.12（内核 5.4、SD 根、A 槽），防火墙检查通过，默认从 OpenWrt 启动（连续 5 次起不来自动回安卓，不 lock）。后台 `http://192.168.77.1/`，root 密码在 `$WORK/f50/private/openwrt-root-password.txt`，**不贴进聊天**；电脑之后用本次生成的密钥登录，不再用密码。以后默认进哪个系统，装好并真实出画后在「收尾检查」问用户。
 
 ### F3 装 DashPlay 和蓝牙（约 5 分钟，要 SIM 卡上网）
 
-先说明会往 F50 装 Python、Java 等约 225 MB，得到同意后运行 `"$WORK/venv/bin/python" "$DP/scripts/f50-install.py" dashplay "$WORK"` → `F50_OK dashplay`：从 openwrt-dashplay 最新发布下载并校验四个包，装好，搭好 F50 专用的私有蓝牙（不装系统 bluez-daemon），确认日志里 `bluetooth powered`。没网时停下：请用户插好能上网的 SIM 卡再运行。
+先说明会往 F50 装 Python、Java 等约 225 MB，得到同意后运行 `"$PY" "$DP/scripts/f50-install.py" dashplay "$WORK"` → `F50_OK dashplay`：从 openwrt-dashplay 最新发布下载并校验四个包，装好，搭好 F50 专用的私有蓝牙（不装系统 bluez-daemon），确认日志里 `bluetooth powered`。没网时停下：请用户插好能上网的 SIM 卡再运行。
 
 接着：
-- 认证文件：先按「放认证文件」开头说明共用实验身份的风险，再运行 `"$WORK/venv/bin/python" "$DP/scripts/f50-install.py" identity "$WORK"`（用户已有两个文件时在末尾加它们所在的目录）→ `F50_OK identity`。它做的就是那一节的第 1–3 步。
+- 认证文件：先按「放认证文件」开头说明共用实验身份的风险，再运行 `"$PY" "$DP/scripts/f50-install.py" identity "$WORK"`（用户已有两个文件时在末尾加它们所在的目录）→ `F50_OK identity`。它做的就是那一节的第 1–3 步。
 - 特斯拉：做「特斯拉」一节（F50 那一项用 `tesla` 步骤）。其他车：设置页 `http://192.168.77.1:18080/` 添加 iPhone，车机连 F50 的 WiFi 打开 `https://192.168.77.1:18443/`；打不开见「车机打不开画面时」。
 - 保留备份（`$WORK/f50`）和 SD 卡；没做的冷启动、上车验收不宣称通过。
 
@@ -343,7 +351,7 @@ DashPlay 在 OpenWrt 上是插件。设备必须已经运行 OpenWrt 25.12（用
 特斯拉模式是已有网络方式上的开关：F50/OpenWrt 自己提供热点和上网；N1/玩客云用方式二或方式三，方式一不适用。开启时默认音乐、通话与 Siri 走车机蓝牙，并显示全屏按钮；N1/玩客云可在「声音」单独调整。F50 插卡已实测；N1 方式三的 A、B 手工方案已于 2026-10-15 实测，正式版本待复测，玩客云与特斯拉方式二未测。特斯拉能访问的地址必须实际核对，不能只看开关或把网关地址当盒子地址。
 
 1. **按设备与方式启用**，先告诉用户本分支会改变哪个网络、需要重连哪个热点：
-   - **F50**：`"$WORK/venv/bin/python" "$DP/scripts/f50-install.py" tesla "$WORK" --sim yes`（插了能上网的 SIM 卡；没插用 `--sim no`）→ `F50_OK tesla`。插卡时它先关掉「替特斯拉回答联网检查」（有卡就有真网；2026.10.15 程序只看 1.1.1.1，有的运营商挡它会误判没网），再开特斯拉模式；局域网约半分钟后变成 `100.96.0.1`，中途出现 `ACTION` 就请用户拔插一次 USB 线让电脑重新取地址；然后核对 `br-lan` 是 `100.96.0.1/24`、插卡时上游 DNS 可用、接收端带 `--tesla`，并显示 WiFi 的国家和信道。已有实车记录里 CN/149 车机看得到、信道 36 看不到：**仅在用户实际位于中国、同意时**再运行一次并加 `--cn-149`；其他地区按当地规定，不硬套。之后电脑用 `ssh -i "$WORK/f50/private/ssh-key" root@100.96.0.1` 登录。F50 跳过下面第 2 步（脚本已核对），从第 3 步继续。
+   - **F50**：`"$PY" "$DP/scripts/f50-install.py" tesla "$WORK" --sim yes`（插了能上网的 SIM 卡；没插用 `--sim no`）→ `F50_OK tesla`。插卡时它先关掉「替特斯拉回答联网检查」（有卡就有真网；2026.10.15 程序只看 1.1.1.1，有的运营商挡它会误判没网），再开特斯拉模式；局域网约半分钟后变成 `100.96.0.1`，中途出现 `ACTION` 就请用户拔插一次 USB 线让电脑重新取地址；然后核对 `br-lan` 是 `100.96.0.1/24`、插卡时上游 DNS 可用、接收端带 `--tesla`，并显示 WiFi 的国家和信道。已有实车记录里 CN/149 车机看得到、信道 36 看不到：**仅在用户实际位于中国、同意时**再运行一次并加 `--cn-149`；其他地区按当地规定，不硬套。之后电脑用 `ssh -i "$WORK/f50/private/ssh-key" root@100.96.0.1` 登录。F50 跳过下面第 2 步（脚本已核对），从第 3 步继续。
    - **其他 OpenWrt 路由器**：在当前 SSH 会话执行 `uci set dashplay.main.tesla_mode=1 && uci commit dashplay && /etc/init.d/dashplay restart`（插了能上网的 SIM 卡时，前面先加 `uci set dashplay.main.answer_tesla_checks=0 &&`），约半分钟后局域网变成 `100.96.0.1`，电脑重连后 `ssh root@100.96.0.1`，`ip -4 addr show br-lan` → 有 `100.96.0.1/24`。
    - **N1 / 玩客云方式三**：首次设置选“车机连盒子热点”，在当前设置页“车”勾选“特斯拉模式”并保存。约 1 分钟后电脑重连已保存名称/密码的盒子热点，按设置页实际地址 SSH；执行 `ip -4 addr` → 热点网卡默认 `100.96.0.1/24`，冲突时为提示的共享空间备用 /24 → 不符停下看设置页提示，不重复切网段。
    - **N1 / 玩客云方式二**：先查看随身 WiFi 的型号官方手册和后台 LAN 设置，确认允许修改 LAN/DHCP；没有此功能即停止本路线，告知用户可改选方式三，不能声称 DashPlay 会代改随身 WiFi。经用户同意，在其后台将 LAN 设为 `100.96.0.1/24`、DHCP 池设为 `100.96.0.100–100.96.0.200`，确认该段不与其他接口冲突再保存；字段/含义不匹配时停下核对该型号文档。电脑、盒子和车机都重连随身 WiFi。由后台租约按已记录的盒子 MAC 找到**盒子的新 IP**，用该 IP SSH；网关 `100.96.0.1` 是随身 WiFi，不能拿来当 DashPlay 地址。在盒子设置页勾选“特斯拉模式”保存。随后 SSH 到该盒子执行：
