@@ -32,6 +32,33 @@ def local_address():
     return ":".join(f"{b:02X}" for b in [first] + [secrets.randbits(8) for _ in range(5)])
 
 
+def initialised(argv):
+    """mu300-bt-init uploads the vendor PSKey/RF blocks; False when the controller did not take them."""
+    try:
+        return subprocess.run(argv, timeout=30).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def reset_controller(state, init, sleep=time.sleep):
+    """Power-cycle the Bluetooth function of the combo chip (its rfkill) so the controller starts from its ROM
+    defaults, then initialise it. The vendor's bluetooth-start waits 1 s blocked and 2 s after unblocking; the
+    unblock itself returns once the function is powered, and on the F50 the init then took 0.07 s with no wait
+    at all (2026-10-16, ten tries), so try that first and fall back to the vendor's waits."""
+    state.write_text("0\n")
+    sleep(0.2)
+    state.write_text("1\n")
+    if init():
+        return "quick"
+    state.write_text("0\n")
+    sleep(1)
+    state.write_text("1\n")
+    sleep(2)
+    if init():
+        return "with the vendor's waits"
+    raise SystemExit("Marlin3 Bluetooth init failed")
+
+
 def stop_children(children, timeout=6):
     """Stop every child (each in its own process group) within one deadline: one after the other, 8 s each,
     outlasted the supervisor's wait for this helper, which was then killed with the children left running."""
@@ -137,13 +164,11 @@ def main():
             time.sleep(0.2)
         if list(Path("/sys/class/bluetooth").glob("hci*")):
             raise SystemExit("an HCI controller already exists (is the old f50-carplay service still running?)")
-        (radios[0] / "state").write_text("0\n")
-        time.sleep(1)
-        (radios[0] / "state").write_text("1\n")
-        time.sleep(2)
-        subprocess.run(["/opt/mu300/bin/mu300-bt-init", "-d", str(TTY), "-p", "/lib/firmware/bt_configure_pskey.ini",
-                        "-r", "/lib/firmware/bt_configure_rf.ini", "-a", address_file.read_text().strip()],
-                       check=True, timeout=30)
+        argv = ["/opt/mu300/bin/mu300-bt-init", "-d", str(TTY), "-p", "/lib/firmware/bt_configure_pskey.ini",
+                "-r", "/lib/firmware/bt_configure_rf.ini", "-a", address_file.read_text().strip()]
+        began = time.monotonic()
+        way = reset_controller(radios[0] / "state", lambda: initialised(argv))
+        print(f"Marlin3 Bluetooth reset ({way}) in {time.monotonic() - began:.2f} s", flush=True)
         (BUS / "dbus.conf").write_text(
             f'<busconfig><type>system</type><listen>unix:path={BUS}/system_bus_socket</listen><auth>EXTERNAL</auth>'
             '<policy user="root"><allow own="*"/><allow send_destination="*"/><allow receive_sender="*"/></policy></busconfig>\n')

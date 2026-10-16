@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 import secrets
 import threading
+import time
 import urllib.parse
 
 import debug_uplink
@@ -28,6 +29,7 @@ import diagnostics
 
 MAX_BODY = 4096
 APPLY_DELAY = 2.0   # let the browser receive the reply before the service restarts its network
+CHECK_LOG_EVERY = 60   # s: one diag line per car connectivity check and reply, repeats counted into the next
 
 
 def _load(path: Path):
@@ -124,6 +126,7 @@ class SettingsPage:
         self.status, self.on_change, self.allowed = status, on_change, allowed_networks
         self.scanner = scanner
         self.server = None
+        self.checks_seen, self.checks_lock = {}, threading.Lock()
 
     def setup(self):
         return setup_wizard.load(self.state)
@@ -154,9 +157,11 @@ class SettingsPage:
                 self.wfile.write(data)
 
             def do_GET(self):
-                reply = page.tesla_check(self.headers.get("Host", ""))
+                host = self.headers.get("Host", "")
+                reply = page.tesla_check(host, self.path)
+                page.note_check(host, self.path, reply[0] if reply else "off")
                 if reply:
-                    return self._send(200, reply[0], "text/html", reply[1])
+                    return self._send(reply[0], reply[1], "text/html", reply[2])
                 if not self._allowed():
                     return self._send(403, "forbidden")
                 target = page.captive_redirect(self.headers.get("Host", ""), self.path)
@@ -203,11 +208,32 @@ class SettingsPage:
     def home(self):
         return self.status().get("home", "/")
 
-    def tesla_check(self, host):
+    def tesla_check(self, host, path="/"):
         status = self.status()
         enabled = status.get("tesla_offline") if self.managed else setup_wizard.tesla_offline(
             self.setup(), setup_wizard.options(self.state), status.get("uplink", {}).get("phase") == "online")
-        return setup_wizard.check_response(host) if enabled and status.get("mode") in ("ap", "openwrt") else None
+        return setup_wizard.check_response(host, path) if enabled and status.get("mode") in ("ap", "openwrt") else None
+
+    def note_check(self, host, path, reply):
+        """A car's request for a check name into state/diag/ (host, path, our reply or "off"), so a user's diagnostics
+        show which checks the car makes and what it got. Only these names, never the settings page's own requests."""
+        name = setup_wizard.check_name(host)
+        if not name:
+            return
+        key, now = (name, path.split("?")[0][:100], reply), time.monotonic()
+        with self.checks_lock:
+            last, repeats = self.checks_seen.get(key, (None, 0))
+            if last is not None and now - last < CHECK_LOG_EVERY:
+                self.checks_seen[key] = (last, repeats + 1)
+                return
+            self.checks_seen[key] = (now, 0)
+        record = {"uptime": round(now, 1), "event": "tesla_check", "host": name, "path": key[1], "reply": reply}
+        if repeats:
+            record["repeats"] = repeats
+        try:
+            diagnostics.DiagLog(self.state / "diag").append(record)
+        except OSError:
+            pass
 
     def captive_redirect(self, host, path):
         """While captive, any other host or path (OS connectivity probes) is sent to the setup page."""

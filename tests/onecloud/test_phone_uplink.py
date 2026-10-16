@@ -63,6 +63,7 @@ class PhoneUplinkTests(unittest.TestCase):
             self.p.cleanup_phone_uplink.assert_called()
             self.assertIsNone(self.p.start_dhcp.call_args.kwargs['upstream'])
             self.assertIn(setup_wizard.TESLA_CHECK_NAMES[0], self.p.start_dhcp.call_args.args[2])
+            self.assertTrue(self.p.start_dhcp.call_args.kwargs['router'], 'offline Tesla checks need a default route')
             self.assertGreater(self.u.next_try,self.now)
 
     def test_missing_hotspot_never_tears_down_ap_and_retries(self):

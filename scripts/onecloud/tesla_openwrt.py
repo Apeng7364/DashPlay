@@ -31,14 +31,15 @@ def offline_fields(sections, network, host, own_name):
     entries = [f'/{name}/{alias}' for name in setup_wizard.TESLA_CHECK_NAMES]
     if own_name:
         entries.append(f'/{own_name}/{address.ip}')
-    # Preserve unrelated DHCP options, replacing only router and DNS.
+    # Preserve unrelated DHCP options, replacing only router and DNS. The box is the router: Teslas left a network
+    # without a default route ~30 s after joining (two N1 users, 2026-10-16), as supervisor.hotspot_router.
     existing = sections[lan[0]].get('dhcp_option', [])
     existing = [existing] if isinstance(existing, str) else existing
     dhcp = [v for v in existing if v.split(',', 1)[0] not in ('3', '6')]
     fields = {f'{dns[0]}.address': entries, f'{dns[0]}.server': None,
               f'{dns[0]}.noresolv': '1', f'{dns[0]}.nohosts': '1', f'{dns[0]}.resolvfile': None,
               f'{dns[0]}.logqueries': '1', f'{dns[0]}.logfacility': None,
-              f'{lan[0]}.dhcp_option': dhcp + ['3', f'6,{address.ip}']}
+              f'{lan[0]}.dhcp_option': dhcp + [f'3,{address.ip}', f'6,{address.ip}']}
     return alias, fields
 
 

@@ -17,7 +17,8 @@ class OpenWrtOfflineTests(unittest.TestCase):
     def test_dns_and_dhcp_plan(self):
         alias, fields = tesla.offline_fields(SECTIONS, 'lan', '100.96.0.1/24', CONFIG['name'])
         self.assertEqual(alias, '100.96.0.2')
-        self.assertEqual(fields['lan.dhcp_option'], ['42,192.0.2.5', '3', '6,100.96.0.1'])
+        # The box is the router: Teslas left a network without a default route ~30 s after joining (2026-10-16).
+        self.assertEqual(fields['lan.dhcp_option'], ['42,192.0.2.5', '3,100.96.0.1', '6,100.96.0.1'])
         self.assertEqual(fields['dns.noresolv'], '1')
         self.assertEqual(fields['dns.logqueries'], '1')
         self.assertIsNone(fields['dns.logfacility'])

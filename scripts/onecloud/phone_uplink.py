@@ -30,7 +30,7 @@ def station_mac(permanent):
 
 
 def start_shared_ap(platform, address, box, channel, width, wait_for, names=(), upstream=None,
-                    query_log=None, concurrent=False):
+                    query_log=None, concurrent=False, router=False):
     """One AP path for phone uplinks and joined car/MiFi uplinks (design 5.2a)."""
     platform.configure_hotspot(channel, width, box['ssid'], box['passphrase'])
     if concurrent:
@@ -42,7 +42,7 @@ def start_shared_ap(platform, address, box, channel, width, wait_for, names=(), 
         platform.stop_child('hostapd')
     else:
         raise RuntimeError('hotspot failed twice')
-    platform.start_dhcp(address, False, names, upstream=upstream, query_log=query_log)
+    platform.start_dhcp(address, False, names, upstream=upstream, query_log=query_log, router=router)
 
 
 class JoinedPhoneAP:
@@ -122,7 +122,7 @@ class PhoneUplink:
     def start_ap(self, channel, width, names, upstream=None):
         start_shared_ap(self.platform, self.address, self.box, channel, width, self.wait_for, names, upstream,
                         query_log=self.state / 'diag/tesla-dns.log' if self.status.get('tesla') else None,
-                        concurrent=bool(upstream))
+                        concurrent=bool(upstream), router=bool(self.status.get('tesla')))   # supervisor.hotspot_router
         self.start_receiver(channel)
         self.status['channel'] = channel
 

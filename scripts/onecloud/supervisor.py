@@ -111,6 +111,14 @@ def hotspot_names(state, own_name, use):
     return checks + ([own_name] if own_name and (chosen.get("tesla") or chosen.get("local_dns")) else [])
 
 
+def hotspot_router(state, use):
+    """Whether the box hotspot hands out the box as default gateway: only while answering a Tesla's online checks.
+    Two N1 users' Teslas asked for a router in DHCP and, without one, left the hotspot ~30 s after every join
+    (2026-10-16); with the box as router they stayed. Other cars keep no router, or a head unit could make the
+    box its default network and lose its own LTE."""
+    return use == "box_hotspot" and tesla_mode(state)
+
+
 def car_audio_args(state):
     """run-receiver.py options for what goes over the car's own Bluetooth (settings page, state/options.json
     "car_music" / "car_voice"; found in a Tesla, 2026-10-14); Tesla mode is all of them."""
@@ -449,7 +457,8 @@ def main():
             # default network and lose internet: box_hotspot mode says so; the other modes avoid it.)
             portal = setup_wizard.captive(setup, "ap")
             platform.start_dhcp(address, portal, hotspot_names(state, own_name, use),
-                                query_log=state / "diag/tesla-dns.log" if tesla and use == "box_hotspot" else None)
+                                query_log=state / "diag/tesla-dns.log" if tesla and use == "box_hotspot" else None,
+                                router=hotspot_router(state, use))
             status["tesla_offline"] = setup_wizard.tesla_offline(setup, options(state))
             if portal:
                 mark("first-run setup portal enabled")

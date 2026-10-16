@@ -161,6 +161,18 @@ class PlatformTests(unittest.TestCase):
         self.assertFalse(self.platform.connected())
         self.assertIsNone(self.platform.frequency())
 
+    def test_bluetooth_waits_for_its_bus_without_running_bluetoothctl(self):
+        # 2026-10-16, F50: bluetoothctl segfaults while the board helper's D-Bus socket is not there yet; polled
+        # every 0.5 s it crashed a dozen times per boot, each with a register dump in the kernel log
+        bus = self.root / 'system_bus_socket'
+        with patch.dict('os.environ', {'DBUS_SYSTEM_BUS_ADDRESS': f'unix:path={bus}'}), \
+                patch('platform_debian.subprocess.run', return_value=Mock(returncode=0, stdout='')) as run:
+            self.assertFalse(self.platform.power_bluetooth())
+            run.assert_not_called()
+            bus.touch()
+            self.assertTrue(self.platform.power_bluetooth())
+            self.assertIn(['bluetoothctl', 'power', 'on'], [c.args[0] for c in run.call_args_list])
+
     @patch('platform_debian.subprocess.run')
     def test_bluetooth_start_clears_a_leftover_phone_link(self, run):
         run.side_effect = lambda argv, **_: Mock(returncode=0, stdout=(

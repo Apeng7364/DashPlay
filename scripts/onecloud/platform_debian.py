@@ -521,6 +521,11 @@ class DebianPlatform:
             print(f"bluetooth address unchanged: {type(error).__name__}", flush=True)
 
     def power_bluetooth(self):
+        # A board helper's own bus (F50, uci dbus_address) appears a few seconds into the boot; bluetoothctl
+        # segfaults until it is there (2026-10-16), so wait for the socket instead of running it.
+        bus = os.environ.get("DBUS_SYSTEM_BUS_ADDRESS", "")
+        if bus.startswith("unix:path=") and not os.path.exists(bus[len("unix:path="):].split(",", 1)[0]):
+            return False
         identity = None
         # Without btmgmt the address is not ours to manage: the F50's board helper fixes it at btattach and its
         # private BlueZ puts only bluetoothctl on PATH (2026.10.15 retried btmgmt for 60 s there: wired only).
@@ -604,9 +609,10 @@ class DebianPlatform:
             return False
         return hostapd.poll() is None
 
-    def start_dhcp(self, address, portal, names=(), query_log=None, upstream=None):
+    def start_dhcp(self, address, portal, names=(), query_log=None, upstream=None, router=False):
         """names: answered with the box's address on its hotspot (the owner's own domain, so that a car without
-        internet finds it, 2026-10-15); every other name is REFUSED, which sends a resolver on to its next server."""
+        internet finds it, 2026-10-15); every other name is REFUSED, which sends a resolver on to its next server.
+        router: hand out the box as default gateway with those names (Tesla offline checks, supervisor.hotspot_router)."""
         network = address.network
         hosts = list(network.hosts())
         # First-run setup only: a router and a DNS server that answers every name with the box make
@@ -620,7 +626,7 @@ class DebianPlatform:
                    f"--dhcp-option=6,{address.ip}"]
         elif names:
             dns = ["--port=53", "--no-resolv", "--no-hosts", *(f"--address=/{name}/{address.ip}" for name in names),
-                   "--dhcp-option=3", f"--dhcp-option=6,{address.ip}"]
+                   f"--dhcp-option=3,{address.ip}" if router else "--dhcp-option=3", f"--dhcp-option=6,{address.ip}"]
         else:
             dns = ["--port=0", "--dhcp-option=3", "--dhcp-option=6"]
         self.start("dnsmasq", ["dnsmasq", "--keep-in-foreground", "--conf-file=/dev/null", *dns,
