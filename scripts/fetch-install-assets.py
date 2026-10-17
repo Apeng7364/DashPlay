@@ -5,6 +5,10 @@ import hashlib
 import json
 from pathlib import Path
 import urllib.request
+import sys
+
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from install_progress import Progress  # noqa: E402
 
 
 def main():
@@ -19,7 +23,13 @@ def main():
         target=a.out/item['file']
         if target.exists():data=target.read_bytes()
         else:
-            with urllib.request.urlopen(item['url'],timeout=120) as response:data=response.read()
+            # in pieces with progress (WORK/progress/download-<file>.json beside the output folder, install_progress.py)
+            with urllib.request.urlopen(item['url'],timeout=120) as response, \
+                    Progress(a.out.parent,f"download-{item['file']}",f"下载 {item['file']}",
+                             total=int(response.headers.get('Content-Length') or 0) or None,expected=300) as p:
+                parts=[]
+                while chunk:=response.read(1<<20):parts.append(chunk);p.advance(len(chunk))
+                data=b''.join(parts)
         if hashlib.sha256(data).hexdigest() != item['sha256']:
             raise SystemExit(f"HASH_MISMATCH {item['file']}: stop; do not use this input")
         if not target.exists():

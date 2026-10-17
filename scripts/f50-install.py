@@ -35,6 +35,9 @@ import time
 import urllib.request
 import zipfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from install_progress import Progress  # noqa: E402
+
 DP = Path(__file__).resolve().parents[1]
 WINDOWS = os.name == 'nt'
 TOOLS = DP / ('tools/windows-x64' if WINDOWS else 'tools/mac-arm64')
@@ -73,12 +76,36 @@ def require(ok, why):
         raise Stop(why)
 
 
+PROGRESS = None   # the running stage's install_progress.Progress: WORK/progress/f50-<stage>.json and .log
+
+
 def say(text):
     print(f'[{time.strftime("%H:%M:%S")}] {text}', flush=True)
+    if PROGRESS:
+        PROGRESS.log(text)
 
 
 def action(text):
     print(f'ACTION: {text}', flush=True)
+    if PROGRESS:
+        PROGRESS.log('ACTION: ' + text)
+
+
+def progress(**change):
+    if PROGRESS:
+        PROGRESS.set(**change)
+
+
+# Each stage: what the person sees, about how long it takes (F50 measurements 2026-10-14/15), and what unplugging
+# then does (None: harmless, run the stage again).
+STAGES = {
+    'check': ('F50 检查工具并下载', 180, None),
+    'flash': ('F50 备份并 Root', 480, '只在提示「断开 F50 的全部电源」时拔一次 USB 线；其余时间不要拔线、不要断电'),
+    'openwrt': ('F50 装 OpenWrt 到 SD 卡', 600, '不要拔线、不要断电、不要拔 SD 卡：正在写 SD 卡和启动分区'),
+    'dashplay': ('F50 装 DashPlay 和蓝牙', 300, '尽量不要断电：正在安装软件包；中断了重新运行这一步即可'),
+    'identity': ('F50 放认证文件', 60, None),
+    'tesla': ('F50 特斯拉模式', 120, None),
+}
 
 
 def digest(path):
@@ -288,6 +315,7 @@ def flash(w, args):
     try:
         fdl.wait(620, 'the F50 in download mode')
         say('F50 in download mode (FDL2)')
+        progress(unplug='不要拔线、不要断电：F50 在下载模式，正在读分区表')
         if not (w.f50 / 'pgpt.bin').exists():
             fdl.send('partition_list partition_list.xml', 120)
         require((w.f50 / 'pgpt.bin').exists(), 'no partition table read (pgpt.bin)')
@@ -298,13 +326,18 @@ def flash(w, args):
         require(out.startswith('PLAN_READY 69 of 75'), f'unexpected partition layout: {out.strip()}')
         plan = json.loads((backup / 'plan.json').read_text())
         say(f'backing up {sum(p["size"] for p in plan["items"]) // 2**20} MiB (a few minutes)')
+        twice = ('boot_a', 'boot_b', 'trustos_a', 'trustos_b', 'misc', 'primary_gpt', 'secondary_gpt')
+        progress(title='F50 备份', done=0, total=sum(p['size'] * (2 if p['name'] in twice else 1) for p in plan['items']),
+                 unplug='不要拔线、不要断电：正在读备份，中途断开要从头再来')
         fdl.send('path backup', 30)
         for p in plan['items']:
             names = [p['name'] + '.bin']
-            if p['name'] in ('boot_a', 'boot_b', 'trustos_a', 'trustos_b', 'misc', 'primary_gpt', 'secondary_gpt'):
+            if p['name'] in twice:
                 names.append(p['name'] + '.verify.bin')
             for name in names:
                 fdl.send(f'read_part user_partition {p["offset"]} {p["size"]} {name}')
+                if PROGRESS:
+                    PROGRESS.advance(p['size'])
         out = w.run([sys.executable, DP / 'scripts/f50-backup.py', 'verify', backup], log='flash.log').stdout
         require(out.startswith('BACKUP_VERIFIED 69 of 75'), f'backup not verified: {out.strip()}')
         say('backup verified')
@@ -317,13 +350,18 @@ def flash(w, args):
                     log='flash.log').stdout
         require(out.startswith('ROOT_PLAN_READY'), f'Root plan refused: {out.strip()}')
         fdl.send('path root-session', 30)
+        steps = {stage: (session / f'stage-{stage}.txt').read_text().splitlines() for stage in ('before', 'boot', 'trustos')}
+        progress(title='F50 写入 Root', done=0, total=sum(map(len, steps.values())), unit='项',
+                 unplug='不要拔线、不要断电：正在写 F50 的启动分区')
         for stage in ('before', 'boot', 'trustos'):
-            for line in (session / f'stage-{stage}.txt').read_text().splitlines():
+            for line in steps[stage]:
                 if line.startswith('w '):   # written from the session directory, read back into it (path)
                     part, image = line.split()[1:]
                     say(f'writing {part}')
                     line = f'w {part} root-session/{image}'
                 fdl.send(line)
+                if PROGRESS:
+                    PROGRESS.advance(1)
             out = w.run([sys.executable, DP / 'scripts/f50-root-plan.py', 'check', session, stage], log='flash.log',
                         check=False)
             if out.returncode != 0 or f'READBACK_OK {stage}' not in out.stdout:
@@ -335,6 +373,7 @@ def flash(w, args):
     finally:
         fdl.close()
     say('rebooting into rooted Android (about 1 minute)')
+    progress(title='F50 重启进 Android', done=0, total=0, unplug='不要拔线：F50 正在重启（约 1 分钟）')
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
         connected = w.run(['adb', 'connect', ANDROID], log='adb.log', check=False, timeout=30).stdout
@@ -442,6 +481,7 @@ def openwrt(w, args):
         require(len(data) == size, f'{name} read back {len(data)} bytes')
         (w.f50 / f'preinstall-{name}.bin').write_bytes(data)
     say('installing OpenWrt on the SD card (several minutes)')
+    progress(note='正在把 OpenWrt 写进 SD 卡（几分钟，期间没有别的输出）')
     out = install(False)
     require(not re.search(r'^! ', out, re.M), 'installer stopped with an error: see logs/mu300-install.log; do not reboot')
     after = w.adb('exec-out', 'cat /dev/block/by-name/boot_b', binary=True)
@@ -451,8 +491,10 @@ def openwrt(w, args):
     password_file.chmod(0o600)
     password = parse_password(password_file.read_text())
     say('switching to OpenWrt (about 1 minute)')
+    progress(unplug='不要拔线：F50 正在切换到 OpenWrt（约 1 分钟）')
     arm_linux(w)
     if not wait_port(OPENWRT, 80, 300):
+        progress(unplug=None)
         action('拔下 F50 的 USB 线再插回电脑（让电脑重新取地址），然后等待。')
         require(wait_port(OPENWRT, 80, 300), f'OpenWrt not reachable at {OPENWRT}')
     wait_port(OPENWRT, 22, 60)
@@ -635,9 +677,12 @@ def main():
             q.add_argument('--sim', choices=('yes', 'no'), required=True)
             q.add_argument('--cn-149', action='store_true', help='CN, channel 149 (only where that is allowed)')
     args = p.parse_args()
+    global PROGRESS
     try:
         w = Work(args.work)
-        globals()[args.stage](w, args)
+        title, expected, unplug = STAGES[args.stage]
+        with Progress(w.root, f'f50-{args.stage}', title, expected=expected, unplug=unplug) as PROGRESS:
+            globals()[args.stage](w, args)
     except Stop as stop:
         print(f'F50_STOP {args.stage}: {stop}', flush=True)
         return 1

@@ -11,6 +11,8 @@ import time
 import setup_wizard
 
 HOTSPOT = 'uplink-hotspot.json'
+# Direct iPhone AP sharing the car's internet: the station's default route can come a moment after its address.
+GATEWAY_WAIT = 10
 
 
 def hotspot(state):
@@ -45,16 +47,39 @@ def start_shared_ap(platform, address, box, channel, width, wait_for, names=(), 
     platform.start_dhcp(address, False, names, upstream=upstream, query_log=query_log, router=router)
 
 
+class UnsuitableChannel(ValueError):
+    """The upstream's channel does not suit a direct hotspot beside it; the text says which and what to change."""
+
+
+def direct_channel_problem(freq, blocked, label='车机热点'):
+    """None when the box can open its hotspot on the upstream's channel (it must use the same one), else why not.
+    blocked: what the radio says of that channel for an AP (platform.ap_channel_problem), or None."""
+    channel = (freq - 2407) // 5 if freq < 3000 else (freq - 5000) // 5
+    fix = f'把{label}改成 5 GHz 的 36–48 或 149–165 信道，就能无线直连'
+    if freq < 3000:
+        # N1 at home 2026-10-17: on 2.4 GHz the picture came 9-12 s late with many frames lost
+        return f'{label}在 2.4 GHz（信道 {channel}），直连会很卡（实测延迟 9–12 秒、丢帧）。{fix}'
+    if blocked:
+        return f'{label}在 5 GHz 信道 {channel}，盒子不能在这个信道开热点（{blocked}）。{fix}'
+    return None
+
+
 class JoinedPhoneAP:
     """Opt-in device validation of a direct iPhone AP beside a car/MiFi station.
 
     Prepare before joining so the station and AP never share a MAC. The supervisor
     owns reconnect/fallback; a changed upstream channel rebuilds this whole lifecycle.
     No Tesla checks or own-name overrides are applied on the joined network.
+
+    share_internet (state/options.json "direct_phone_internet", off by default; the user, 2026-10-17: some cars come
+    with a data plan): the iPhone gets the box as router and DNS, and the box masquerades it out through the car
+    hotspot, so the iPhone's own internet check passes for real. Off, the iPhone gets no router and stays on its
+    cellular data. Its traffic shares the box's one Wi-Fi chip and channel with the CarPlay picture.
     """
-    def __init__(self, platform, address, box, wait_for):
+    def __init__(self, platform, address, box, wait_for, share_internet=False, label='车机热点'):
         self.platform, self.address, self.box, self.wait_for = platform, address, box, wait_for
-        self.prepared = self.active = False
+        self.share_internet, self.label = share_internet, label
+        self.prepared = self.active = self.sharing = False
         self.frequency = None
 
     def prepare(self):
@@ -73,7 +98,22 @@ class JoinedPhoneAP:
         self.frequency = p.frequency()
         if not self.frequency:
             raise RuntimeError('upstream has no channel')
-        upstream = p.uplink_gateway()
+        problem = direct_channel_problem(int(self.frequency), p.ap_channel_problem(int(self.frequency)), self.label)
+        if problem:
+            raise UnsuitableChannel(problem)
+        upstream = None
+        if self.share_internet:
+            seen = [None]
+
+            def routed():
+                seen[0] = p.uplink_gateway()
+                return seen[0]
+            try:
+                self.wait_for(routed, GATEWAY_WAIT, interval=0.5)
+            except TimeoutError:
+                pass   # no router on the car hotspot: the iPhone stays on its cellular data
+            upstream = seen[0] or p.uplink_gateway()
+        self.sharing = bool(upstream)
         if not p.add_phone_ap():
             raise RuntimeError('direct AP interface failed')
         if upstream:
@@ -94,7 +134,7 @@ class JoinedPhoneAP:
             for child in ('dnsmasq', 'hostapd'):
                 self.platform.stop_child(child)
             self.platform.cleanup_phone_uplink()
-        self.prepared = self.active = False
+        self.prepared = self.active = self.sharing = False
 
 
 class PhoneUplink:

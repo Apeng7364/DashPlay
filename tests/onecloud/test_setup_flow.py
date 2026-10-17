@@ -34,6 +34,117 @@ class SetupFlowTests(unittest.TestCase):
             self.answer('uplink', ssid='Phone', password='synthetic-uplink', uplink_phone='same' if same else 'other')
         self.answer('sound', value='no')
 
+    def test_network_step_shows_at_once_while_the_scan_runs_and_its_fields_are_visible(self):
+        # N1 2026-10-17: "next" to the car-hotspot step took seconds (the first list is two scans), and the box's
+        # fallback password row looked like a label (borderless input, no placeholder).
+        import threading
+        release, calls = threading.Event(), []
+        class Radio:
+            def scan_networks(self, own, ap=False):
+                calls.append(1); release.wait(5)
+                return [{'ssid': 'XPeng G6', 'band': '5', 'signal': -50}]
+        self.page.scanner = setup_wizard.Scanner('wlan0', 'DashPlay', lambda: 'ap', platform=Radio())
+        self.answer('vehicle', value='other')
+        self.answer('mode', value='car_hotspot')
+        html = self.page.render('')
+        self.assertIn('正在扫描附近的车机热点', html)
+        self.assertIn('<meta http-equiv=refresh content=2>', html)
+        self.assertNotIn('name=box_password', html, 'no form to lose what was typed on the reload')
+        self.assertIn('正在扫描', self.page.render(''), 'one scan at a time')
+        release.set()
+        for _ in range(100):
+            if not self.page.scanner.busy: break
+            threading.Event().wait(0.02)
+        self.assertEqual(len(calls), 2, 'the first list is still two scans')
+        html = self.page.render('')
+        self.assertIn('value="XPeng G6"', html)
+        self.assertNotIn('http-equiv=refresh', html)
+        self.assertIn('placeholder="至少 8 位" required minlength=8 maxlength=63 autocomplete=new-password', html,
+                      'no box password saved yet: a visible, required field')
+        # Rescan answers at once too; the page shows "scanning" until it is done.
+        # A list older than 20 s stays shown while a new scan runs for the next page.
+        release.clear(); self.page.scanner.at -= setup_wizard.SCAN_CACHE_SECONDS
+        self.assertIn('value="XPeng G6"', self.page.render(''))
+        self.assertTrue(self.page.scanner.busy)
+        self.assertIn('value="XPeng G6"', self.page.render(''), 'not "scanning" for a scan nobody asked for')
+        release.set()
+        for _ in range(100):
+            if not self.page.scanner.busy: break
+            threading.Event().wait(0.02)
+        # Rescan answers at once too; the page shows "scanning" until it is done.
+        release.clear()
+        self.assertEqual(self.answer('network-rescan'), ('go', '/?view=setup'))
+        self.assertIn('正在扫描', self.page.render(''))
+        release.set()
+
+    def test_car_hotspot_offers_the_direct_wireless_way_only_when_the_box_can(self):
+        # 2026-10-17: the direct iPhone hotspot is a normal choice; whether it is offered depends on the radio only.
+        def until_iphone():
+            self.answer('vehicle', value='other'); self.answer('mode', value='car_hotspot')
+            self.answer('network', ssid='Car', password='synthetic-car', box_password='synthetic-box')
+            self.answer('sound', value='no')
+        self.status['direct_capable'] = True
+        until_iphone()
+        html = self.page.render('')
+        self.assertIn('value="wireless"', html); self.assertIn('无线（iPhone 直连盒子热点）', html)
+        self.assertIn('36–48 或 149–165', html)
+        self.assertNotIn('只能用数据线', html)
+        self.answer('iphone', value='any')
+        self.assertIn('都行', self.page.render(''))
+        self.answer('summary', value='confirm')
+        self.assertIs(setup_wizard.options(self.state)['direct_phone'], True)
+        self.assertEqual(setup_wizard.load(self.state)['iphone'], 'any')
+        # A radio that cannot: the cable only, and why
+        (self.state / 'setup-draft.json').unlink(missing_ok=True)
+        setup_wizard.save(self.state, {'done': False, 'wizard_version': 2})
+        self.status['direct_capable'] = False
+        until_iphone()
+        html = self.page.render('')
+        self.assertNotIn('value="wireless"', html)
+        self.assertIn('不能同时连车机热点又开自己的热点', html)
+        with self.assertRaises(ValueError):
+            self.answer('iphone', value='wireless')
+
+    def test_settings_page_switches_for_the_direct_way_and_the_cars_internet(self):
+        setup_wizard.save(self.state, {'done': True, 'wizard_version': 2, 'confirmed': True, 'mode': 'car_hotspot',
+                                       'iphone': 'any', 'car': 'Car'})
+        self.status.update(direct_capable=True, direct_phone='iPhone 直连盒子热点（信道 149）')
+        html = self.page.iphone_preference(self.page.pairing.nonce)
+        self.assertIn('name=direct_phone value=1 checked', html, 'on by default on the car hotspot')
+        self.assertIn('name=direct_phone_internet value=1>', html, 'sharing the car\'s internet off by default')
+        self.assertIn('会抢带宽', html)
+        self.assertIn('class="banner ok', html)
+        self.page.apply('/direct', {'nonce': self.page.pairing.nonce, 'direct_phone': '1', 'direct_phone_internet': '1'})
+        chosen = setup_wizard.options(self.state)
+        self.assertEqual((chosen['direct_phone'], chosen['direct_phone_internet']), (True, True))
+        self.page.apply('/direct', {'nonce': self.page.pairing.nonce})
+        self.assertEqual(setup_wizard.options(self.state)['direct_phone'], False)
+        self.status.pop('direct_phone')
+        html = self.page.iphone_preference(self.page.pairing.nonce)
+        self.assertIn('name=direct_phone value=1>', html, 'turned off stays off')
+        self.assertIn('打开上面的「无线时 iPhone 直连盒子热点」就能用无线', html)
+        self.status['direct_capable'] = False
+        with self.assertRaises(ValueError):
+            self.page.apply('/direct', {'nonce': self.page.pairing.nonce, 'direct_phone': '1'})
+        self.assertNotIn('name=direct_phone', self.page.iphone_preference(self.page.pairing.nonce))
+
+    def test_the_box_can_go_direct_by_its_radio_and_an_n1_only_on_the_new_firmware(self):
+        from unittest.mock import Mock, patch
+        radio = Mock(); radio.concurrent_ap.return_value = 0
+        self.assertEqual(supervisor.direct_capable(radio)[0], False)
+        self.assertIn('不能同时连车机热点又开自己的热点', supervisor.direct_capable(radio)[1])
+        radio.concurrent_ap.return_value = 1
+        with patch.object(supervisor.board_phicomm_n1, 'direct_ready', return_value=False):
+            capable, why = supervisor.direct_capable(radio)
+        self.assertFalse(capable); self.assertIn('新无线固件', why)
+        with patch.object(supervisor.board_phicomm_n1, 'direct_ready', return_value=True):
+            self.assertEqual(supervisor.direct_capable(radio), (True, None))
+
+    def test_box_hotspot_password_fields_say_what_an_empty_one_means(self):
+        self.answer('vehicle', value='other'); self.answer('mode', value='no'); self.answer('mifi', value='box_hotspot')
+        html = self.page.render('')
+        self.assertIn('<b>热点密码</b>', html); self.assertIn('placeholder="至少 8 位" required', html)
+
     def test_summary_is_the_only_apply_and_passwords_never_render(self):
         self.assertIn('什么车', self.page.render(''))
         self.until_iphone('phone_hotspot')

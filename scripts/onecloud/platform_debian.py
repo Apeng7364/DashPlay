@@ -116,6 +116,19 @@ def supports_sta_ap(iw_list):
     return best
 
 
+def ap_channel_problem(iw_list, freq):
+    """From `iw list`: None when an AP may start on freq, else why not ("disabled", "no IR", "radar detection",
+    "not listed"). The N1 lists 52-64 and 100-144 as disabled (2026-10-17)."""
+    match = re.search(rf"\* {int(freq)}(?:\.0)? MHz \[\d+\]([^\n]*)", iw_list)
+    if not match:
+        return "not listed"
+    flags = match.group(1)
+    for flag in ("disabled", "no IR", "radar detection"):
+        if flag in flags:
+            return flag
+    return None
+
+
 def missed_on_known_freq(scan_results, ssid):
     """`wpa_cli scan_results` after scanning only last time's frequency: True when that scan found
     networks but not the car hotspot, i.e. the car moved channel (Xpeng: 149 one drive, 36 the next)."""
@@ -317,6 +330,9 @@ class DebianPlatform:
         """Channels a station and an AP may use at once: 0 none, 1 the same (rtw88 built by
         build-rtw88-concurrent.sh), 2 different ones (MT7921AU)."""
         return supports_sta_ap(subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout)
+
+    def ap_channel_problem(self, freq):
+        return ap_channel_problem(subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout, freq)
 
     def add_ap_interface(self):
         """Create AP_VIF beside the station; its MAC is the dongle's with the locally administered bit
@@ -572,6 +588,10 @@ class DebianPlatform:
         # heard as 1 s of music then 5 s of silence. The JVM uses the default, so raise it.
         for name in ("rmem_max", "rmem_default"):
             Path("/proc/sys/net/core", name).write_text(f"{4 * 1024 * 1024}\n")
+        # Phicomm N1: its Wi-Fi on the Cypress firmware (board_phicomm_n1.py); after a first change brcmfmac is
+        # reloaded, and the wait below brings the interface back.
+        import board_phicomm_n1
+        board_phicomm_n1.prepare(say=lambda text: print(text, flush=True))
         # The unit starts right after local-fs, possibly before udev has renamed the dongle.
         wait_for(lambda: Path(f"/sys/class/net/{self.interface}").exists(), 30)
         self.unique_wifi_address()

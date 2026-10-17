@@ -27,6 +27,7 @@ class PhoneUplinkTests(unittest.TestCase):
         self.p.start_ap.return_value = True
         self.p.connected.return_value = True
         self.p.ap_ready.return_value = True
+        self.p.ap_channel_problem.return_value = None
         self.now = 0
         self.status = {'tesla':True,'own_name':'example.duckdns.org'}
         self.receiver = Mock()
@@ -164,7 +165,10 @@ class JoinedPhoneAPTests(unittest.TestCase):
         self.assertEqual(direct.start(), 149)
         self.assertTrue(direct.active)
         self.assertEqual(self.p.start_dhcp.call_args.args[2], ())
-        self.assertEqual(self.p.start_dhcp.call_args.kwargs['upstream'], '192.0.2.1')
+        # Off by default: no router, no DNS, no NAT for the iPhone, even with a gateway upstream (its cellular data)
+        self.assertIsNone(self.p.start_dhcp.call_args.kwargs['upstream'])
+        self.p.enable_phone_nat.assert_not_called()
+        self.assertFalse(direct.sharing)
         self.assertEqual(handed_hotspot(self.state, False, direct=True), self.state/'hotspot.json')
         args = joined_receiver_network(self.state, ('192.0.2.8',149,'wpa3'), 'wlan-test', direct_address=self.u.address.ip)
         network = dict(zip(args[::2], args[1::2]))
@@ -182,6 +186,54 @@ class JoinedPhoneAPTests(unittest.TestCase):
         direct.close()
         self.p.cleanup_phone_uplink.assert_called_once()
         self.assertFalse(direct.active)
+
+    def test_sharing_the_cars_internet_routes_the_iphone_out_through_the_car_hotspot(self):
+        # 2026-10-17, the user: some cars have their own data plan; the iPhone's internet check must pass for real.
+        direct = JoinedPhoneAP(self.p, self.u.address, self.u.box, Mock(), share_internet=True)
+        direct.prepare(); direct.start()
+        self.p.enable_phone_nat.assert_called_once_with(self.u.address.network)
+        self.assertEqual(self.p.start_dhcp.call_args.kwargs['upstream'], '192.0.2.1', 'DNS forwarded upstream, the box as router')
+        self.assertTrue(direct.sharing)
+        direct.close()
+        self.p.cleanup_phone_uplink.assert_called_once()   # which takes the NAT rules and ip_forward back
+        self.assertFalse(direct.sharing)
+
+    def test_sharing_waits_for_the_default_route_and_without_one_the_iphone_keeps_its_own_data(self):
+        waits = []
+        def wait_for(predicate, seconds, interval=0.2):   # tries a few times, like the supervisor's within its seconds
+            waits.append(seconds)
+            if not any(predicate() for _ in range(3)): raise TimeoutError
+        gateways = iter([None, None, '192.0.2.1'])
+        self.p.uplink_gateway.side_effect = lambda: next(gateways)
+        direct = JoinedPhoneAP(self.p, self.u.address, self.u.box, wait_for, share_internet=True)
+        direct.prepare(); direct.start()
+        self.assertIn(10, waits)
+        self.assertTrue(direct.sharing, 'the route came within the wait')
+        self.p.uplink_gateway.side_effect = None; self.p.uplink_gateway.return_value = None
+        self.p.enable_phone_nat.reset_mock()
+        direct = JoinedPhoneAP(self.p, self.u.address, self.u.box, wait_for, share_internet=True)
+        direct.prepare(); direct.start()
+        self.p.enable_phone_nat.assert_not_called()
+        self.assertIsNone(self.p.start_dhcp.call_args.kwargs['upstream'])
+        self.assertFalse(direct.sharing)
+        self.assertTrue(direct.active, 'CarPlay goes on without it')
+
+    def test_a_channel_the_direct_hotspot_cannot_use_says_which_and_never_opens_it(self):
+        # 2026-10-17: on 2.4 GHz the N1's direct picture came 9-12 s late; 52-64 and 100-144 are disabled for its AP.
+        from phone_uplink import UnsuitableChannel
+        direct = JoinedPhoneAP(self.p, self.u.address, self.u.box, Mock())
+        direct.prepare()
+        self.p.frequency.return_value = 2437
+        with self.assertRaisesRegex(UnsuitableChannel, r'车机热点在 2.4 GHz（信道 6），直连会很卡.*36–48 或 149–165'):
+            direct.start()
+        self.p.frequency.return_value = 5500; self.p.ap_channel_problem.return_value = 'disabled'
+        mifi = JoinedPhoneAP(self.p, self.u.address, self.u.box, Mock(), label='随身 WiFi')
+        mifi.prepare()
+        with self.assertRaisesRegex(UnsuitableChannel, r'随身 WiFi在 5 GHz 信道 100，盒子不能在这个信道开热点（disabled）'):
+            mifi.start()
+        self.p.add_phone_ap.assert_not_called()
+        self.p.frequency.return_value = 5240; self.p.ap_channel_problem.return_value = None
+        self.assertEqual(direct.start(), 48)
 
     def test_unsupported_adapter_and_collision_cannot_start_a_second_ap(self):
         direct = JoinedPhoneAP(self.p, self.u.address, self.u.box, Mock())

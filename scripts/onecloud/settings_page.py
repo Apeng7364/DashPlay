@@ -28,6 +28,10 @@ from setup_flow import FirstSetup, iphone_choices, limitations, validation_table
 import diagnostics
 
 MAX_BODY = 4096
+# A phone shown the setup portal gets its connectivity checks answered "online" for this long (first-run setup).
+PORTAL_SEEN_SECONDS = 3600
+PIXEL = (b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,"
+         b"\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;")
 APPLY_DELAY = 2.0   # let the browser receive the reply before the service restarts its network
 CHECK_LOG_EVERY = 60   # s: one diag line per car connectivity check and reply, repeats counted into the next
 
@@ -127,9 +131,24 @@ class SettingsPage:
         self.scanner = scanner
         self.server = None
         self.checks_seen, self.checks_lock = {}, threading.Lock()
+        self.portal_seen = {}   # phone address -> when it was shown the setup portal
 
     def setup(self):
         return setup_wizard.load(self.state)
+
+    def direct_capable(self):
+        """The box can keep a joined hotspot and its own one for the iPhone at once (supervisor.direct_capable)."""
+        return bool(self.status().get('direct_capable'))
+
+    def networks(self):
+        """The scanned hotspots, or None while a scan runs (the page then shows "scanning" and reloads)."""
+        if not self.scanner:
+            return []
+        return self.scanner.listing() if hasattr(self.scanner, 'listing') else self.scanner.results()
+
+    def rescan(self):
+        if self.scanner:
+            self.scanner.refresh(fresh=True) if hasattr(self.scanner, 'refresh') else self.scanner.results(fresh=True)
 
     def apply_later(self, reason):
         threading.Timer(APPLY_DELAY, self.on_change, args=(reason,)).start()
@@ -164,9 +183,9 @@ class SettingsPage:
                     return self._send(reply[0], reply[1], "text/html", reply[2])
                 if not self._allowed():
                     return self._send(403, "forbidden")
-                target = page.captive_redirect(self.headers.get("Host", ""), self.path)
-                if target:
-                    return self._send(302, "", extra={"Location": target})
+                portal = page.portal_reply(host, self.path, self.client_address[0].removeprefix("::ffff:"))
+                if portal:
+                    return self._send(portal[0], portal[1], portal[2], portal[3])
                 if self.path == "/ca.crt" and page.ca_file.exists():
                     return self._send(200, page.ca_file.read_bytes(), "application/x-x509-ca-cert",
                                       {"Content-Disposition": 'attachment; filename="dashplay-ca.crt"'})
@@ -235,15 +254,36 @@ class SettingsPage:
         except OSError:
             pass
 
-    def captive_redirect(self, host, path):
-        """While captive, any other host or path (OS connectivity probes) is sent to the setup page."""
-        if not setup_wizard.captive(self.setup(), self.status().get("mode")):
+    def portal_active(self):
+        """The box hotspot during first-run setup: the open hotspot's first questions, and the whole one-question
+        setup until its summary is confirmed."""
+        setup, mode = self.setup(), self.status().get("mode")
+        return not self.managed and (setup_wizard.captive(setup, mode) or mode == "ap" and setup.get("wizard_version") == 2
+                                     and not setup.get("confirmed") and not setup.get("done"))
+
+    def portal_reply(self, host, path, client):
+        """(status, body, content type, headers) for a request that is not the setup page itself during first-run setup,
+        or None. Two users (2026-10-17): "next" often did nothing until they left and joined the Wi-Fi again - the setup
+        ran in the phone's captive-portal window, which the phone closes, leaving the Wi-Fi, once the user switches away.
+        So the window (any other name or path: the phones' checks) only shows the address to open in a browser, and
+        once it drew that page (its pixel), that phone's own checks pass: it keeps the Wi-Fi when the window closes."""
+        if not self.portal_active():
             return None
+        if path.split("?")[0] == "/portal-seen.gif":
+            with self.checks_lock:
+                self.portal_seen[client] = time.monotonic()
+            return 200, PIXEL, "image/gif", {}
         own = urllib.parse.urlsplit(self.home()).hostname
-        name = host.split(":")[0].lower()
+        name = host.split(":")[0].lower().rstrip(".")
         if name in (own, setup_wizard.MDNS_NAME) and path.split("?")[0] in ("/", "/ca.crt"):
             return None
-        return self.home()
+        with self.checks_lock:
+            seen = self.portal_seen.get(client)
+        if seen is not None and time.monotonic() - seen < PORTAL_SEEN_SECONDS:
+            online = setup_wizard.online_reply(name, path)
+            if online:
+                return online
+        return 200, ui.portal_page(self.home()), "text/html; charset=utf-8", {}
 
     def check_nonce(self, form):
         if not secrets.compare_digest(form.get("nonce", ""), self.pairing.nonce):
@@ -282,6 +322,16 @@ class SettingsPage:
         if path in ("/internet", "/iphone"):
             self.check_nonce(form)
             return self.save_connection(path, form)
+        if path == "/direct":
+            self.check_nonce(form)
+            if self.setup().get('mode') not in setup_wizard.JOINS or not self.direct_capable():
+                raise ValueError('只有连车机热点或随身 WiFi、且盒子网卡支持时才能直连。')
+            chosen = setup_wizard.options(self.state)
+            chosen['direct_phone'] = form.get('direct_phone') == '1'
+            chosen['direct_phone_internet'] = form.get('direct_phone_internet') == '1'
+            _save(self.options_file, chosen)
+            self.apply_later('direct phone changed')
+            return '已保存，约 1 分钟后生效，期间 CarPlay 会断一下。'
         if path == "/setup":
             self.check_nonce(form)
             return self.apply_setup(form)
@@ -307,8 +357,7 @@ class SettingsPage:
             self.check_nonce(form)
             action = form.get("action")
             if action == "rescan":
-                if self.scanner:
-                    self.scanner.results(fresh=True)
+                self.rescan()
                 return ""
             ssid, password = _car_credentials(form, _load(self.car_file) or {})
             _save(self.car_file, {"ssid": ssid, "passphrase": password})
@@ -508,7 +557,7 @@ class SettingsPage:
         if path == '/iphone':
             value = form.get('iphone')
             draft = dict(chosen, **setup)
-            if value not in [key for key, *_ in iphone_choices(draft)]:
+            if value not in [key for key, *_ in iphone_choices(draft, self.direct_capable())]:
                 raise ValueError('前面的需求只能使用数据线；请先修改网络来源。')
             setup_wizard.save(self.state, dict(setup, iphone=value))
         else:
@@ -546,8 +595,11 @@ class SettingsPage:
         rows += f'<form method=post action=/internet>{ui.hidden(nonce)}'
         for value, text in [('none', '不上网'), ('phone_hotspot', '借手机热点')]:
             rows += f'<label class=cell><input type=radio name=car_internet value={value}{" checked" if chosen["car_internet"]==value else ""}>{text}</label>'
-        rows += (f'<label class=cell>热点名称<input name=ssid value="{escape(saved.get("ssid", ""))}" maxlength=32 aria-label=手机热点名称></label>'
-                 '<label class=cell>热点密码<input type=password name=password minlength=8 maxlength=63 autocomplete=new-password aria-label=手机热点密码></label>')
+        rows += (f'<label class=cell><span class=main><b>热点名称</b></span><input type=text name=ssid value="{escape(saved.get("ssid", ""))}" '
+                 'maxlength=32 placeholder=手机热点名称 autocapitalize=off style="text-align:right" aria-label=手机热点名称></label>'
+                 '<label class=cell><span class=main><b>热点密码</b></span><input type=password name=password minlength=8 maxlength=63 '
+                 f'placeholder="{"留空沿用已保存的密码" if saved.get("passphrase") else "至少 8 位"}" autocomplete=new-password '
+                 'style="text-align:right" aria-label=手机热点密码></label>')
         for value, title in [('same', '同一部 iPhone（有线、无线均可）'), ('other', '另一部手机（无线组合未实测）')]:
             rows += f'<label class=cell><input type=radio name=uplink_phone value={value}{" checked" if chosen["uplink_phone"]==value else ""}>{title}</label>'
         rows += '<button class="cell action">保存</button></form>'
@@ -559,15 +611,31 @@ class SettingsPage:
         setup = self.setup()
         chosen = setup_wizard.options(self.state)
         draft = dict(chosen, **setup)
+        capable, mode = self.direct_capable(), setup.get('mode')
         direct_status = self.status().get('direct_phone')
-        rows = ui.banner(direct_status, 'wait') if direct_status else ''
+        rows = ui.banner(direct_status, 'ok' if direct_status.startswith('iPhone 直连') else 'wait') if direct_status else ''
         rows += f'<form method=post action=/iphone>{ui.hidden(nonce)}'
-        for key, title, text in iphone_choices(draft):
+        for key, title, text in iphone_choices(draft, capable):
             rows += (f'<label class=cell><input type=radio name=iphone value={key}{" checked" if setup.get("iphone")==key else ""}>'
                      f'<span class=main><b>{title}</b><span>{text}</span></span></label>')
         rows += '<button class="cell action">保存</button></form>'
-        if not setup_wizard.wireless(dict(setup, iphone='any'), chosen):
-            rows += ui.banner('当前网络需求只能用数据线。要用无线，请修改网络来源。', 'wait')
+        if mode in setup_wizard.JOINS and capable:
+            on = setup_wizard.direct_phone(chosen, capable, mode)
+            other = '数据线' if mode == 'car_hotspot' else '经随身 WiFi 连接'
+            rows += (f'<form method=post action=/direct>{ui.hidden(nonce)}'
+                     f'<label class=cell><input type=checkbox name=direct_phone value=1{" checked" if on else ""}>'
+                     '<span class=main><b>无线时 iPhone 直连盒子热点</b>'
+                     f'<span>不经{network_label(mode)}转发，画面更顺。{network_label(mode)}要在 5 GHz 的 36–48 或 149–165 信道；'
+                     f'2.4 GHz 或其他信道时自动改用{other}，上面会写明原因。</span></span></label>'
+                     f'<label class=cell><input type=checkbox name=direct_phone_internet value=1'
+                     f'{" checked" if chosen.get("direct_phone_internet") is True else ""}>'
+                     f'<span class=main><b>iPhone 用车机流量上网</b><span>只在直连时有效，默认关（关着时 iPhone 用自己的流量）。'
+                     f'iPhone 上网的数据和 CarPlay 画面走盒子同一块无线网卡、同一信道，会抢带宽；{network_label(mode)}没网或限速时，'
+                     'iPhone 上网会变慢，要等它自己切回蜂窝。</span></span></label>'
+                     '<button class="cell action">保存</button></form>')
+        if not setup_wizard.wireless(dict(setup, iphone='any'), chosen, capable) and not direct_status:
+            rows += ui.banner('这种方式只能用数据线。' + ('打开上面的「无线时 iPhone 直连盒子热点」就能用无线。'
+                                                    if mode == 'car_hotspot' and capable else '要用无线，请修改网络来源。'), 'wait')
         return rows
 
 
@@ -583,8 +651,7 @@ class SettingsPage:
         if setup.get("wizard_version") == 2 and not setup.get("confirmed"):
             raise ValueError("请使用一步一问的首次设置并确认配置总结。")
         if action == "rescan":
-            if self.scanner:
-                self.scanner.results(fresh=True)
+            self.rescan()
             return ""
         if action == "mode":
             mode = form.get("mode")
@@ -615,7 +682,7 @@ class SettingsPage:
             self.apply_later("setup box hotspot set")
             return ("page", self.reconnect_page(ssid, "正在打开盒子热点", first=True))
         if action == "finish" and step == "phone":
-            if setup.get("wizard_version") == 2 and setup_wizard.wireless(setup, setup_wizard.options(self.state)) and not self.pairing.devices():
+            if setup.get("wizard_version") == 2 and setup_wizard.wireless(setup, setup_wizard.options(self.state), self.direct_capable()) and not self.pairing.devices():
                 raise ValueError("选择了无线或都行，请先添加 iPhone；只用线可返回改为有线。")
             setup_wizard.save(self.state, dict(setup, done=True))
             return "设置完成。"
@@ -762,7 +829,7 @@ class SettingsPage:
         if trying:
             reason = setup_wizard.FAILURES.get(setup.get("failed"), setup_wizard.FAILURES["not_found"])
             failure = ui.banner(f"没有连上「{setup['car']}」。{reason}", "bad")
-        networks = self.scanner.results() if self.scanner else []
+        networks = self.networks()
         box = _load(self.hotspot_file) or {}
         extra = "" if box.get("passphrase") else ui.group(
             "盒子自己的热点", '<label class=cell>' + ui.LOCK + '<input type=password name=box_password placeholder="设置密码，至少 8 位" '
@@ -771,12 +838,12 @@ class SettingsPage:
         foot = ("盒子连车机热点，车机浏览器经它打开 CarPlay 画面。请先在车机上打开它的热点。"
                 if setup.get("mode") == "car_hotspot" else
                 "盒子、车机和 iPhone 都连这个随身 WiFi。请先打开随身 WiFi。")
-        picker = ui.network_picker(networks, setup.get("car") if trying else None, nonce, "car", "/setup", "连接",
-                                   foot, extra, label)
+        picker = ui.scanning(label) if networks is None else ui.network_picker(
+            networks, setup.get("car") if trying else None, nonce, "car", "/setup", "连接", foot, extra, label)
         body = (f'{self.back_link()}<h1>连接{label}</h1><p class=sub>首次设置：第 2 步，共 3 步</p>{notice}'
                 f'{ui.chain(("wait", label, "请选择"), ("off", "iPhone", "下一步"), "car" if label == "车机热点" else "hotspot")}'
                 f'{failure}{picker}')
-        return ui.page("首次设置", body)
+        return ui.page("首次设置", body, ui.SCANNING_RELOAD if networks is None else False)
 
     def wired_phase(self):
         return read_wired(self.wired_status)
@@ -787,7 +854,7 @@ class SettingsPage:
         mode = self.setup().get("mode")
         wired = self.wired_phase()
         waiting = wired in ("trust", "starting") or first and mode == "car_hotspot" and wired != "live"
-        if not setup_wizard.wireless(self.setup(), setup_wizard.options(self.state)):
+        if not setup_wizard.wireless(self.setup(), setup_wizard.options(self.state), self.direct_capable()):
             return ui.wired_block(wired, "iPhone 用数据线", "这种使用方式只能用数据线（有线 CarPlay）。"), waiting, {}, wired
         foot = ("插着数据线时用有线；拔掉后改用下面的无线。"
                 + ("无线卡顿或连不上时请用数据线：有的随身 WiFi 不让设备互相访问。" if mode == "mifi" else ""))
@@ -817,7 +884,7 @@ class SettingsPage:
         block, refresh, devices, wired = self.iphone_blocks(nonce, first=True)
         presence = self.pairing.presence()
         phase = self.pairing.status().get("phase", "closed")
-        needs_pair = setup_wizard.wireless(self.setup(), setup_wizard.options(self.state))
+        needs_pair = setup_wizard.wireless(self.setup(), setup_wizard.options(self.state), self.direct_capable())
         ready = bool(devices) if needs_pair else True
         finish = (f'<form method=post action=/setup>{ui.hidden(nonce)}'
                   f'<button class="{"btn" if ready else "btn plain"}" name=action value=finish>'
@@ -835,7 +902,10 @@ class SettingsPage:
         nonce = self.pairing.nonce
         car = _load(self.car_file) or {}
         label = network_label(self.setup().get("mode"))
-        networks = self.scanner.results() if self.scanner else []
+        networks = self.networks()
+        if networks is None:
+            return ui.page(label, f'<a class=back href="/">‹ 盒子设置</a><h1>{label}</h1>{notice}{ui.scanning(label)}',
+                           ui.SCANNING_RELOAD)
         picker = ui.network_picker(networks, car.get("ssid"), nonce, "save", "/car", "连接",
                                    "保存后盒子会切换过去；连不上时临时打开盒子自己的热点。" +
                                    ("密码留空表示沿用已保存的密码。" if car else ""), label=label)

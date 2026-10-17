@@ -32,7 +32,8 @@ import time
 
 from boxnet import ensure_leaf
 import debug_uplink
-from phone_uplink import PhoneUplink, JoinedPhoneAP
+from phone_uplink import PhoneUplink, JoinedPhoneAP, UnsuitableChannel
+import board_phicomm_n1
 from mdns_name import NameResponder
 import own_domain
 from settings_page import SettingsPage, network_label
@@ -46,6 +47,21 @@ LINK_LOSS_GRACE = 30   # seconds without the car hotspot before falling back
 RESCAN_EVERY = 60      # box-hotspot mode: look for the car hotspot when no station is attached
 BIND_WAIT = 120        # an early receiver waits this long for its address (CAR_WAIT + DHCP)
 WIRED_STATUS = RUN / "wired-status.json"   # written by the receiver, shown on the settings page
+
+
+def direct_capable(platform):
+    """(True, None) when the box can keep a station and its own hotspot at once for a direct iPhone (design 5.2a),
+    else (False, why, in words for the settings page). A Phicomm N1 only on the Cypress firmware (board_phicomm_n1)."""
+    try:
+        concurrent = platform.concurrent_ap()
+    except (OSError, subprocess.SubprocessError):
+        concurrent = 0
+    if not concurrent:
+        return False, '这台盒子的无线网卡不能同时连车机热点又开自己的热点，iPhone 只能用数据线。'
+    if not board_phicomm_n1.direct_ready():
+        return False, ('N1 没用上新无线固件（缺 /lib/firmware/cypress/cyfmac43455-sdio.bin 7.45.234），'
+                       '旧固件直连约 1 分钟就断流，iPhone 只能用数据线。')
+    return True, None
 
 
 def channel_of(freq_mhz):
@@ -285,6 +301,7 @@ def main():
     try:
         mark("supervisor start")
         platform.prepare(wait_for)
+        status["direct_capable"], why_not_direct = direct_capable(platform)
         platform.ensure_receiver_ipv6()
         light.show("starting")
         settings.start()
@@ -327,8 +344,14 @@ def main():
         if debug:
             car = debug
             print(f"remote debugging: joining the phone hotspot for {debug_uplink.remaining(RUN) / 60:.0f} min", flush=True)
-        # Opt-in validation path until real car-hotspot tests pass (design 6).
-        direct_requested = bool(car and not debug and options(state).get('direct_phone') is True)
+        # The iPhone on the box's own hotspot beside the joined one (design 5.2a): on by default for the car hotspot
+        # when the radio can (setup_wizard.direct_phone); the user made it a normal choice on 2026-10-17.
+        direct_requested = bool(car and not debug and setup.get('iphone') != 'wired' and
+                                setup_wizard.direct_phone(options(state), status["direct_capable"], use))
+        status.pop('direct_phone', None)
+        if use == 'car_hotspot' and not status["direct_capable"] and setup.get('iphone') != 'wired':
+            status['direct_phone'] = why_not_direct
+        fallback = '已改用数据线' if use == 'car_hotspot' else 'iPhone 改经随身 WiFi 连接'
         direct_active = False
         WIRED_STATUS.unlink(missing_ok=True)
         # The cable is always offered; wireless (Bluetooth handoff) except in car_hotspot mode.
@@ -359,13 +382,15 @@ def main():
             start("receiver", receiver_argv(predicted, wait=True))
             mark(f"receiver launched early for {predicted[0]}")
         if direct_requested:
-            direct_ap = JoinedPhoneAP(platform, address, hotspot, wait_for)
+            direct_ap = JoinedPhoneAP(platform, address, hotspot, wait_for,
+                                      share_internet=options(state).get('direct_phone_internet') is True,
+                                      label='车机热点' if use == 'car_hotspot' else '随身 WiFi')
             try:
                 if not direct_ap.prepare():
-                    status['direct_phone'] = '无线驱动不支持同时连接和开热点，保留原连接方式'
+                    status['direct_phone'] = f'无线网卡不能同时连热点又开热点，{fallback}。'
             except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
                 direct_ap.close()
-                status['direct_phone'] = '直连热点准备失败（' + type(error).__name__ + '），保留原连接方式'
+                status['direct_phone'] = f'直连热点准备失败（{type(error).__name__}），{fallback}。'
         joined = join_car_hotspot(car, remember=not debug) if car else None
         if direct_ap and direct_ap.prepared:
             if joined:
@@ -373,10 +398,16 @@ def main():
                     direct_ap.start()
                     direct_active = True
                     status['phone_interface'] = platform.ap_interface
-                    status['direct_phone'] = 'iPhone 直连盒子热点（待实车验证）；车机仍用上游地址'
+                    status['direct_phone'] = (f'iPhone 直连盒子热点（信道 {channel_of(direct_ap.frequency)}）' + (
+                        '；iPhone 经盒子用车机流量上网' if direct_ap.sharing else
+                        '；上游没有网关，iPhone 用自己的流量上网' if direct_ap.share_internet else ''))
+                except UnsuitableChannel as problem:
+                    direct_ap.close()
+                    status['direct_phone'] = f'{problem}。这次{fallback}。'
+                    joined = join_car_hotspot(car)
                 except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
                     direct_ap.close()
-                    status['direct_phone'] = '直连热点失败（' + type(error).__name__ + '），保留原连接方式'
+                    status['direct_phone'] = f'直连热点失败（{type(error).__name__}），{fallback}。'
                     joined = join_car_hotspot(car)
             else:
                 direct_ap.close()

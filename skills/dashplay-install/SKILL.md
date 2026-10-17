@@ -31,7 +31,8 @@ description: 帮完全不懂技术的用户把 DashPlay（网页 CarPlay）装�
 4. **CarPlay 认证文件**（`identity.pk8` 和 `certificate.p7b` 两个文件）：用户有就用用户的；没有就由你从 DiPlay 的发布包里取（步骤见“放认证文件”），先用一句话告诉用户这是很多人共用的实验身份、苹果可能让它失效、只供自己用。认证文件和任何密码不要打印到屏幕、不要上传到任何地方，电脑副本留在用户指定的私有目录；未经用户授权不要删除。
 5. 盒子的 SSH 默认用户名 `root`、密码 `1234`。装好后可以提议用户改密码（`passwd`），但不强制。
 6. 出错先自己查日志、排查（见“排错”），不要把报错原样丢给用户。
-7. **要电脑密码的命令**（如写 U 盘的 `sudo dd`）：你的命令环境通常没法输入密码。先说明这条命令做什么，用户同意后把完整命令单独给他，请他在「终端」App 里粘贴执行并输入密码，完成后你再核对结果。不要让用户把密码发给你。
+7. **要电脑密码的命令**（如写 U 盘）：你的命令环境通常没法输入密码。先说明这条命令做什么，用户同意后把完整命令单独给他，请他在「终端」App 里粘贴执行并输入密码，完成后你再核对结果。不要让用户把密码发给你。
+8. **长时间的步骤要让用户看得见进度**（有人等到第 8 分钟以为坏了，中途拔线）。开始前一句话说清：大约多久、这段时间能不能拔线或断电。`install-image.py`、`f50-install.py`、`fetch-install-assets.py` 每 15 秒打印一行进度，并持续写 `$WORK/progress/<步骤>.json`（`percent` 百分比、`eta_s` 约还要几秒、`safe_to_unplug` 现在能不能拔、`unplug` 拔了会怎样、`note` 最近一条记录；完整记录在同名 `.log`）。你的工具要等命令结束才显示输出、或有时长上限时，把命令放到后台运行，每 30–60 秒读一次这个文件，用一句话告诉用户（如「写 U 盘 41%，约还要 3 分钟；现在拔 U 盘只需要重写」），`safe_to_unplug` 为 false 时每次都提醒不要拔。用户在自己的「终端」里运行（sudo）时，你同样读这个文件跟进。超过通常时长不算失败：进度或 `note` 还在变就继续等；超过通常时长 2 倍且没有任何变化，才按出错排查，排查时也不要叫用户拔线。
 
 ## 第 0 步：问清楚
 
@@ -39,7 +40,7 @@ description: 帮完全不懂技术的用户把 DashPlay（网页 CarPlay）装�
 
 1. **Q1 买的是哪种设备？** N1 / 玩客云 / F50 / 已有 OpenWrt 路由器，决定下面的安装路线。
 2. **Q2 什么品牌和车型？** 记下答案，用于套用已知适配，不以品牌划分网络路线。特斯拉启用专用模式：共享地址段、仅在方式三无上游时代答联网检查、显示全屏按钮；已知它不能开热点。未知车型按实际能力确认，不因为“不肯连无网 WiFi”就盲开特斯拉模式。
-3. **Q3 车机能自己开热点吗？** N1 / 玩客云先问这一件事：能 → 方式一，盒子连车机热点（无线经车机中转实测较卡，建议有线；当前正式选项只提供有线）。不能、只能连 WiFi → 下一问「有没有随身 WiFi？」；有 → 方式二，盒子、车机、iPhone 都连它；没有 → 方式三，车机连盒子热点，再问 Q5。已知车型的能力直接说明并沿用，不重复追问。特斯拉的随身 WiFi 必须支持把 LAN 改到 `100.96.0.1/24`，不支持就引导方式三，不能自动改用户的路由器。方式一、二再问热点名、让用户在设置页输入密码；方式三设置盒子热点名和密码。
+3. **Q3 车机能自己开热点吗？** N1 / 玩客云先问这一件事：能 → 方式一，盒子连车机热点（N1 盒子网卡支持时 iPhone 无线直连盒子自己的热点（不经车机热点转发）；车机热点要在 5 GHz 的 36–48 或 149–165 信道，2.4 GHz 或 52–144 等盒子开不了热点的信道时自动改用有线并在设置页写明是哪个信道；网卡不支持的盒子只能有线）。不能、只能连 WiFi → 下一问「有没有随身 WiFi？」；有 → 方式二，盒子、车机、iPhone 都连它；没有 → 方式三，车机连盒子热点，再问 Q5。已知车型的能力直接说明并沿用，不重复追问。特斯拉的随身 WiFi 必须支持把 LAN 改到 `100.96.0.1/24`，不支持就引导方式三，不能自动改用户的路由器。方式一、二再问热点名、让用户在设置页输入密码；方式三设置盒子热点名和密码。
    **F50 / OpenWrt 改问「插了能上网的 SIM 卡吗？」** F50 插卡则用 SIM；没有则进入 Q5。普通 OpenWrt 路由器同样核实其真实 WAN 来源，不把以太网误当 SIM。F50 使用无线 CarPlay；其他路由器有线取决于 USB 主机口。
 4. **Q5 连着盒子时，车机自己还要能上网吗？** 所有车在方式三无上游或 F50 无卡时都问；B 是通用功能，不以特斯拉开关为条件。
    - 不需要：特斯拉走方案 A，其他车保持普通无网热点，不代答联网检查。对特斯拉明确说「连着 DashPlay 时，特斯拉自带音乐、地图不能联网，CarPlay 正常，iPhone 用自己的流量」。特斯拉不会因此转去用 4G。
@@ -47,9 +48,9 @@ description: 帮完全不懂技术的用户把 DashPlay（网页 CarPlay）装�
    - **F50 无卡只有「不需要上网」**：当前驱动不能同时连别人的热点和开自己的热点，不提供 B；要上网就插能用的 SIM 卡。也不能让特斯拉直接连手机热点访问 F50（手机热点私网地址被拦）。
 5. **Q6 用自己的网址吗？** 特斯拉必问；其他车在打不开画面时问。推荐免费 DuckDNS 正式证书，这是特斯拉已验证的路线；说明「回家给盒子插网线，申请一次证书」，之后按期联网续签。用户愿意时按下文带他注册、自己填 token；不愿意可试 IP，但证书警告有没有「继续」尚未实车确认，不保证能用。
 6. **Q7 音乐、通话、Siri 走车机蓝牙吗？** 特斯拉默认是；其他车按需。偏好不确定可选「都行」，按车的默认值，说明要把 iPhone 蓝牙连车机并选为媒体来源。
-7. **Q4 iPhone 用数据线还是无线？** 最后问，默认「都行，能用就行」，只展示前面条件允许的选项：方式一只能有线；方式二、A、B 可选有线/无线/都行（B 同一 iPhone 无线在家通过，另一手机组合未测）；F50 选无线。两种都可且选都行时，插线用有线、拔线用无线。说明是哪一需求排除了无线，允许返回修改该需求。会用无线时必须添加 iPhone，只用有线可跳过。
+7. **Q4 iPhone 用数据线还是无线？** 最后问，默认「都行，能用就行」，只展示前面条件允许的选项：方式一在盒子支持直连时可选有线/无线/都行（无线即 iPhone 直连盒子热点；设置页显示「不能同时连车机热点又开自己的热点」时只能有线），是否支持只看盒子网卡和车机热点的频段、信道，不看车型；方式二、A、B 可选有线/无线/都行（B 同一 iPhone 无线在家通过，另一手机组合未测）；F50 选无线。两种都可且选都行时，插线用有线、拔线用无线。说明是哪一需求排除了无线，允许返回修改该需求。会用无线时必须添加 iPhone，只用有线可跳过。
 
-**能力分支核对**：与教程选择图一致：浏览器 + WiFi → 设备 → F50 的 SIM，或 N1 / 玩客云的「能开热点 → 方式一；不能 → 有随身 WiFi → 方式二；没有 → 方式三 → 要不要上网」。品牌只补已知适配。未知车型另外确认是否接受无网 WiFi、浏览器能否打开局域网地址、出 P 挡是否断 WiFi；遇到失败按下面 ①～⑧ 定位，不先让用户做全套改动。维护本 Skill 时对照设计仓库 `docs/视频教程规划-20261015.md` 图 2（安装用户不需要这份内部文档）。设计 5.2a 的盒子直连热点做成并实测前，保留方式一建议有线；通过后再开放无线，不把手机热点实验当作车机热点验收。
+**能力分支核对**：与教程选择图一致：浏览器 + WiFi → 设备 → F50 的 SIM，或 N1 / 玩客云的「能开热点 → 方式一；不能 → 有随身 WiFi → 方式二；没有 → 方式三 → 要不要上网」。品牌只补已知适配。未知车型另外确认是否接受无网 WiFi、浏览器能否打开局域网地址、出 P 挡是否断 WiFi；遇到失败按下面 ①～⑧ 定位，不先让用户做全套改动。维护本 Skill 时对照设计仓库 `docs/视频教程规划-20261015.md` 图 2（安装用户不需要这份内部文档）。方式一的无线直连：设置页 iPhone 分组有「无线时 iPhone 直连盒子热点」（支持时默认开）和「iPhone 用车机流量上网」（默认关；iPhone 上网的数据和 CarPlay 画面抢同一块网卡、同一信道）；直连没开起来时，iPhone 分组顶部写明原因（哪个频段或信道、网卡不支持），照着告诉用户，不要自己改驱动或强开。
 
 **配置总结，确认或返回修改后才生效**：逐项列出答案及网段、盒子热点、联网检查、车机上网来源、iPhone 连接与声音；列出代价和下面的实测状态。不要把「都行」默认为跳过无线配对。总结确认不替代刷盘等具体破坏性动作的授权。
 
@@ -61,6 +62,8 @@ description: 帮完全不懂技术的用户把 DashPlay（网页 CarPlay）装�
 | N1 / 玩客云 + 特斯拉 A | N1 2026-10-15 手工方案有线/无线通过；正式版本待复测，玩客云未测 |
 | N1 / 玩客云 + 特斯拉 B | N1 手工方案有线实车通过，同一 iPhone 热点 + 无线在家通过；正式功能需复测，2.4 GHz 与另一手机热点 + 无线未测 |
 | N1 / 玩客云 + 特斯拉方式二 | 未实车验证，照常配置并记录结果 |
+| N1 方式一 + iPhone 无线直连盒子热点 | 新固件（Cypress 7.45.234，程序自动启用）在家直连 13 分钟零断流、画面延迟 15–30 ms；旧固件约 1 分钟断流；上游 2.4 GHz 延迟 9–12 秒不可用（自动改有线）；未上车，小鹏待测 |
+| 玩客云方式一 + 无线直连 | 未实测：只有并发版 rtw88 驱动报告「同时连热点又开热点」时才会提供 |
 | 其他车方式一 / 二 / 三 | 按该车型已有记录，无记录写未测 |
 
 确认后再逐个核实安装前置：电脑系统（玩客云刷机需 Windows）、认证文件是否已有及私有位置。然后按设备章节执行，先用一句话说明安装步骤与需要用户插拔的动作。
@@ -98,7 +101,7 @@ Test-Path "$DP/scripts/fetch-install-assets.py"
 
 Mac 的 N1 ADB 前置（F50 不用这段：`f50-install.py check` 会自己下载固定版本的 ADB，Mac、Windows 都一样）：先 `command -v adb; command -v fastboot` → 两者存在；缺少时执行 `python3 "$DP/scripts/fetch-install-assets.py" adb-mac "$WORK/adb"`，再 `unzip "$WORK/adb/platform-tools-darwin.zip" -d "$WORK/adb"`、`export PATH="$WORK/adb/platform-tools:$PATH"`、`adb version`、`fastboot --version` → 摘要通过、版本命令成功 → 否则停止。Linux/Windows 原厂 N1 路线需已有可工作的 ADB/fastboot；没有则停下明确换用本段支持的 Mac，不能临时找不明驱动包。
 
-解压镜像：把 `$IMAGE_XZ` 设为下载的 `.xz` 绝对路径，执行 `python3 -c "import lzma,shutil,sys; p=sys.argv[1]; a=lzma.open(p,'rb'); b=open(p[:-3],'xb'); shutil.copyfileobj(a,b); b.close(); a.close()" "$IMAGE_XZ"`（Windows 用 `python`）→ 退出 0、同目录出现去掉 `.xz` 后缀的镜像 → 失败保留现场，不拿部分文件刷写；目标已存在时先核对来源，不覆盖用户文件。
+解压镜像：把 `$IMAGE_XZ` 设为下载的 `.xz` 绝对路径，执行 `python3 "$DP/scripts/install-image.py" --work "$WORK" unpack "$IMAGE_XZ"`（Windows 用 `python`；约 1–3 分钟，有进度）→ `UNPACK_OK <镜像> <字节数>`、同目录出现去掉 `.xz` 后缀的镜像 → 失败保留现场，不拿部分文件刷写（没解完的是 `.part`）；目标已存在时先核对来源，不覆盖用户文件。
 
 固定前置下载的项目作者地址与 SHA-256 在 [downloads.json](downloads.json)（与 skill 同目录）；`python3 "$DP/scripts/fetch-install-assets.py" <组名> <目录>` 下载并逐项验证，输出 `SHA256_OK` 才可执行。`n1` 是社区保存的 2.19 分区镜像，`onecloud` 是教程作者保存的 Amlogic 工具，均**不是厂商认证的官方分发**；不要隐瞒来源。哈希用于固定本次审阅的文件，不等于厂商签名。用户要求只用厂商官方镜像时停下问用户，这两项没有已核实可用的厂商官方直链。
 
@@ -125,7 +128,7 @@ N1/玩客云刷机包：只改程序的补丁版不带刷机包（发布说明�
 2. 从已校验包提取升级器：`mkdir "$WORK/upgrader"`；`python3 -c "import tarfile,sys,pathlib; t=tarfile.open(sys.argv[1]); m=next(x for x in t.getmembers() if x.name.removeprefix('./')=='firmware/upgrade.py' and x.isfile()); pathlib.Path(sys.argv[2]).write_bytes(t.extractfile(m).read())" "$BUNDLE" "$WORK/upgrader/upgrade.py"`；`scp "$BUNDLE" root@<盒子IP>:/tmp/dashplay-bundle.tar`；`scp "$WORK/upgrader/upgrade.py" root@<盒子IP>:/tmp/upgrade.py` → 上传成功、远端 `sha256sum /tmp/dashplay-bundle.tar` 与发布摘要一致 → 不同停止重传。
 3. `ssh root@<盒子IP> 'python3 /tmp/upgrade.py /tmp/dashplay-bundle.tar --dry-run'` → 只列程序替换/删除，不能出现 state/identity/service.json → 异常停止。实际执行：
    `ssh root@<盒子IP> 'systemd-run --unit=dashplay-upgrade --collect python3 /tmp/upgrade.py /tmp/dashplay-bundle.tar'`
-   → 升级在独立 systemd 任务运行，SSH 断开不会杀掉它；WiFi 会重启。1–2 分钟后重连同一地址并看 `cat /opt/dashplay/state/upgrade.log; systemctl is-active dashplay` → `upgrade done; service up` 和 `active`，设置页显示已设置而非首次引导，原热点密码能连接。
+   → 升级在独立 systemd 任务运行，SSH 断开不会杀掉它；WiFi 会重启。先告诉用户这 1–2 分钟热点会断一下，不要拔电（失败会自动回到上一版）。1–2 分钟后重连同一地址（可用 `install-image.py wait <地址> 22 --expect 90` 等）并看 `cat /opt/dashplay/state/upgrade.log; systemctl is-active dashplay` → `upgrade done; service up` 和 `active`，设置页显示已设置而非首次引导，原热点密码能连接。
 4. 用升级前备份与升级后的文件比对：`state/setup.json`、`state/options.json`（原来存在才比）、`service.json`、identity 两文件和 `state/receiver/*pair*`。Java `.properties` 文件可能只刷新 `#` 注释中的时间；忽略注释后键值必须相同。日志、缓存不要求相同。实际让已配对 iPhone 连接并在电脑打开 `https://<盒子IP>:18443/` → 出真实画面才记“出画通过”；`sessionActive=false` 或仅设置页成功不能算出画。
 5. 失败：先读 `state/upgrade.log` 和 `state/logs/<本次启动>/receiver.log`。检查失败/服务起不来时脚本会尝试自动恢复上一版程序；手动回退：`ssh root@<盒子IP> 'systemd-run --unit=dashplay-rollback --collect python3 /tmp/upgrade.py --rollback'` → 再核对服务和画面。`/opt/dashplay-previous.tar` 只保留上一版程序，不替代电脑里的完整数据备份；回退失败停止，不重新刷机覆盖数据。
 
@@ -140,19 +143,13 @@ N1/玩客云刷机包：只改程序的补丁版不带刷机包（发布说明�
 
 N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
 
-1. **下载**：按“下载工具与校验”找到最近带刷机包的版本，下载 `DashPlay_n1-<版本>.img.xz` 和同名 `.sha256`，校验并解压出 `.img`。
+1. **下载**：按“下载工具与校验”找到最近带刷机包的版本，用 `python3 "$DP/scripts/install-image.py" --work "$WORK" download <镜像地址> "$WORK/dl"` 下载（约 600 MB，网络慢时十几分钟，有进度；断了再运行同一条会接着下）→ `SHA256_OK DashPlay_n1-<版本>.img.xz`（它连同名 `.sha256` 一起下载并核对），再按上面「解压镜像」解压出 `.img`。
 2. **写 U 盘**（8 GB 以上，会清空）：
    **请把一个不用的 U 盘插到电脑上。**
-   - macOS：`diskutil list external` 找到 U 盘（核对容量），请用户确认是 `/dev/diskN`；然后 `diskutil unmountDisk /dev/diskN` 并执行 `sudo dd if=DashPlay_n1-<日期>.img of=/dev/rdiskN bs=4m`（要电脑密码；你的终端输不了密码时按规则 7 请用户在「终端」App 执行，下面的读回核对同样处理）。`dd` 退出 0 后，把下列代码保存为 `$WORK/check-usb.py`，执行 `sudo python3 "$WORK/check-usb.py" <镜像绝对路径> /dev/rdiskN` → `USB_READBACK_OK` 才执行 `diskutil eject /dev/diskN`；读取错误或不一致停止，不拿它启动盒子。
-     ```python
-     import sys
-     with open(sys.argv[1], 'rb') as src, open(sys.argv[2], 'rb') as disk:
-         while data := src.read(4 * 1024 * 1024):
-             if disk.read(len(data)) != data:
-                 raise SystemExit('STOP: USB readback differs')
-     print('USB_READBACK_OK')
-     ```
-   - Linux：`lsblk` 找到 U 盘并确认，`sudo dd if=… of=/dev/sdX bs=4M conv=fsync status=progress`。
+   - macOS：`diskutil list external` 找到 U 盘（核对容量），请用户确认是 `/dev/diskN`。写入和读回核对是一条命令（约 3–8 分钟写、1–3 分钟读回，每 15 秒一行进度）：
+     `sudo "<python3 的绝对路径>" "<DP 的绝对路径>/scripts/install-image.py" --work "<WORK 的绝对路径>" write-usb "<镜像的绝对路径>" /dev/diskN`
+     要电脑密码，按规则 7 把这条命令（路径都换成实际的绝对路径，`command -v python3` 查 Python；sudo 下不能用 `$WORK` 这类变量）给用户在「终端」App 执行，你在旁边读 `$WORK/progress/usb-write.json` 和 `usb-readback.json` 报进度。它自己卸载 U 盘、写完读回逐字节核对、最后弹出；遇到电脑内置硬盘、系统盘、分区或容量比镜像小的盘会直接拒绝。→ `USB_WRITE_OK` 和 `USB_READBACK_OK` → `STOP:` 开头时把原因告诉用户，读回不一致就换一个 U 盘重写，不拿它启动盒子。这期间拔 U 盘只需重写，不伤 N1。
+   - Linux：`lsblk` 找到 U 盘并确认，同样 `sudo "<python3 的绝对路径>" "<DP>/scripts/install-image.py" --work "<WORK>" write-usb "<镜像>" /dev/sdX` → `USB_WRITE_OK`、`USB_READBACK_OK`。
    - Windows：没有安全的命令行方式，请用户安装 balenaEtcher（或 Rufus），你告诉他选哪个文件、哪个 U 盘。
 3. **从 U 盘启动**。先读用户已经说明的起点（已有 Linux、斐讯原厂 ≤2.19、斐讯原厂 >2.19），已明确就直接走对应分支，不再重复问系统类型。只说“原厂高于 2.19”但没给精确版本时，只补问版本号；两条原厂路线都注明“来自公开实践，本项目未实测”。起点没说明时才问：**现在开机看到的是 Linux（Armbian/OpenWrt）、斐讯原厂界面、安卓电视桌面，还是根本起不来？** 不把所有“刷过系统”都当成 Linux。
    - **Linux**（2026-10-14 实测：已有 Armbian、内核 6.12.111-ophub）：先记录当前可用的 SSH 地址、登录方法和网卡 MAC；不能登录就停下补齐，不能假设旧系统密码也是 1234。
@@ -168,14 +165,16 @@ N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
      4. 获得清楚的降级授权后，**请用双公头 USB 线连接电脑与 N1 靠 HDMI 的 USB 口。** 执行 `adb -s <IP>:5555 shell reboot fastboot`，再 `fastboot devices` → 恰好一台设备标为 fastboot → 没设备先查数据线/驱动，多台先让用户断开无关设备，禁止猜序列号。
      5. 在 `$WORK/n1-downgrade` 依次执行 `fastboot flash bootloader bootloader.img` → Sending/Writing 均 OKAY；`fastboot flash boot boot.img` → 均 OKAY；`fastboot flash recovery recovery.img` → 均 OKAY；**任一步失败即停止，不继续写，不换包盲试。** 全过再 `fastboot reboot`。降级只换三个引导分区，界面版本可能不变，不以界面仍显示高版本判为失败。
      6. 原厂重新起来后，拔掉双公头线，重新 `adb connect <IP>:5555`。**请把已写好的 U 盘拿在手里，靠 HDMI 的 USB 口先留空。** 执行 `adb -s <IP>:5555 shell reboot update` 后单独提示用户立刻插 U 盘 → 出现 DashPlay WiFi 后先做下一步连网，再用 SSH 验收；不能只看斐讯 Logo。2 分钟还只有原厂后台：保留屏幕/启动状态，查 U 盘校验、端口与引导版本，不循环乱刷。
-   第一次从 U 盘开机约 1–2 分钟，会出现名叫 `DashPlay` 的 WiFi（没有密码）。
-4. **连上盒子**：让电脑连 WiFi `DashPlay`（macOS 可以用 `networksetup -setairportnetwork <WiFi 接口> DashPlay`，接口名用 `networksetup -listallhardwareports` 查；先问用户可不可以切换电脑的 WiFi；切换后电脑暂时不能上网，所以下载都要在这之前做完）。盒子地址固定 `192.168.78.1`：`ssh root@192.168.78.1`（密码 `1234`）。
+   第一次从 U 盘开机约 1–2 分钟（期间会自动扩展 U 盘空间），会出现名叫 `DashPlay` 的 WiFi（没有密码）。先告诉用户这 2 分钟里屏幕和灯可能没变化、是正常的；超过 4 分钟还没有热点再排查，不要叫用户反复拔电。
+4. **连上盒子**：让电脑连 WiFi `DashPlay`（macOS 可以用 `networksetup -setairportnetwork <WiFi 接口> DashPlay`，接口名用 `networksetup -listallhardwareports` 查；先问用户可不可以切换电脑的 WiFi；切换后电脑暂时不能上网，所以下载都要在这之前做完）。盒子地址固定 `192.168.78.1`：`ssh root@192.168.78.1`（密码 `1234`）。电脑连上热点后、盒子还在启动时，可以用 `python3 "$DP/scripts/install-image.py" --work "$WORK" wait 192.168.78.1 22 --expect 60 --title 等盒子 SSH` 等它（每 15 秒一行，→ `BOX_UP`；`BOX_TIMEOUT` 再排查）。
    再执行 `ssh root@192.168.78.1 'findmnt -no SOURCE /; test -d /opt/dashplay && echo DASHPLAY_PRESENT'` → 根设备为 `/dev/sd…` 的 USB 分区、`DASHPLAY_PRESENT` → 若是 `/dev/mmcblk…` 或目录不存在，不能宣称 U 盘启动成功，先查启动来源，不运行内置安装。
 5. **装进内置存储**（未完成本轮实测；以后不用插 U 盘，会清空 N1 原来的系统）：先完成 USB 路线的首次设置与真实 iPhone 出画，再执行 `findmnt -no SOURCE /; lsblk -o NAME,SIZE,MODEL,FSTYPE,MOUNTPOINT` → 根目录仍在 USB、内置 eMMC 与 USB 的名称容量明确区分 → 备份内置系统及用户数据到电脑并核对，告诉用户具体 eMMC 目标/容量/覆盖范围，取得当次同意。目标不清、备份失败或用户暂缓出画时停在这里，不提前写内置盘。
    再执行
-   `ssh root@<当前已验证的盒子IP> "printf '101\n1\n' | armbian-install"`（机型 101 = Phicomm N1，文件系统 1 = ext4）。看到成功后：
+   先告诉用户：**接下来约 3–6 分钟在往 N1 内置存储里写系统，这期间绝对不要拔电**（拔了内置系统起不来，要再插 U 盘救回）。安装作为盒子上的独立任务运行，电脑和盒子的 SSH 断了也不会中断（机型 101 = Phicomm N1，文件系统 1 = ext4）：
+   `ssh root@<当前已验证的盒子IP> 'rm -f /root/emmc-install.log; systemd-run --unit=dashplay-emmc -p RemainAfterExit=yes -p StandardInputText="101\n1\n" -p StandardOutput=file:/root/emmc-install.log -p StandardError=file:/root/emmc-install.log armbian-install'`
+   然后每 30–60 秒看一次 `ssh root@<盒子IP> 'systemctl show -p ActiveState -p SubState -p ExecMainStatus dashplay-emmc; tail -n 3 /root/emmc-install.log'`，把已用时间和最后一行告诉用户，每次都提醒不要拔电 → `SubState=running` 还在装；`ActiveState=active`、`SubState=exited`、`ExecMainStatus=0` 且日志末尾是成功 → 装好了；`ActiveState=failed` 或状态非 0 → 停下，读完整 `/root/emmc-install.log`，**不要拔电、不要重启**，先排查。看到成功后：
    **请拔掉 N1 的电源，拔下 U 盘，再接上电源。**
-   保留首次设置时的热点名称/密码及当前 SSH 地址，不能假设仍是无密码 DashPlay 或 192.168.78.1。约 1–2 分钟后连已保存的热点（方式一/二连原上游 WiFi），使用当前地址 SSH；方式三开特斯拉后地址是 100.96.0.1，方式一/二 DHCP 地址变化则从上游路由器租约中按已记录 MAC 重新确认。连不上就停下，不盲目再次安装。用户想一直从 U 盘运行也可以跳过这一步。
+   保留首次设置时的热点名称/密码及当前 SSH 地址，不能假设仍是无密码 DashPlay 或 192.168.78.1。约 1–2 分钟后（可用上面的 `install-image.py wait <地址> 22 --expect 120` 等）连已保存的热点（方式一/二连原上游 WiFi），使用当前地址 SSH；方式三开特斯拉后地址是 100.96.0.1，方式一/二 DHCP 地址变化则从上游路由器租约中按已记录 MAC 重新确认。连不上就停下，不盲目再次安装。用户想一直从 U 盘运行也可以跳过这一步。
 6. USB 验收先去“放认证文件”和“首次设置与上车”；通过后若用户选择安装 eMMC，返回第 5 步。eMMC 启动后再次 `findmnt -no SOURCE /` → `/dev/mmcblk…`，然后复验设置保留及真实出画；不以热点出现代替。
 
 ## 玩客云
@@ -187,6 +186,7 @@ N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
    - 以前刷过 Armbian 等系统的玩客云，也照这样线刷（DashPlay 刷机包整片覆盖）。
    - 原厂机通常需要拆壳短接，已刷过可进烧录模式的机器不一定要再次短接。按上述原作者的 [整板照片](https://attachment.soulteary.com/2025/01/08/boards.jpg) 和 [短接标注图](https://attachment.soulteary.com/2025/01/08/short-circuit.jpg) 逐点核对：V1.0 是无 SD 槽旁 V1.3 标记的旧板，短接点在背面白色线框附近；V1.3 的 SD 槽旁有明显 V1.3，点在带主芯片一面 RX 标记附近未焊焊盘。只凭“附近”不能动手：AI 打开原文两幅对应板型图片，与用户主板照片核对两点。图打不开、点位不一致、丝印不是这两种或用户不会认，**停下问用户要清晰板照**；不要猜引脚，更不能让用户“自己查好再试”。
    **请用双公头 USB 线把玩客云远离网口的那个 USB 口（刷机口）接到电脑，短接主板上的两个触点，同时接上电源；工具里出现设备后松开，点「开始」。**
+   开始前告诉用户：烧录约 5–10 分钟，工具里的进度条会先停在前几个百分点（擦除、校验），然后慢慢走；**看到 `100%: Burning successfully` 之前不要拔线、不要断电、不要关工具**，进度条几分钟不动也先别动，截图发给你。
    → 工具必须显示 `100%: Burning successfully` → 失败保留错误码和进度，停止，不反复短接/换固件。成功后点停止，再拔 USB 与电源。
 3. **第一次开机**：
    **请把 USB 无线网卡插到玩客云靠近网口的 USB 口（不是刚才刷机用的口），接上 12 V 电源。**
@@ -207,7 +207,7 @@ N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
 
 **全程用仓库里的 `scripts/f50-install.py`，一步一条命令，不要自己另写脚本代替它。** 备份、写入、两槽读回核对、装 OpenWrt、装插件和蓝牙的检查都在里面，这些检查就是本节原来的手工步骤。你的工作是：每条命令前把要用户做的事讲清楚、等用户说好，再运行，把结果转告用户。
 - 每条命令最后一行是 `F50_OK <步骤>`（成功，进下一步）或 `F50_STOP <步骤>: 原因`（停下：把原因原样告诉用户，不重试、不换办法、不自己改设备，`$WORK/f50` 整个目录保留）。中途的 `ACTION:` 行是要用户做的事。
-- 命令会运行几分钟到十几分钟：用你的工具允许的最长等待或后台运行，看到最后一行之前不下结论。日志在 `$WORK/f50/logs/`。
+- 命令会运行几分钟到十几分钟：用你的工具允许的最长等待或后台运行，看到最后一行之前不下结论。运行中每 15 秒打印一行进度，并写 `$WORK/progress/f50-<步骤>.json`（按规则 8 读它向用户报进度：备份按已读字节、写入按已完成项数，其余按已用时间对比通常时长；`safe_to_unplug` 为 false 时提醒不要拔线）。详细日志在 `$WORK/f50/logs/`。
 - 各步按顺序，前一步没 `F50_OK` 后一步会拒绝运行；`flash` 只能跑一次，再跑会拒绝（要人先看现场）。
 
 ### F0 确认 B16 并检查工具（约 3 分钟）
@@ -235,7 +235,7 @@ N1 有内置 WiFi 和蓝牙，iPhone 的数据线插 N1 的任意 USB 口。
 
 先告诉用户两件事，等用户说好：
 - 备份读取约 3.3 GiB（NV/IMEI、基带、全部启动分区、主副 GPT），跳过安卓用户数据和日志（约 27 GiB；以后回原厂用后台「恢复出厂设置」重建）。**请先记下原厂后台里改过的设置**（WiFi 名称和密码等）。备份只留在这台电脑，不上传。
-- 命令开始后要做一次：**断开 F50 全部电源（拔掉 USB 线），再插回电脑**；之后约 8 分钟不要碰它。
+- 命令开始后要做一次：**断开 F50 全部电源（拔掉 USB 线），再插回电脑**；之后约 8 分钟不要碰它：先读备份（中途断开要从头再来），再写启动分区（**这时断电可能变砖**）。进度文件里 `unplug` 会写明当前是哪一段。
 
 `"$PY" "$DP/scripts/f50-install.py" flash "$WORK"` → `F50_OK flash`：备份 69 of 75 个分区并核对通过；用这台 F50 自己的 TrustOS 和本机 ADB 公钥做出 Root，只写 boot_b、trustos_b，每次写后读回 A/B 两槽和 GPT；重启后 ADB 是 root、B16、B 槽。读回不符会停下且不重启，**这时让用户保持 F50 通电连接**，不拔线硬试。
 
@@ -339,7 +339,7 @@ DashPlay 在 OpenWrt 上是插件。设备必须已经运行 OpenWrt 25.12（用
 
 首次设置在**手机**上做最简单，而且方式一、二要在**车上**做（盒子要连上车机热点或随身 WiFi 才能进行下一步）。你把步骤讲给用户，按用户手册第 2 节：
 
-1. **请给盒子通电，手机连 WiFi「DashPlay」，打开自动弹出的设置页。** 没弹出可用 `http://dashplay.local/` 或新装机的 `http://192.168.78.1/`。
+1. **请给盒子通电，手机连 WiFi「DashPlay」。自动弹出的窗口只显示设置页地址：点「复制地址」，关掉弹窗（iPhone 点「完成」），在 Safari 或常用浏览器里粘贴打开。** 没弹出就直接用浏览器打开新装机的 `http://192.168.78.1/` 或 `http://dashplay.local/`。不要在弹窗里做设置：一切出去它就关掉，手机还可能断开 WiFi。
 2. 按第 0 步已确认的需求逐页填写：车 → 网络 → 适用时车机上网 → 声音 → iPhone → 配置总结。总结前只保存草稿，返回可修改；确认后约 1 分钟生效，CarPlay 会断一下。方式一、二要在能找到上游热点的地方做。
 3. 会用无线时按页面添加 iPhone：iPhone 停在「设置 → 蓝牙」，另一台设备或车机打开设置页，核对六位数字后两边确认。只用有线可跳过，插能传数据的线，首次在 iPhone 点信任。
 4. 车机浏览器打开设置页列出的地址。特斯拉按下节配置网址，IP 证书能否继续仍未验证；其他车有继续选项时继续。完成页会提醒特斯拉回家插网线设置自己的网址。

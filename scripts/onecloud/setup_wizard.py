@@ -86,6 +86,29 @@ def check_response(host, path="/"):
     return None
 
 
+# The phones' and computers' own connectivity checks, answered "online" for a phone that was shown the setup portal
+# (settings_page.portal_reply). Android makers' names vary (gstatic, miui, hicloud, vivo...); all ask for /generate_204.
+APPLE_CHECK_NAMES = ("captive.apple.com", "www.apple.com", "www.appleiphonecell.com", "www.itools.info", "www.ibook.info",
+                     "www.airport.us", "www.thinkdifferent.us")
+APPLE_SUCCESS = b"<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"
+
+
+def online_reply(name, path):
+    """(status, body, content type, headers) of a connectivity check's "online" answer, or None for another request."""
+    path = path.split("?")[0]
+    if path in ("/generate_204", "/gen_204"):
+        return 204, b"", "text/plain", {}
+    if name in APPLE_CHECK_NAMES or path in ("/hotspot-detect.html", "/library/test/success.html"):
+        return 200, APPLE_SUCCESS, "text/html", {}
+    if path == "/connecttest.txt":
+        return 200, b"Microsoft Connect Test", "text/plain", {}
+    if path == "/ncsi.txt":
+        return 200, b"Microsoft NCSI", "text/plain", {}
+    if name == "detectportal.firefox.com":
+        return 200, b"success\n", "text/plain", {}
+    return None
+
+
 def box_hotspot_address(usual, tesla, local_addresses):
     """The box hotspot's address and why it is not the one asked for (None when it is): SHARED_LAN in Tesla mode,
     unless another interface (the Ethernet at home, say) already has an address in that network."""
@@ -180,9 +203,23 @@ def captive(setup, network):
     return network == "ap" and open_hotspot(setup)
 
 
-def wireless(setup, chosen=None):
-    # 2026-10-15 home test: the same iPhone can host the uplink AND join ap0 for wireless CarPlay.
-    return setup.get("mode") != "car_hotspot" and setup.get("iphone") != "wired"
+def direct_phone(chosen, capable, mode):
+    """Whether the iPhone joins the box's own hotspot beside the joined car hotspot or MiFi (design 5.2a), so the
+    picture does not go through the car's Wi-Fi. capable: the box can be a station and an AP at once (supervisor
+    direct_capable; an N1 only on the Cypress firmware). state/options.json "direct_phone" decides when set; else on
+    for the car hotspot, where the only other way is the cable, and off for a MiFi, whose wireless way works as it is."""
+    if not capable or mode not in JOINS:
+        return False
+    value = (chosen or {}).get("direct_phone")
+    return value is True if value is not None else mode == "car_hotspot"
+
+
+def wireless(setup, chosen=None, capable=False):
+    """Wireless CarPlay for this setup. The car hotspot carries it only through the direct hotspot; a MiFi or the box
+    hotspot always. (2026-10-15 home test: the same iPhone can host the uplink AND join ap0 for wireless CarPlay.)"""
+    if setup.get("iphone") == "wired":
+        return False
+    return setup.get("mode") != "car_hotspot" or direct_phone(chosen, capable, "car_hotspot")
 
 
 from platform_api import get_platform
@@ -264,6 +301,8 @@ class Scanner:
         self.lock = threading.Lock()
         self.seen = {}   # ssid -> (entry, last seen)
         self.at = None
+        self.busy = False   # a scan runs on its own thread (refresh)
+        self.waited_for = False   # that scan is the first list or an asked-for one: the page shows "scanning"
 
     def scan_once(self):
         try:
@@ -285,7 +324,38 @@ class Scanner:
                 self.scan_once()
                 self.at = time.monotonic()
             self.seen = {ssid: kept for ssid, kept in self.seen.items() if self.at - kept[1] <= SCAN_KEEP_SECONDS}
-            return sorted((entry for entry, _ in self.seen.values()), key=lambda item: -item["signal"])
+            return self.sorted()
+
+    def sorted(self):
+        return sorted((entry for entry, _ in list(self.seen.values())), key=lambda item: -item["signal"])
+
+    def refresh(self, fresh=False):
+        """results() on its own thread. The first list is two scans, several seconds (N1, 2026-10-17: "next" to the
+        network step took seconds); a page shows "scanning" meanwhile instead of waiting for it."""
+        with self.lock:
+            if self.busy:
+                return
+            self.busy, self.waited_for = True, fresh or self.at is None
+
+        def run():
+            try:
+                self.results(fresh=fresh)
+            finally:
+                self.busy = False
+        threading.Thread(target=run, name="wifi-scan", daemon=True).start()
+
+    def listing(self):
+        """The hotspots now, without waiting: None while the first or an asked-for scan runs (refresh). A list older
+        than SCAN_CACHE_SECONDS is shown as it is while a new scan runs for the next page."""
+        if self.at is None or self.busy and self.waited_for:
+            if not self.busy:
+                self.refresh()
+            return None
+        if time.monotonic() - self.at >= SCAN_CACHE_SECONDS:
+            listed = self.sorted()
+            self.refresh()
+            return listed
+        return self.sorted()
 
 
 def join_failure(log_text):

@@ -99,7 +99,9 @@ position:relative;box-shadow:inset 0 0 0 2px transparent;transition:box-shadow .
 .role input:checked~.check{visibility:visible}
 .role.off{opacity:.45;cursor:default}
 .secret{font-variant-numeric:tabular-nums;letter-spacing:.02em}
-@media (prefers-reduced-motion:reduce){.role{transition:none}}
+.spinner{width:22px;height:22px;flex:none;border-radius:50%;border:2.5px solid var(--sep);border-top-color:var(--tint);animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.role{transition:none}.spinner{animation-duration:2.4s}}
 @media (min-width:960px){main.wide{max-width:1100px;display:grid;grid-template-columns:1fr 1fr;column-gap:28px;align-items:start}
 main.wide>.span{grid-column:1/-1}}
 """
@@ -130,12 +132,36 @@ if(c){var r=c.querySelector('input.pick');if(r)r.checked=true;}});
 </script>"""
 
 
+SCANNING_RELOAD = 2   # seconds between reloads while a Wi-Fi scan runs (scanning)
+
+
 def page(title, body, refresh=False, wide=False):
-    meta = '<meta http-equiv=refresh content=3>' if refresh else ''
+    """refresh: True reloads every 3 s, a number every that many seconds."""
+    meta = f'<meta http-equiv=refresh content={3 if refresh is True else refresh}>' if refresh else ''
     return (f'<!doctype html><html lang=zh-CN><head><meta charset=utf-8>'
             f'<meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">{meta}'
             f'<title>{escape(title)}</title><style>{STYLE}</style></head>'
             f'<body><main{" class=wide" if wide else ""}>{body}</main>{SCRIPT}</body></html>')
+
+
+def portal_page(address):
+    """What the phone's captive-portal window shows during first-run setup: only the address, to open in a browser
+    (the window closes, and the phone may leave the Wi-Fi, once the user switches away). The pixel tells the box the
+    window drew it (settings_page.portal_reply)."""
+    value = escape(address)
+    body = ('<h1>在浏览器里继续设置</h1>'
+            '<p class=sub>这个自动弹出的窗口一切出去就会关掉，手机还可能断开 WiFi。请改用浏览器完成设置。</p>'
+            f'<div class=group><label class=cell><input id=portal-address type=text value="{value}" readonly '
+            'aria-label=设置页地址 style="font-size:20px;font-weight:600"></label></div>'
+            '<button class=btn type=button id=portal-copy>复制地址</button>'
+            '<p class=foot>1. 点「复制地址」。<br>2. iPhone 点右上角「完成」，安卓点返回；手机问要不要保持连接时，选保持。<br>'
+            '3. 打开 Safari 或常用的浏览器，把地址粘贴到地址栏打开。手机提示这个 WiFi 不能上网是正常的。</p>'
+            '<img src="/portal-seen.gif" width=1 height=1 alt="" style="position:absolute;opacity:0">'
+            "<script>document.getElementById('portal-copy').onclick=function(){var i=document.getElementById('portal-address'),ok=false;"
+            "i.readOnly=false;i.focus();i.select();i.setSelectionRange(0,i.value.length);try{ok=document.execCommand('copy');}catch(e){}"
+            "i.readOnly=true;i.blur();if(!ok&&navigator.clipboard){navigator.clipboard.writeText(i.value).then(function(){},function(){});ok=true;}"
+            "this.textContent=ok?'已复制，去浏览器粘贴打开':'请长按上面的地址复制';};</script>")
+    return page('打开设置页', body)
 
 
 def wifi_icon(signal):
@@ -180,6 +206,12 @@ def group(title, cells, foot=""):
     head = f'<p class=group-title>{escape(title)}</p>' if title else '<div class=gap></div>'
     tail = f'<p class=foot>{foot}</p>' if foot else ""
     return f'<section>{head}<div class=group>{cells}</div>{tail}</section>'
+
+
+def scanning(label):
+    """Shown while the box scans for hotspots on its own thread; the page reloads every SCANNING_RELOAD s."""
+    return (f'<div class=group><div class="cell scanning" role=status><span class=spinner aria-hidden=true></span>'
+            f'<span class=main><b>正在扫描附近的{escape(label)}…</b><span>几秒钟，扫完自动显示列表。请先在车上打开它。</span></span></div></div>')
 
 
 def network_picker(networks, selected, nonce, action, path, submit, foot="", extra="", label="车机热点"):

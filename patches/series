@@ -43,4 +43,5 @@ playport-car-bluetooth.patch
 playport-tesla-offline-fullscreen.patch
 playport-startup-timing.patch
 playport-viewer-debug-hud.patch
+playport-upstream-absorb.patch
 playport-viewer-compat-display.patch

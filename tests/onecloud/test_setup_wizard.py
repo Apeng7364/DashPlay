@@ -1,3 +1,4 @@
+import json
 import socket
 import struct
 import sys
@@ -120,6 +121,34 @@ class WizardStateTests(unittest.TestCase):
         self.assertEqual(setup_wizard.join_failure(''), 'not_found')
         sae = 'wlan0: CTRL-EVENT-AUTH-REJECT 02:00:00:00:00:a1 auth_type=3 auth_transaction=2 status_code=15'
         self.assertEqual(setup_wizard.join_failure(sae), 'wrong_password')
+
+
+class DirectPhoneTests(unittest.TestCase):
+    """The direct iPhone hotspot as a normal choice (the user, 2026-10-17): by the radio and the upstream's channel,
+    never by car make."""
+
+    def test_on_by_default_for_the_car_hotspot_when_the_radio_can_and_the_owner_decides(self):
+        d = setup_wizard.direct_phone
+        self.assertTrue(d({}, True, 'car_hotspot'))
+        self.assertFalse(d({}, True, 'mifi'), 'a MiFi keeps its own wireless way unless asked')
+        self.assertTrue(d({'direct_phone': True}, True, 'mifi'))
+        self.assertFalse(d({'direct_phone': False}, True, 'car_hotspot'), 'turned off stays off')
+        self.assertFalse(d({'direct_phone': True}, False, 'car_hotspot'), 'not without the radio')
+        self.assertFalse(d({'direct_phone': True}, True, 'box_hotspot'))
+        w = setup_wizard.wireless
+        self.assertTrue(w({'mode': 'car_hotspot', 'iphone': 'any'}, {}, capable=True))
+        self.assertFalse(w({'mode': 'car_hotspot', 'iphone': 'any'}, {}, capable=False))
+        self.assertFalse(w({'mode': 'car_hotspot', 'iphone': 'wired'}, {}, capable=True))
+        self.assertTrue(w({'mode': 'mifi', 'iphone': 'any'}, {}))
+        self.assertTrue(w({'mode': 'box_hotspot', 'iphone': 'wireless'}, {}))
+
+    def test_the_radio_says_which_channels_an_ap_may_use(self):
+        from platform_debian import ap_channel_problem
+        iw = ("\t\tFrequencies:\n\t\t\t* 2437.0 MHz [6] (20.0 dBm)\n\t\t\t* 5240.0 MHz [48] (20.0 dBm)\n"
+              "\t\t\t* 5260.0 MHz [52] (disabled)\n\t\t\t* 5500 MHz [100] (20.0 dBm) (no IR, radar detection)\n"
+              "\t\t\t* 5745.0 MHz [149] (20.0 dBm)\n")
+        self.assertEqual([ap_channel_problem(iw, f) for f in (2437, 5240, 5260, 5500, 5745, 5825)],
+                         [None, None, 'disabled', 'no IR', None, 'not listed'])
 
 
 class WizardPageTests(unittest.TestCase):
@@ -264,14 +293,41 @@ class WizardPageTests(unittest.TestCase):
             self.assertEqual(setup_wizard.wifi_interface(net), 'wlx020000000010')
         self.assertIsNone(setup_wizard.wifi_interface(Path('/nonexistent-net')))
 
-    def test_portal_sends_probes_to_setup_but_not_the_page_itself(self):
-        self.assertEqual(self.page.captive_redirect('captive.apple.com', '/hotspot-detect.html'), 'http://192.168.78.1/')
-        self.assertEqual(self.page.captive_redirect('connectivitycheck.gstatic.com', '/generate_204'), 'http://192.168.78.1/')
-        self.assertIsNone(self.page.captive_redirect('192.168.78.1', '/'))
-        self.assertIsNone(self.page.captive_redirect('dashplay.local', '/?m=x'))
-        self.assertEqual(self.page.captive_redirect('192.168.78.1', '/generate_204'), 'http://192.168.78.1/')
+    def test_portal_sends_the_phone_to_its_browser_and_then_passes_its_checks(self):
+        # Two users (2026-10-17): "next" often did nothing until they left and joined the Wi-Fi again. The setup ran in
+        # the phone's captive-portal window, which the phone closes - leaving the Wi-Fi - once the user switches away
+        # (the sound step even sent them to Bluetooth settings). The window now only shows the address to open in a browser.
+        phone, other = '192.168.78.20', '192.168.78.21'
+        for host, path in (('captive.apple.com', '/hotspot-detect.html'), ('connectivitycheck.gstatic.com', '/generate_204'),
+                           ('192.168.78.1', '/generate_204')):
+            code, body, kind, _ = self.page.portal_reply(host, path, phone)
+            self.assertEqual((code, kind), (200, 'text/html; charset=utf-8'))
+            self.assertIn('value="http://192.168.78.1/"', body)
+            self.assertIn('复制地址', body)
+            self.assertNotIn('/setup-flow', body)
+        self.assertIsNone(self.page.portal_reply('192.168.78.1', '/', phone), 'the address typed in a browser: the setup page')
+        self.assertIsNone(self.page.portal_reply('dashplay.local', '/?m=x', phone))
+        # The window drew the page (its pixel): from then on that phone's own checks pass, so it keeps the Wi-Fi.
+        self.assertEqual(self.page.portal_reply('captive.apple.com', '/portal-seen.gif', phone)[:1], (200,))
+        self.assertEqual(self.page.portal_reply('captive.apple.com', '/hotspot-detect.html', phone)[1],
+                         b'<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>')
+        for host in ('connectivitycheck.gstatic.com', 'connect.rom.miui.com', 'connectivitycheck.platform.hicloud.com'):
+            self.assertEqual(self.page.portal_reply(host, '/generate_204', phone)[:2], (204, b''))
+        self.assertEqual(self.page.portal_reply('www.msftconnecttest.com', '/connecttest.txt', phone)[1], b'Microsoft Connect Test')
+        self.assertIn('复制地址', self.page.portal_reply('www.baidu.com', '/', phone)[1], 'another site: the address again')
+        self.assertIn('复制地址', self.page.portal_reply('captive.apple.com', '/hotspot-detect.html', other)[1])
+        # Through the whole first setup, not only its first two questions.
+        setup_wizard.save(self.state, {'done': False, 'wizard_version': 2})
+        (self.state / 'setup-draft.json').write_text(json.dumps({'tesla': False, 'car_can_hotspot': False, 'mode': 'box_hotspot',
+                                                                 'answered': ['vehicle', 'mode', 'mifi', 'network', 'internet']}))
+        self.assertIn('复制地址', self.page.portal_reply('captive.apple.com', '/hotspot-detect.html', other)[1])
+        self.assertEqual(self.page.portal_reply('captive.apple.com', '/hotspot-detect.html', phone)[0], 200)
+        self.status['mode'] = 'sta'
+        self.assertIsNone(self.page.portal_reply('captive.apple.com', '/hotspot-detect.html', other), 'not on a joined hotspot')
+        self.status['mode'] = 'ap'
         self.set_up_done()
-        self.assertIsNone(self.page.captive_redirect('captive.apple.com', '/hotspot-detect.html'))
+        self.assertIsNone(self.page.portal_reply('captive.apple.com', '/hotspot-detect.html', other))
+        self.assertIsNone(self.page.portal_reply('captive.apple.com', '/hotspot-detect.html', phone))
 
     def test_car_hotspot_step_lists_networks_and_saves_choice(self):
         self.choose('car_hotspot')
@@ -381,7 +437,7 @@ class WizardPageTests(unittest.TestCase):
         self.assertEqual(read_json(self.state / 'hotspot.json'), {'ssid': 'Box', 'passphrase': 'boxpass1'})
         self.assertEqual(setup_wizard.load(self.state), {'done': False, 'mode': 'box_hotspot', 'box': True, 'iphone': 'any'})
         self.assertEqual(self.changes, ['setup box hotspot set'])
-        self.assertIsNone(self.page.captive_redirect('captive.apple.com', '/hotspot-detect.html'))
+        self.assertIsNone(self.page.portal_reply('captive.apple.com', '/hotspot-detect.html', '192.168.78.20'))
         self.status.update(box_ssid='Box', entries=['https://192.168.78.1:18443/'])
         html = self.page.render('')
         self.assertIn('第 3 步，共 3 步', html)

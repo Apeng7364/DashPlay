@@ -65,7 +65,7 @@ class TeslaOfflineTests(unittest.TestCase):
             conn.request('GET', path, headers={'Host': host})
             response = conn.getresponse(); data = response.read(); headers = dict(response.getheaders()); conn.close()
             return response.status, headers, data
-        with patch.object(page, 'captive_redirect', side_effect=AssertionError('must precede captive')):
+        with patch.object(page, 'portal_reply', side_effect=AssertionError('must precede captive')):
             code, headers, body = get('CONNMAN.VN.CLOUD.TESLA.CN:80')
         self.assertEqual(code, 200)
         self.assertEqual(headers['X-ConnMan-Status'], 'online')
