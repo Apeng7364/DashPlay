@@ -136,7 +136,7 @@ N1/玩客云刷机包：只改程序的补丁版不带刷机包（发布说明�
 
 1. 电脑备份：`ssh root@<路由器IP> 'tar -czf - /opt/dashplay /etc/config/dashplay /etc/config/wireless /etc/config/network /var/lib/bluetooth' > "$WORK/openwrt-before-upgrade.tar.gz"`；`gzip -t "$WORK/openwrt-before-upgrade.tar.gz"` → 成功；不存在的蓝牙目录先确认实际路径再调整列表，不能忽略 tar 失败。F50 再执行 `ssh root@<路由器IP> 'tar -czf - /opt/dashplay-bluez' > "$WORK/f50-bluez-before-upgrade.tar.gz"`、`gzip -t "$WORK/f50-bluez-before-upgrade.tar.gz"` → 均成功，否则停止。备份只留用户电脑，不打印 UCI 中的密码/token。
 2. 读取 `cat /etc/apk/arch; apk info -v dashplay dashplay-jre luci-app-dashplay` → 记住版本与架构。下载**更新版本同一 Release**的 dashplay、对应架构 dashplay-jre、两个 LuCI apk 与 `SHA256SUMS`，校验全过。传到新建的 `/tmp/dashplay-upgrade/`，该目录只放本次四个包。
-3. 在路由器上执行 `apk add --upgrade --simulate --allow-untrusted /tmp/dashplay-upgrade/*.apk` → 只升级上述用户态包及必要用户态依赖；出现内核、kmod、系统 BlueZ 的计划就停止。F50 不能向 5.4 系统装 6.12 模块；保留独立 BlueZ。确认计划后执行相同命令去掉 `--simulate`，再 `/etc/init.d/dashplay restart`。
+3. 在路由器上先 `apk update`（取最新的软件源目录；没有它时试运行看不到联网后才会带上的依赖升级，2026-10-19 F50 试运行只列 3 个包，正式执行时多升了 luci-base），再执行 `apk add --upgrade --simulate --allow-untrusted /tmp/dashplay-upgrade/*.apk` → 只升级上述用户态包及必要用户态依赖；出现内核、kmod、系统 BlueZ 的计划就停止。F50 不能向 5.4 系统装 6.12 模块；保留独立 BlueZ。确认计划后执行相同命令去掉 `--simulate`，再 `/etc/init.d/dashplay restart`。
 4. `apk info -v dashplay luci-app-dashplay; /etc/init.d/dashplay status` → 新版本、running；LuCI 打开/刷新、设置保留、iPhone 无需重新配对、真实出画。包明确不拥有 state/identity，`/etc/config/dashplay` 是保留配置；如出现 `.apk-new`，先比较新增选项，只合并所需默认值，不覆盖现有秘密。升级失败保留日志和备份，诊断依赖或用保存的上一版 apk；不要 `apk del` 再装、不要 sysupgrade。
 
 ## 斐讯 N1
