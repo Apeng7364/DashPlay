@@ -46,3 +46,4 @@ playport-viewer-debug-hud.patch
 playport-upstream-absorb.patch
 playport-viewer-compat-display.patch
 playport-remember-before-release.patch
+playport-follow-author.patch
