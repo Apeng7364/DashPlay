@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -14,7 +15,7 @@ from settings_page import SettingsPage
 import setup_wizard
 import supervisor_openwrt
 from supervisor_openwrt import (name_changes, read_config, trusted_networks, shared_lan_changes,
-                               shared_lan_conflict, apply_shared_lan, car_audio_args)
+                               shared_lan_conflict, apply_shared_lan, car_audio_args, waiting_trust, waiting_warning)
 
 # Shape of `ubus call network.wireless status` on OpenWrt 25.12 (two radios, a 2.4 GHz AP listed first).
 WIRELESS = {
@@ -59,7 +60,8 @@ class HandoffTests(unittest.TestCase):
     def test_named_section_may_be_a_client_network(self):
         network, _ = ow.pick_network(ow.wifi_networks(WIRELESS), "wwan")
         self.assertEqual((network["mode"], network["ssid"]), ("sta", "Xpeng"))
-        self.assertEqual(ow.pick_network(ow.wifi_networks(WIRELESS), "nope"), (None, "Wi-Fi section nope not found"))
+        self.assertEqual(ow.pick_network(ow.wifi_networks(WIRELESS), "nope"),
+                         (None, "Wi-Fi section nope not found or switched off"))
 
     def test_waits_while_the_radio_is_down_and_skips_enterprise(self):
         down = json.loads(json.dumps(WIRELESS))
@@ -166,6 +168,48 @@ F50_ROUTE = """default via fe80::1 dev sipa_eth0 proto ra metric 1024 expires 62
 default via fe80::1 dev sipa_eth0 proto static metric 4096 pref medium
 """
 
+
+
+class WaitingForWifiTests(unittest.TestCase):
+    # 2026-10-19 (momo): the F50's own Wi-Fi turned off, the settings page never opened while DashPlay waited for it.
+    def test_the_settings_page_trusts_the_planned_wifi_or_else_the_lan(self):
+        planned = {"address": ipaddress.IPv4Interface("192.168.77.1/24")}
+        self.assertEqual(waiting_trust(planned, None), [ipaddress.IPv4Network("192.168.77.0/24")])
+        self.assertEqual(waiting_trust(None, ipaddress.IPv4Interface("192.168.1.1/24")),
+                         [ipaddress.IPv4Network("192.168.1.0/24")])
+        self.assertEqual(waiting_trust(None, None), [])
+
+    def test_a_switched_off_access_point_is_named_as_such(self):
+        # A disabled wifi-iface is left out of `ubus call network.wireless status` altogether (F50, 2026-10-19).
+        radio_only = {"radio0": {"up": True, "config": {"band": "5g", "channel": "149"}, "interfaces": []}}
+        self.assertEqual(ow.pick_network(ow.wifi_networks(radio_only)),
+                         (None, "no Wi-Fi network is switched on (access point or client)"))
+        self.assertEqual(ow.pick_network(ow.wifi_networks(radio_only), "ap0"),
+                         (None, "Wi-Fi section ap0 not found or switched off"))
+
+    def test_the_page_says_what_it_waits_for(self):
+        self.assertIn("还没准备好：「DashPlay-F50」还没开启。", waiting_warning("Wi-Fi DashPlay-F50 is not up yet"))
+        self.assertIn("路由器的 WiFi 都关着", waiting_warning("no Wi-Fi network is switched on (access point or client)"))
+        self.assertIn("选的 WiFi（ap0）不存在或已关闭", waiting_warning("Wi-Fi section ap0 not found or switched off"))
+        self.assertIn("「Car-5G」所在的网络 lan 还没有地址",
+                      waiting_warning("network lan for Wi-Fi Car-5G has no IPv4 address yet"))
+        self.assertIn("the other router's Wi-Fi channel is missing",   # anything else as it is
+                      waiting_warning("the other router's Wi-Fi channel is missing: set a fixed channel there and enter it"))
+
+    def test_a_hanging_ubus_is_no_address(self):
+        def hang(argv, **kwargs):
+            raise ow.subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+        with patch.object(ow.subprocess, "run", hang):
+            self.assertIsNone(ow.OpenWrtPlatform.interface_network("lan"))
+            self.assertEqual(ow._ubus("network.wireless"), {})
+
+    def test_the_lan_address_comes_from_ubus(self):
+        class Done:
+            def __init__(self, stdout): self.stdout, self.returncode = stdout, 0
+
+        with patch.object(ow.subprocess, "run", lambda argv, **_: Done(json.dumps(LAN if argv[2] == "network.interface.lan" else {}))):
+            self.assertEqual(ow.OpenWrtPlatform.interface_network("lan"), ipaddress.IPv4Interface("192.168.1.1/24"))
+            self.assertIsNone(ow.OpenWrtPlatform.interface_network("guest"))
 
 class PublicIpv6Tests(unittest.TestCase):
     def test_the_modems_address_when_the_lan_has_only_a_local_prefix(self):
@@ -493,6 +537,37 @@ class ManagedPageTests(unittest.TestCase):
         for path in ("/setup", "/reset", "/car", "/hotspot", "/retry"):
             with self.assertRaises(ValueError):
                 self.page.apply(path, {"nonce": nonce})
+
+    def test_the_daily_check_is_shown_with_the_update_button(self):
+        import update
+        update.save(self.state / "update-check.json", {"checked_at": 1, "current": "2026.10.19.1", "latest": "2026.10.20",
+                                                       "notes": "- 新功能<b>\n- 修复", "available": True, "online": True})
+        html = self.page.render("")
+        for text in ("程序更新", "有新版本 2026.10.20", "当前 2026.10.19.1", "- 新功能&lt;b&gt;<br>- 修复", "立即升级", "检查更新"):
+            self.assertIn(text, html)
+        update.save(self.state / "update-check.json", {"checked_at": 1, "latest": "2026.10.20", "available": True,
+                                                       "online": False})
+        html = self.page.render("")
+        self.assertIn("用刷机包升级", html)
+        self.assertNotIn("立即升级", html, "a release that changed the system is not offered online")
+        update.save(self.state / "update-check.json", {"checked_at": 1, "current": "2026.10.20", "latest": "2026.10.20",
+                                                       "available": False, "online": True})
+        self.assertIn("已是最新", self.page.render(""))
+
+    def test_update_actions_need_the_page_and_start_apart(self):
+        import update
+        nonce = self.page.pairing.nonce
+        with self.assertRaises(ValueError):
+            self.page.apply("/update", {"action": "install", "nonce": "stale"})
+        with patch.object(update, "launch", return_value="已开始升级") as launch, \
+                patch.object(update, "check") as check:
+            self.assertEqual(self.page.apply("/update", {"action": "install", "nonce": nonce}), "已开始升级")
+            launch.assert_called_once_with(self.state.parent)
+            self.assertIn("正在检查更新", self.page.apply("/update", {"action": "check", "nonce": nonce}))
+        update.save(self.state / "update-status.json", {"phase": "installing", "message": "正在安装", "at": time.time()})
+        html = self.page.render("")
+        self.assertIn("正在升级", html)
+        self.assertNotIn("value=install", html)
 
     def test_firewall_warning_is_shown(self):
         self.status["warning"] = "防火墙区域拒绝入站连接"

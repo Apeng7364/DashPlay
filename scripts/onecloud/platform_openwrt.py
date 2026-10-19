@@ -19,7 +19,12 @@ RUN = Path("/var/run/dashplay")
 
 
 def _ubus(path, method="status"):
-    out = subprocess.run(["ubus", "call", path, method], capture_output=True, text=True, timeout=10)
+    """`ubus call path method` as a dict; {} when it fails or hangs: netifd may not answer for a while (an
+    interface it cannot set up took 30 s in the OpenWrt container, 2026-10-19), which must not end the service."""
+    try:
+        out = subprocess.run(["ubus", "call", path, method], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return {}
     if out.returncode != 0:
         return {}
     try:
@@ -71,8 +76,10 @@ def pick_network(networks, wanted="auto", live=True):
     candidates = [n for n in networks if n["mode"] in ("ap", "sta")]
     if wanted and wanted != "auto":
         candidates = [n for n in candidates if n["section"] == wanted]
-        if not candidates:
-            return None, f"Wi-Fi section {wanted} not found"
+        if not candidates:   # ubus leaves a disabled wifi-iface out altogether
+            return None, f"Wi-Fi section {wanted} not found or switched off"
+    if not candidates:
+        return None, "no Wi-Fi network is switched on (access point or client)"
     usable = [n for n in candidates if handoff_security(n["encryption"]) and n["ssid"]]
     if not usable:
         return None, "no Wi-Fi network with a password type the iPhone accepts (open, WPA2 or WPA3 personal)"
@@ -190,6 +197,11 @@ class OpenWrtPlatform(DebianPlatform):
             return None, f"Wi-Fi {network['ssid']} has no channel yet"
         return dict(network, channel=channel, address=address, device=device,
                     security=handoff_security(network["encryption"])), ""
+
+    @staticmethod
+    def interface_network(name):
+        """The IPv4 address of netifd interface `name` (e.g. the LAN), or None."""
+        return interface_address(_ubus(f"network.interface.{name}"))[1]
 
     @staticmethod
     def zone_input(network):

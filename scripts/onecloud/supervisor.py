@@ -40,6 +40,7 @@ from settings_page import SettingsPage, network_label
 import setup_wizard
 from platform_api import get_platform
 import diagnostics
+import update
 
 RUN = Path("/run/dashplay")
 CAR_WAIT = 60          # head units often raise their hotspot after the box has booted
@@ -311,6 +312,9 @@ def main():
                           state=state)
         diagnostics.LogMirror(state / "logs", RUN, platform.boot_id()).start(stopped)
         NameResponder(setup_wizard.MDNS_NAME, stopped).start()
+        # A new release is looked for once a day and only shown on the settings page; nothing installs by itself.
+        threading.Thread(target=update.checker, name="update-check", daemon=True,
+                         args=(root, stopped, setup_wizard.options(state).get("update_check", True))).start()
         # Power Bluetooth now, not after the network: an early receiver reads the adapter address while
         # it starts and stalled ~15 s waiting for it (2026-10-11).
         bluetooth = threading.Thread(target=power_bluetooth, name="bluetooth-power", daemon=True)

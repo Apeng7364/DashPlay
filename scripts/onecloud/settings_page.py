@@ -26,6 +26,7 @@ import settings_ui as ui
 import setup_wizard
 from setup_flow import FirstSetup, iphone_choices, limitations, validation_table
 import diagnostics
+import update
 
 MAX_BODY = 4096
 # A phone shown the setup portal gets its connectivity checks answered "online" for this long (first-run setup).
@@ -292,7 +293,7 @@ class SettingsPage:
     # Behaviour -------------------------------------------------------------------------------
 
     def apply(self, path, form):
-        if self.managed and path != "/pair":
+        if self.managed and path not in ("/pair", "/update"):
             raise ValueError(f"网络在 {self.managed['by']} 后台设置。")
         if path == "/pair":
             self.check_nonce(form)
@@ -315,6 +316,14 @@ class SettingsPage:
             if action in ("yes", "no"):
                 self.pairing.confirm(form.get("request_id", ""), action == "yes")
                 return "" if action == "yes" else "已拒绝这次配对。"
+            raise ValueError("未知操作。")
+        if path == "/update":
+            self.check_nonce(form)
+            if form.get("action") == "check":
+                threading.Thread(target=update.check, args=(self.state.parent,), name="update-check", daemon=True).start()
+                return "正在检查更新，几秒后刷新页面就能看到结果。"
+            if form.get("action") == "install":
+                return update.launch(self.state.parent)
             raise ValueError("未知操作。")
         if path == "/setup-flow":
             self.check_nonce(form)
@@ -414,6 +423,35 @@ class SettingsPage:
             self.apply_later("remote debugging stopped")
             return "已结束远程调试，盒子约 1 分钟后回到原来的网络。"
         raise ValueError("未知操作。")
+
+    def update_block(self, nonce):
+        """Program update (update.py): what the daily check found, the last outcome and the button. The update itself
+        runs apart from this service, which it restarts."""
+        found = update.read(self.state / "update-check.json")
+        progress = update.read(self.state / "update-status.json")
+        if update.running(self.state.parent):
+            return (f'<div class=cell><span class=main><b>正在升级</b><span>{escape(progress.get("message", ""))}</span>'
+                    '</span></div><p class=note>约 2–5 分钟，期间 CarPlay 会断开，页面会自己刷新。</p>')
+        cells = ""
+        if progress.get("phase") in ("done", "failed") and time.time() - progress.get("at", 0) < 86400:
+            cells += (f'<div class=cell><span class=main><b>{"上次升级" if progress["phase"] == "done" else "上次升级没有完成"}</b>'
+                      f'<span>{escape(progress.get("message", ""))}</span></span></div>')
+        if found.get("error"):
+            cells += f'<div class=cell><span class=main><b>检查更新没有成功</b><span>{escape(found["error"])}</span></span></div>'
+        elif found.get("available"):
+            notes = escape(found.get("notes", "")).replace("\n", "<br>")
+            cells += (f'<div class=cell><span class=main><b>有新版本 {escape(found["latest"])}</b><span>{notes}</span></span>'
+                      f'<span class=value>当前 {escape(found.get("current") or "较旧版本")}</span></div>')
+            cells += (f'<form method=post action=/update>{ui.hidden(nonce)}<button class="cell action" name=action '
+                      'value=install>立即升级（约 2–5 分钟，期间 CarPlay 会断开）</button></form>' if found.get("online") else
+                      f'<p class=note>{escape(found.get("reason") or "这一版改了系统")}，不能在线升级：请按装机说明用刷机包升级。</p>')
+        elif found.get("latest"):
+            cells += (f'<div class=cell><span class=main><b>已是最新</b></span>'
+                      f'<span class=value>{escape(found["latest"])}</span></div>')
+        checked = (time.strftime("上次检查 %m-%d %H:%M", time.localtime(found["checked_at"]))
+                   if found.get("checked_at") else "还没有检查过")
+        return cells + (f'<form method=post action=/update>{ui.hidden(nonce)}<button class="cell action" name=action '
+                        f'value=check>检查更新</button></form><p class=note>{checked}</p>')
 
     def debug_block(self, nonce):
         """Advanced: remote debugging over the owner's phone hotspot."""
@@ -976,6 +1014,8 @@ class SettingsPage:
                             "盒子装了 Tailscale 时，连上手机热点后帮你调试的人就能远程登录。调试期间盒子不开自己的热点，"
                             f"{debug_uplink.MINUTES} 分钟后或拔电重启后自动回到原来的网络。")
                    if self.run and not self.managed else "")
+                + ui.group("程序更新", self.update_block(nonce),
+                           "每天自动检查一次，只提示不自动安装。升级前会备份配对、证书和设置，新版本起不来会自动退回。")
                 + ui.group("高级", advanced, "" if self.managed else "重新进行首次设置可以更换使用方式，会保留盒子证书、自己的域名和盒子热点密码。")
                 + '</div>')
-        return ui.page("盒子设置", body, refresh, wide=True)
+        return ui.page("盒子设置", body, refresh or update.running(self.state.parent), wide=True)

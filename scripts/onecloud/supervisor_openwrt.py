@@ -5,7 +5,8 @@ The router owns the network: the person sets up Wi-Fi in LuCI. This supervisor r
 the iPhone (uci dashplay.main.wifi: a wifi-iface section, "auto" = the first access point, 5 GHz
 first, or "external" = another router's Wi-Fi bridged into the LAN, entered as external_*), starts the
 receiver on that network's address and the settings page (iPhones only) on settings_port, and restarts
-itself when that Wi-Fi changes. Without a Bluetooth adapter it runs wired CarPlay only. Compared with supervisor.py: no box hotspot, no joining, no first-run setup.
+itself when that Wi-Fi changes. Without a Bluetooth adapter it runs wired CarPlay only. Compared with
+supervisor.py: no box hotspot, no joining, no first-run setup.
 Optional: a DuckDNS name with a Let's Encrypt certificate (uci duckdns_domain / duckdns_token,
 own_domain.py) for car browsers that refuse the local CA; it then replaces the name.
 """
@@ -29,6 +30,7 @@ from settings_page import SettingsPage
 import setup_wizard
 import diagnostics
 import own_domain
+import update
 from tesla_openwrt import OfflineChecks
 from platform_openwrt import OpenWrtPlatform, RUN
 
@@ -58,7 +60,10 @@ DEFAULTS = {"enabled": "1", "wifi": "auto", "settings_port": "18080",
             "tesla_mode": "0", "answer_tesla_checks": "auto",
             # A DuckDNS sub-domain and its token: the name becomes <sub-domain>.duckdns.org, with a Let's Encrypt
             # certificate the router obtains and renews itself (own_domain.py). Empty: off.
-            "duckdns_domain": "", "duckdns_token": ""}
+            "duckdns_domain": "", "duckdns_token": "",
+            # Look for a new release once a day (update.py; installed only when someone clicks it), and the URL
+            # prefixes tried after GitHub (read by update.py itself).
+            "update_check": "1", "update_mirror": ""}
 
 
 def car_audio_args(config):
@@ -90,6 +95,34 @@ def trusted_networks(network):
     """Who may use the settings page: the network of the Wi-Fi handed to the iPhone, where the head unit is,
     not every interface of the router (the WAN or a guest network too; audit 2026-10-13, A5)."""
     return [network["address"].network]
+
+
+def waiting_trust(planned, lan):
+    """Who may open the settings page while the Wi-Fi is not up: the network the configured Wi-Fi will use, or the
+    LAN when the configuration names none (its access point switched off, 2026-10-19). [] when neither has an address."""
+    if planned:
+        return trusted_networks(planned)
+    return [lan.network] if lan else []
+
+
+WAITING_REASONS = [   # platform_openwrt's reasons, for the settings page; others are shown as they are
+    (r"no Wi-Fi network is switched on.*", "路由器的 WiFi 都关着"),
+    (r"Wi-Fi section (\S+) not found or switched off", r"选的 WiFi（\1）不存在或已关闭"),
+    (r"Wi-Fi (.+) is not up yet", r"「\1」还没开启"),
+    (r"no Wi-Fi network with a password type.*", "没有 iPhone 能用的加密方式（不加密、WPA2 或 WPA3 个人）"),
+    (r"network (\S+) for Wi-Fi (.+) has no IPv4 address yet", r"「\2」所在的网络 \1 还没有地址"),
+    (r"Wi-Fi (.+) has no channel yet", r"「\1」还没有信道"),
+]
+
+
+def waiting_warning(why):
+    """The settings page's notice while it waits for the Wi-Fi handed to the iPhone."""
+    for pattern, text in WAITING_REASONS:
+        if re.fullmatch(pattern, why):
+            why = re.sub(pattern, text, why)
+            break
+    return (f"交给 iPhone 的 WiFi 还没准备好：{why}。请在 OpenWrt 后台「网络 → 无线」或「服务 → DashPlay」检查；"
+            "准备好后 DashPlay 会自动继续。")
 
 
 def read_config(uci_text):
@@ -484,9 +517,13 @@ def main():
                 launch(early, has_bluez, wait=True)
                 mark(f"receiver launched early for {early['ssid']}")
 
-        # The Wi-Fi comes up some seconds after procd starts us; wait for it rather than fail.
+        # The Wi-Fi comes up some seconds after procd starts us; wait for it rather than fail. The settings page
+        # opens meanwhile, so that a Wi-Fi that never comes up (the router's own switched off) still leaves a page
+        # saying why (2026-10-19).
         reason = ""
         network = None
+        planned = early or platform.handoff(config["wifi"], live=False, external=config)[0]
+        settings_open = False
         while not stopped.is_set():
             network, why = platform.handoff(config["wifi"], external=config)
             if network:
@@ -494,9 +531,22 @@ def main():
             if why != reason:
                 say(f"waiting: {why}")
                 reason = why
+                status["warning"] = waiting_warning(why)
+            if not settings_open and not stopped.wait(5):   # a Wi-Fi coming up as usual needs a few seconds more
+                lan = None if planned else platform.interface_network("lan")
+                trusted[:] = waiting_trust(planned, lan)
+                # Without any address the page answers the router itself only: an online update still sees the
+                # service up (update.py).
+                host = str((planned["address"] if planned else lan).ip) if trusted else "127.0.0.1"
+                status["home"] = f"http://{host}:{port}/"
+                settings.start(port)
+                settings_open = True
+                say(f"settings page open on {host} while waiting for the Wi-Fi")
+                continue
             stopped.wait(1)
         if stopped.is_set():
             raise InterruptedError("Service stopping")
+        status.pop("warning", None)
         mark(f"Wi-Fi {network['ssid']} up on channel {network['channel']}")
         moved, warning = apply_shared_lan("1" in (config["shared_lan"], config["tesla_mode"]), network, state, say, stopped)
         if moved:
@@ -542,11 +592,15 @@ def main():
         shared_on = "1" in (config["shared_lan"], config["tesla_mode"])
         refresh_network_warning(shared_on, network["device"], status, base_warning)
         trusted[:] = trusted_networks(network)
-        settings.start(port)
+        if not settings_open:
+            settings.start(port)
         if offline_checks.update(config, network, status) and network.get("ifname"):
             reconnect_clients(network["ifname"], say)
         diagnostics.start(stopped, diagnostics.DiagLog(state / "diag"), RUN / "receiver.log", platform, status,
                           state=state)
+        # A new release is looked for once a day and only shown (LuCI, settings page); nothing installs by itself.
+        threading.Thread(target=update.checker, args=(root, stopped, config["update_check"] != "0"),
+                         name="update-check", daemon=True).start()
 
         bluetooth_thread.join()
         wireless = bool(bluetooth and bluetooth[0])

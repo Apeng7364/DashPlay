@@ -29,7 +29,8 @@ sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum 
 
 # Program and service.
 # Committed files only: work in progress in the tree must not ship.
-for file in $(git -C "$repo" ls-files 'scripts/onecloud/*.py') scripts/onecloud/dashplay.service scripts/onecloud/tls.security; do
+for file in $(git -C "$repo" ls-files 'scripts/onecloud/*.py') scripts/onecloud/dashplay.service scripts/onecloud/tls.security \
+            scripts/onecloud/update-key.pem; do   # update.py checks release manifests with this public key
     case "$file" in scripts/onecloud/*/*) continue ;; esac   # the top level only, as on the box
     cp "$repo/$file" "$stage/"
 done
