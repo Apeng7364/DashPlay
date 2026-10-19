@@ -157,7 +157,7 @@ class OfflineChecks:
     def update(self, config, network, status, online=None):
         was_active = self.active
         choice = config.get('answer_tesla_checks', 'auto')
-        eligible = config.get('tesla_mode') == '1' and network['mode'] == 'ap'
+        eligible = config.get('tesla_mode') == '1' and network['mode'] in ('ap', 'external')
         upstream = wan_available(self.run) if eligible and choice != '0' and online is None else bool(online)
         # Even explicit enable may not shadow genuine services when WAN is available.
         wanted = eligible and choice != '0' and not upstream

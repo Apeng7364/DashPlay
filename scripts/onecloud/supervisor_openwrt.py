@@ -2,10 +2,10 @@
 """Run DashPlay on OpenWrt as one procd service (/etc/init.d/dashplay, package openwrt/dashplay).
 
 The router owns the network: the person sets up Wi-Fi in LuCI. This supervisor reads the Wi-Fi to hand
-the iPhone (uci dashplay.main.wifi: a wifi-iface section, or "auto" = the first access point, 5 GHz
-first), starts the receiver on that network's address and the settings page (iPhones only) on
-settings_port, and restarts itself when that Wi-Fi changes. Without a Bluetooth adapter it runs
-wired CarPlay only. Compared with supervisor.py: no box hotspot, no joining, no first-run setup.
+the iPhone (uci dashplay.main.wifi: a wifi-iface section, "auto" = the first access point, 5 GHz
+first, or "external" = another router's Wi-Fi bridged into the LAN, entered as external_*), starts the
+receiver on that network's address and the settings page (iPhones only) on settings_port, and restarts
+itself when that Wi-Fi changes. Without a Bluetooth adapter it runs wired CarPlay only. Compared with supervisor.py: no box hotspot, no joining, no first-run setup.
 Optional: a DuckDNS name with a Let's Encrypt certificate (uci duckdns_domain / duckdns_token,
 own_domain.py) for car browsers that refuse the local CA; it then replaces the name.
 """
@@ -33,6 +33,10 @@ from tesla_openwrt import OfflineChecks
 from platform_openwrt import OpenWrtPlatform, RUN
 
 DEFAULTS = {"enabled": "1", "wifi": "auto", "settings_port": "18080",
+            # wifi "external": the Wi-Fi of another router (a travel router with better radios, its uplink this
+            # router over USB or a cable, bridged into external_network) as entered, with its fixed channel.
+            "external_ssid": "", "external_key": "", "external_security": "wpa2", "external_channel": "",
+            "external_network": "lan",
             "java": "/usr/lib/dashplay-jre/bin/java", "name": "dashplay.lan",
             # Boards whose BlueZ cannot come from the system (ZTE F50: board_zte_f50.py): a command that
             # brings up the controller and its own D-Bus, and that bus's address.
@@ -74,6 +78,12 @@ LAN_BEFORE = "lan-before.json"   # in state/: the LAN address to put back when s
 # reaches the router (about 90 s), else puts it back. A LAN moved before that confirm cannot be confirmed,
 # so shared_lan would be rolled back to 0 and the address with it.
 ROLLBACK_PENDING = Path("/var/run/rpcd/snapshot-files")
+
+
+def own_lan(network):
+    """Devices on this Wi-Fi get their address and DNS from this router: its access point, or another router's
+    Wi-Fi bridged into its LAN (wifi "external"); not a network it joined as a client."""
+    return network["mode"] in ("ap", "external")
 
 
 def trusted_networks(network):
@@ -274,7 +284,7 @@ def apply_shared_lan(on, network, state, say, stopped=None):
         before = json.loads(path.read_text())
     except (OSError, ValueError):
         before = None
-    if on and network["mode"] != "ap":
+    if on and not own_lan(network):
         return False, "「车机不让开任何局域网地址」只对路由器自己的 WiFi 有效"
     if on and not before:
         out = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True, timeout=5).stdout
@@ -468,7 +478,7 @@ def main():
         # configuration says while the radio comes up, and check it against the live Wi-Fi below.
         early = None
         if have_identity:
-            early, _ = platform.handoff(config["wifi"], live=False)
+            early, _ = platform.handoff(config["wifi"], live=False, external=config)
             if early:
                 ensure_leaf(state, [config["name"], setup_wizard.MDNS_NAME], [str(early["address"].ip)])
                 launch(early, has_bluez, wait=True)
@@ -478,7 +488,7 @@ def main():
         reason = ""
         network = None
         while not stopped.is_set():
-            network, why = platform.handoff(config["wifi"])
+            network, why = platform.handoff(config["wifi"], external=config)
             if network:
                 break
             if why != reason:
@@ -497,9 +507,10 @@ def main():
         address = network["address"]
         platform.interface, platform.ap_interface = network["device"], network["ifname"]
         host = str(address.ip)
-        # The name resolves through the router's own DNS, i.e. for devices on its access point only; on a
-        # client network (car hotspot, portable Wi-Fi) the head unit asks that network's DNS instead.
-        named = network["mode"] == "ap"
+        # The name resolves through the router's own DNS, i.e. for devices on its access point (or another
+        # router's Wi-Fi bridged into its LAN) only; on a client network (car hotspot, portable Wi-Fi) the head
+        # unit asks that network's DNS instead.
+        named = own_lan(network)
         public_mode = config["public_ipv6"] if config["public_ipv6"] in ("1", "2") else "0"
 
         def point(public):
@@ -522,7 +533,7 @@ def main():
         if ddns:
             maintainer.append(own_domain.Maintainer(root, ddns, host, stopped, say, tesla=config["tesla_mode"] == "1"))
             maintainer[0].start()
-        if network["mode"] == "sta" and platform.zone_input(network["network"]) not in ("ACCEPT", None):
+        if network["mode"] != "ap" and platform.zone_input(network["network"]) not in ("ACCEPT", None):
             # A client network usually sits in the wan zone, which rejects the iPhone's AirPlay connections.
             status["warning"] = (f"「{network['ssid']}」所在的防火墙区域拒绝入站连接，iPhone 连不上 DashPlay。"
                                  f"请在 OpenWrt 后台把网络 {network['network']} 放进允许入站的区域，或改用路由器自己的 WiFi。")
@@ -569,7 +580,7 @@ def main():
                 if offline_checks.update(config, network, status) and network.get("ifname"):
                     reconnect_clients(network["ifname"], say)
                 refresh_network_warning(shared_on, network["device"], status, base_warning)
-                now, why = platform.handoff(config["wifi"])
+                now, why = platform.handoff(config["wifi"], external=config)
                 if now is None or plan_of(now) != plan:
                     request_reexec("Wi-Fi changed" if now else why)
                 elif named and public_mode != "0":

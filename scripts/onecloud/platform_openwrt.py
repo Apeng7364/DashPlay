@@ -1,8 +1,9 @@
 """OpenWrt adapter: the router owns the network (netifd, uci); DashPlay only reads it.
 
 The person sets up Wi-Fi in LuCI as usual. DashPlay hands the iPhone one of the router's Wi-Fi
-networks over Bluetooth (an access point by default, or the network the router joined as a client)
-and serves the viewer on that network's address. Nothing here creates hotspots or joins networks.
+networks over Bluetooth (an access point by default, or the network the router joined as a client, or
+another router's Wi-Fi bridged into its LAN, as entered) and serves the viewer on that network's address.
+Nothing here creates hotspots or joins networks.
 
 No operations run at import time; the parsers take command output so they are testable anywhere.
 """
@@ -81,6 +82,32 @@ def pick_network(networks, wanted="auto", live=True):
     return up[0], ""
 
 
+EXTERNAL_ENCRYPTION = {"open": "none", "wpa2": "psk2", "wpa3": "sae"}
+
+
+def external_network(config):
+    """uci dashplay.main.external_* -> (network, reason when unusable): the Wi-Fi of another router (a travel
+    router given the uplink over USB or a cable and bridged into this router's LAN), handed to the iPhone as
+    entered. Its radio is not ours, so the channel comes from the configuration: set a fixed one there."""
+    ssid, key = config.get("external_ssid", ""), config.get("external_key", "")
+    security = config.get("external_security", "wpa2")
+    channel = config.get("external_channel", "")
+    lan = config.get("external_network", "lan")
+    if not 1 <= len(ssid.encode()) <= 32:
+        return None, "the other router's Wi-Fi name is missing or longer than 32 bytes"
+    if security not in EXTERNAL_ENCRYPTION:
+        return None, "the other router's password type must be open, wpa2 or wpa3"
+    if security != "open" and not (8 <= len(key) <= 63 or re.fullmatch(r"[0-9A-Fa-f]{64}", key)):
+        return None, "the other router's Wi-Fi password must be 8 to 63 characters"
+    if not channel.isdigit() or not 1 <= int(channel) <= 196:
+        return None, "the other router's Wi-Fi channel is missing: set a fixed channel there and enter it"
+    if not re.fullmatch(r"[A-Za-z0-9_]+", lan):
+        return None, f"network {lan} for the other router's Wi-Fi is not an OpenWrt interface name"
+    return {"section": "external", "ifname": "", "radio": "", "up": True, "band": "5g" if int(channel) > 14 else "2g",
+            "mode": "external", "ssid": ssid, "key": "" if security == "open" else key,
+            "encryption": EXTERNAL_ENCRYPTION[security], "network": lan, "channel": int(channel)}, ""
+
+
 def parse_channel(iw_info):
     match = re.search(r"\bchannel (\d+)", iw_info or "")
     return int(match.group(1)) if match else None
@@ -142,11 +169,15 @@ class OpenWrtPlatform(DebianPlatform):
     def __init__(self, interface="", run=RUN):
         super().__init__(interface, run=run)
 
-    def handoff(self, wanted="auto", live=True):
+    def handoff(self, wanted="auto", live=True, external=None):
         """(network dict with channel, address and device, reason when not ready).
         live=False: what the configuration says before the radio is up (the access point's configured
-        channel, the LAN address), so that the receiver can start while the Wi-Fi comes up."""
-        network, reason = pick_network(wifi_networks(_ubus("network.wireless")), wanted, live)
+        channel, the LAN address), so that the receiver can start while the Wi-Fi comes up.
+        wanted "external": another router's Wi-Fi from the dashplay options in `external` (external_network)."""
+        if wanted == "external":
+            network, reason = external_network(external or {})
+        else:
+            network, reason = pick_network(wifi_networks(_ubus("network.wireless")), wanted, live)
         if not network:
             return None, reason
         device, address = interface_address(_ubus(f"network.interface.{network['network']}"))

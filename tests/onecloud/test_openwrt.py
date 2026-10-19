@@ -99,6 +99,52 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual((network["channel"], network["security"], network["device"], str(network["address"].ip)),
                          (36, "wpa2", "br-lan", "192.168.1.1"))
 
+    def test_another_routers_wifi_is_handed_as_entered(self):
+        # A travel router bridged into the LAN (cable or USB): its Wi-Fi is not in /etc/config/wireless.
+        config = read_config("dashplay.main.wifi='external'\ndashplay.main.external_ssid='Travel-5G'\n"
+                             "dashplay.main.external_key='travel-pass'\ndashplay.main.external_channel='149'\n")
+        network, reason = ow.external_network(config)
+        self.assertEqual(reason, "")
+        self.assertEqual((network["mode"], network["ssid"], network["key"], network["network"], network["channel"],
+                          network["ifname"]), ("external", "Travel-5G", "travel-pass", "lan", 149, ""))
+        self.assertEqual(ow.handoff_security(network["encryption"]), "wpa2")
+        wpa3 = dict(config, external_security="wpa3", external_network="guest")
+        self.assertEqual((ow.external_network(wpa3)[0]["encryption"], ow.external_network(wpa3)[0]["network"]),
+                         ("sae", "guest"))
+        self.assertEqual(ow.external_network(dict(config, external_security="open", external_key=""))[0]["key"], "")
+
+    def test_another_routers_wifi_needs_its_name_password_and_channel(self):
+        config = {"external_ssid": "Travel-5G", "external_key": "travel-pass", "external_security": "wpa2",
+                  "external_channel": "149", "external_network": "lan"}
+        for change, why in (({"external_ssid": ""}, "Wi-Fi name"), ({"external_ssid": "x" * 33}, "Wi-Fi name"),
+                            ({"external_key": "short"}, "password"), ({"external_key": ""}, "password"),
+                            ({"external_channel": ""}, "channel"), ({"external_channel": "auto"}, "channel"),
+                            ({"external_channel": "0"}, "channel"), ({"external_security": "wep"}, "password type"),
+                            ({"external_network": "lan wan"}, "network")):
+            network, reason = ow.external_network(dict(config, **change))
+            self.assertIsNone(network, change)
+            self.assertIn(why, reason)
+
+    def test_handoff_of_another_routers_wifi_uses_the_lan_address_and_entered_channel(self):
+        config = {"external_ssid": "Travel-5G", "external_key": "travel-pass", "external_security": "wpa2",
+                  "external_channel": "149", "external_network": "lan"}
+        commands = []
+
+        class Done:
+            def __init__(self, stdout): self.stdout, self.returncode = stdout, 0
+
+        def run(argv, **_):
+            commands.append(argv)
+            return Done(json.dumps({"network.interface.lan": LAN}.get(argv[2], {})) if argv[0] == "ubus" else "")
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(ow.subprocess, "run", run):
+            network, reason = ow.OpenWrtPlatform(run=Path(tmp)).handoff("external", external=config)
+        self.assertEqual(reason, "")
+        self.assertEqual((network["ssid"], network["channel"], network["security"], network["device"],
+                          str(network["address"].ip)), ("Travel-5G", 149, "wpa2", "br-lan", "192.168.1.1"))
+        self.assertNotIn(["ubus", "call", "network.wireless", "status"], commands)   # not one of our radios
+        self.assertFalse([argv for argv in commands if argv[0] == "iw"])
+
 
 class TrustedNetworkTests(unittest.TestCase):
     def test_only_the_network_of_the_wifi_handed_to_the_iphone(self):
@@ -357,6 +403,12 @@ class SharedLanTests(unittest.TestCase):
             self.assertFalse(changed)
             self.assertIn("路由器自己的 WiFi", warning)
             self.assertIn("network.lan.ipaddr='192.168.77.1'", uci["network"])
+            # Another router's Wi-Fi bridged into this LAN: its devices get their address here, so the LAN moves.
+            calls.clear()
+            external = dict(network, mode="external", ifname="")
+            self.assertEqual(apply_shared_lan(True, external, state, said.append), (True, ""))
+            self.assertIn("network.lan.ipaddr='100.96.0.1'", uci["network"])
+            self.assertFalse([c for c in calls if c[:2] == ["ubus", "call"]], "its stations are not ours to kick")
 
 
     def test_waits_while_a_luci_apply_awaits_its_confirm(self):
@@ -407,6 +459,12 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((config["wifi"], config["settings_port"], config["java"]),
                          ("wwan", "18090", "/usr/lib/dashplay-jre/bin/java"))
         self.assertEqual(read_config("")["wifi"], "auto")
+
+    def test_another_routers_wifi_defaults_to_wpa2_on_the_lan(self):
+        config = read_config("")
+        self.assertEqual((config["external_ssid"], config["external_key"], config["external_security"],
+                          config["external_channel"], config["external_network"]), ("", "", "wpa2", "", "lan"))
+
 
 
 class ManagedPageTests(unittest.TestCase):

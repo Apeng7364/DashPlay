@@ -266,7 +266,7 @@ DashPlay 在 OpenWrt 上是插件。设备必须已经运行 OpenWrt 25.12（用
    - F50：用上一节的 `f50-install.py dashplay`，它已包含下面三步和蓝牙；**不要**装系统的 `bluez-daemon`（会带入和 F50 内核不匹配的模块）。
    - 其他路由器：`apk add bluez-daemon`；用 USB 蓝牙棒再加 `kmod-btusb`。没有蓝牙就只能有线。
    - 有线（数据线）需要路由器的 USB 口能当主机：`apk add kmod-tun`。F50 不支持有线。
-4. **WiFi**：在路由器后台「服务 → DashPlay」选交给 iPhone 的 WiFi（默认自动选第一个 5 GHz 热点）。网络本身用户怎么设就怎么用，不要改他的网络配置。
+4. **WiFi**：在路由器后台「服务 → DashPlay」选交给 iPhone 的 WiFi（默认自动选第一个 5 GHz 热点）。网络本身用户怎么设就怎么用，不要改他的网络配置。用户想让手机和车机连另一台路由器（如插在 F50 上的便携路由）时，选「另一台路由器的 WiFi」，按 [openwrt-dashplay README](https://github.com/yizhixiaoheigou/openwrt-dashplay#4-设置与使用)「用另一台路由器的 WiFi」：那台路由器要桥接进本机局域网、关掉它的 DHCP、固定信道，这里填它**实际在用**的信道；原厂固件的「USB 共享网络」默认当外网口再做地址转换，那样 iPhone 找不到 DashPlay，要改成桥接。那台路由器的设置先讲清要改什么、得到用户同意再动。
 5. 去“放认证文件”（路径相同；OpenWrt 上看日志用 `cat /var/run/dashplay/supervisor.log`、`tail /var/run/dashplay/receiver.log`，服务用 `/etc/init.d/dashplay restart`），然后：
    - 设置页 `http://<路由器地址>:18080/`（添加 iPhone）；
    - 车机连路由器的 WiFi，浏览器打开 `https://dashplay.lan:18443/`（或 `https://<路由器地址>:18443/`）；打不开时见下面「车机打不开画面时」。

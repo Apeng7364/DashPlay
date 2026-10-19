@@ -13,6 +13,16 @@ import time
 
 PHONE = re.compile(r'(?:[0-9A-F]{2}:){5}[0-9A-F]{2}')
 GRANT_SECONDS = 90
+# An open window waits up to its timeout (180 s) for someone to start pairing; each attempt (a phone picked
+# on the page, or a phone's own request) then gets ATTEMPT_SECONDS from when it begins, within
+# WINDOW_LIMIT_SECONDS in all. A retry late in the window was cut off while the iPhone was confirming (F50, 2026-10-19).
+ATTEMPT_SECONDS = 120
+WINDOW_LIMIT_SECONDS = 600
+
+
+def attempt_deadline(deadline, now, opened):
+    """The window's end once a pairing attempt begins at `now`: never earlier than before, never past the limit."""
+    return max(deadline, min(now + ATTEMPT_SECONDS, opened + WINDOW_LIMIT_SECONDS))
 
 
 def read_json(path):
@@ -223,7 +233,8 @@ async def run_incoming(root, timeout):
     confirmed = False
     pairing = None
     error = ''
-    deadline = time.monotonic() + min(timeout, 180)
+    opened = time.monotonic()
+    deadline = opened + min(timeout, 180)
 
     def busy():
         return bool(read_json(root / 'state/receiver/phone-presence.json').get('active'))
@@ -249,11 +260,12 @@ async def run_incoming(root, timeout):
 
         @method()
         async def RequestConfirmation(self, device: 'o', passkey: 'u'):
-            nonlocal selected, confirmed
+            nonlocal selected, confirmed, deadline
             if (not device.startswith(adapter_path + '/dev_') or stopped.is_set() or
                     (selected is not None and selected != device) or busy()):
                 raise DBusError('org.bluez.Error.Rejected', 'Receiver busy')
             selected = device
+            deadline = attempt_deadline(deadline, time.monotonic(), opened)
             request_id = secrets.token_urlsafe(20)
             device_props = await proxy(device, 'org.bluez.Device1')
             name = await device_props.get_alias()
@@ -360,6 +372,7 @@ async def run_incoming(root, timeout):
                 pick_file.unlink(missing_ok=True)
                 if pick and not busy() and pick in {item['address'] for item in found}:
                     selected, error = f"{adapter_path}/dev_{pick.replace(':', '_')}", ''
+                    deadline = attempt_deadline(deadline, time.monotonic(), opened)
                     save_json(status_file, {'phase':'pairing', 'name':next(i['name'] for i in found if i['address'] == pick)})
                     pairing = asyncio.ensure_future(pair(selected))
                 else:

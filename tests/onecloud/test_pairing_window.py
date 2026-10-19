@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'scripts/onecloud'))
-from pairing_window import PairingWindow, save_json, read_json
+from pairing_window import PairingWindow, save_json, read_json, attempt_deadline, ATTEMPT_SECONDS, WINDOW_LIMIT_SECONDS
 from settings_page import SettingsPage
 
 class PairingTests(unittest.TestCase):
@@ -114,5 +114,14 @@ class PairingTests(unittest.TestCase):
         self.assertEqual(left['declined'],{})
         self.assertEqual(left['paired'],[A])
         self.assertFalse(grant.exists())
+
+class AttemptDeadlineTests(unittest.TestCase):
+    # 2026-10-19 (F50): a retry late in the 180 s window was cut off while the iPhone was confirming.
+    def test_each_attempt_gets_its_own_time_from_when_it_begins(self):
+        self.assertEqual(attempt_deadline(180, now=170, opened=0), 170 + ATTEMPT_SECONDS)
+        self.assertEqual(attempt_deadline(400, now=10, opened=0), 400)   # never shortened
+
+    def test_the_window_stays_bounded(self):
+        self.assertEqual(attempt_deadline(180, now=WINDOW_LIMIT_SECONDS - 5, opened=0), WINDOW_LIMIT_SECONDS)
 
 if __name__=='__main__':unittest.main()
