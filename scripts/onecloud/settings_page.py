@@ -432,8 +432,13 @@ class SettingsPage:
         if update.running(self.state.parent):
             return (f'<div class=cell><span class=main><b>正在升级</b><span>{escape(progress.get("message", ""))}</span>'
                     '</span></div><p class=note>约 2–5 分钟，期间 CarPlay 会断开，页面会自己刷新。</p>')
-        cells = ""
-        if progress.get("phase") in ("done", "failed") and time.time() - progress.get("at", 0) < 86400:
+        version = update.bundled_version(self.state.parent)
+        cells = (f'<div class=cell><span class=main><b>本机程序</b></span><span class=value>{escape(version)}</span></div>'
+                 if version else "")
+        # A failure no longer matters once a later check finds the box up to date (updated by hand, say).
+        settled = progress.get("phase") == "failed" and found.get("latest") and not found.get("available") \
+            and not found.get("error") and found.get("checked_at", 0) > progress.get("at", 0)
+        if progress.get("phase") in ("done", "failed") and time.time() - progress.get("at", 0) < 86400 and not settled:
             cells += (f'<div class=cell><span class=main><b>{"上次升级" if progress["phase"] == "done" else "上次升级没有完成"}</b>'
                       f'<span>{escape(progress.get("message", ""))}</span></span></div>')
         if found.get("error"):

@@ -18,6 +18,8 @@ import subprocess
 import threading
 import time
 
+import update
+
 MAX_BYTES = 1_000_000
 INTERVAL = 10
 MAX_LINES = 40
@@ -303,10 +305,13 @@ def keep(lines, limit=MAX_LINES):
     return kept[-limit:]
 
 
-def start(stopped, log: DiagLog, receiver_log: Path, platform, status, interval=INTERVAL, state: Path = None):
+def start(stopped, log: DiagLog, receiver_log: Path, platform, status, interval=INTERVAL, state: Path = None,
+          program: Path = Path(__file__).resolve().parent):
     tail = LogTail(receiver_log)
+    # The release this box runs opens every start, so a user's diagnostics say it (2026-10-20: a box still on the
+    # image's 2026.10.15 program was only told apart by the viewer's build stamp).
     log.append({"event": "start", "wall": round(time.time()), "uptime": round(time.monotonic(), 1),
-                "boot": platform.boot_id()[:8]})
+                "boot": platform.boot_id()[:8], "version": update.bundled_version(program)})
 
     def loop():
         while not stopped.wait(interval):

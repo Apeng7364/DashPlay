@@ -170,6 +170,17 @@ def public_ipv6(addresses, routes, lan_device):
     return None
 
 
+def hottest(zones=Path("/sys/class/thermal")):
+    """The hottest readable thermal zone in degrees C, for the drive log (the F50 has some 25, a few unreadable)."""
+    temps = []
+    for zone in zones.glob("thermal_zone*"):
+        try:
+            temps.append(int((zone / "temp").read_text().strip()))
+        except (OSError, ValueError):
+            pass
+    return round(max(temps) / 1000, 1) if temps else None
+
+
 class OpenWrtPlatform(DebianPlatform):
     """Process handling, Bluetooth and addresses as on Debian; Wi-Fi is read from OpenWrt."""
 
@@ -222,6 +233,9 @@ class OpenWrtPlatform(DebianPlatform):
             data["mem_mb"] = int(re.search(r"^MemAvailable:\s*(\d+)", meminfo, re.M).group(1)) // 1024
         except (OSError, ValueError, AttributeError):
             pass
+        temp = hottest()
+        if temp is not None:
+            data["temp_c"] = temp
         if self.ap_interface:
             data["peers"] = parse_stations(subprocess.run(["iw", "dev", self.ap_interface, "station", "dump"],
                                                           capture_output=True, text=True, timeout=5).stdout)

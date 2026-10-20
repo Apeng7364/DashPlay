@@ -36,6 +36,7 @@ OWNER = "yizhixiaoheigou"
 LATEST = os.environ.get("DASHPLAY_UPDATE_LATEST", f"https://github.com/{OWNER}/DashPlay/releases/latest/download/")
 PREVIOUS_FEED = os.environ.get("DASHPLAY_UPDATE_FEED",
                                f"https://github.com/{OWNER}/openwrt-dashplay/releases/download/v{{version}}/")
+VERSION_FILE = "version.txt"
 MANIFEST = "dashplay-update.json"
 SIGNATURE = MANIFEST + ".sig"
 KEY = Path(__file__).resolve().with_name("update-key.pem")
@@ -56,6 +57,10 @@ BACKUP = "dashplay-update-backup.tar.gz"   # beside the program directory: the o
 
 class UpdateError(Exception):
     """Why an update stops, in words for the owner (Chinese, shown on the page)."""
+
+
+class NotFound(UpdateError):
+    """Every source answered 404: the file is not published, not a network problem."""
 
 
 def is_openwrt():
@@ -98,7 +103,7 @@ def mirrors(root, openwrt):
 def fetch(url, prefixes=(), limit=1 << 20, target=None, sha256=None, size=None):
     """Bytes of url (or, with target, the file written there), from GitHub or else each mirror prefix. With sha256
     and size the download must match them exactly."""
-    errors = []
+    errors, codes = [], []
     for candidate in [url] + [prefix + url for prefix in prefixes]:
         try:
             request = urllib.request.Request(candidate, headers={"User-Agent": "DashPlay-update"})
@@ -126,6 +131,9 @@ def fetch(url, prefixes=(), limit=1 << 20, target=None, sha256=None, size=None):
             if hasattr(error, "close"):   # an HTTPError holds its response open
                 error.close()
             errors.append(f"{candidate.split('/')[2]}: {error}")
+            codes.append(getattr(error, "code", None))
+    if all(code == 404 for code in codes):
+        raise NotFound("下载失败（" + "；".join(errors)[-300:] + "）")
     raise UpdateError("下载失败（" + "；".join(errors)[-300:] + "）。网络恢复后再试，或在设置里换一个镜像")
 
 
@@ -185,12 +193,21 @@ def apk_version(name, listing=None):
     return None
 
 
+def bundled_version(root):
+    """The release a program bundle was built for (build-bundle.sh writes version.txt for a release), or None
+    for a development build and the releases before 2026.10.20."""
+    try:
+        return (Path(root) / VERSION_FILE).read_text().strip() or None
+    except OSError:
+        return None
+
+
 def current_version(root, openwrt):
     if openwrt:
         full = apk_version("dashplay")
         return full.rsplit("-r", 1)[0] if full else None
     try:
-        return json.loads((Path(root) / "state/update.json").read_text()).get("version")
+        return bundled_version(root) or json.loads((Path(root) / "state/update.json").read_text()).get("version")
     except (OSError, ValueError, AttributeError):
         return None
 
@@ -253,7 +270,11 @@ def forbidden_in_plan(simulation):
 def previous_packages(version, prefixes, work):
     """The installed release's three packages (to go back to), checked against that release's SHA256SUMS."""
     base = PREVIOUS_FEED.format(version=version)
-    sums = fetch(base + "SHA256SUMS", prefixes, limit=1 << 16).decode()
+    try:
+        sums = fetch(base + "SHA256SUMS", prefixes, limit=1 << 16).decode()
+    except NotFound:
+        raise UpdateError(f"找不到当前版本 {version} 的安装包（它不是正式发布的版本），升级失败时无法退回，已停止。"
+                          "请按装机说明手动升级") from None
     files = []
     for line in sums.splitlines():
         digest, _, name = line.partition("  ")
@@ -323,13 +344,14 @@ def install_openwrt(root, manifest, status, work):
         if arch not in feed["jre"]["files"]:
             raise UpdateError(f"这一版没有 {arch} 的 Java 运行环境")
         wanted["dashplay-jre"] = feed["jre"]["files"][arch]
+    # The way back first: without it nothing is installed, so the new release is not fetched for nothing.
+    status("downloading", f"正在下载当前版本 {current} 的安装包（升级失败时用来退回）")
+    previous = previous_packages(current, prefixes, work)
     status("downloading", f"正在下载 {manifest['version']}（{sum(f['size'] for f in wanted.values()) // 1048576} MB）")
     files = []
     for entry in wanted.values():
         files.append(fetch(feed["base"] + entry["file"], prefixes, target=Path(work) / entry["file"],
                            sha256=entry["sha256"], size=entry["size"]))
-    status("downloading", f"正在下载当前版本 {current} 的安装包（升级失败时用来退回）")
-    previous = previous_packages(current, prefixes, work)
     status("checking", "正在核对升级计划")
     run("apk", "update", timeout=300)   # without the index the simulation misses dependencies (F50, 2026-10-19)
     simulation = run("apk", "add", "--upgrade", "--simulate", "--allow-untrusted", *map(str, files))

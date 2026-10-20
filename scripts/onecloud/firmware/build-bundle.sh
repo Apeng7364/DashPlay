@@ -67,6 +67,8 @@ cp "$repo"/scripts/onecloud/firmware/install.sh "$repo"/scripts/onecloud/firmwar
    "$repo/scripts/onecloud/board-probe.sh" "$stage/firmware/"
 printf '{\n  "interface": "auto",\n  "address": "192.168.78.1/24",\n  "channel": 149,\n  "width": 80\n}\n' > "$stage/service.json"
 printf '{"ssid": "DashPlay"}\n' > "$stage/state/hotspot.json"
+# The release this bundle is (prepare-release.sh sets it): the settings page and the diagnostics show it.
+[ -z "${DASHPLAY_VERSION:-}" ] || printf '%s\n' "$DASHPLAY_VERSION" > "$stage/version.txt"
 find "$stage" -name __pycache__ -type d -prune -exec rm -rf {} +
 
 # Nothing personal may ship: no identity, pairing, token, Wi-Fi password or certificate key.

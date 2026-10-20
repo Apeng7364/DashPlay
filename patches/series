@@ -48,3 +48,4 @@ playport-viewer-compat-display.patch
 playport-remember-before-release.patch
 playport-follow-author.patch
 playport-fullscreen-button-place.patch
+playport-auto-resolution-2560.patch

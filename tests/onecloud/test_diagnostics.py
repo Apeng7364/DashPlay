@@ -84,7 +84,9 @@ class DiagLogTests(unittest.TestCase):
         receiver.write_text('x WARN something\n')
         stopped = threading.Event()
         log = diagnostics.DiagLog(self.dir)
-        diagnostics.start(stopped, log, receiver, Platform(), {'mode': 'sta'}, interval=0.05)
+        program = Path(self.tmp.name) / 'program'; program.mkdir()
+        (program / 'version.txt').write_text('2026.10.20\n')
+        diagnostics.start(stopped, log, receiver, Platform(), {'mode': 'sta'}, interval=0.05, program=program)
         for _ in range(100):
             if len(log.text().splitlines()) >= 2:
                 break
@@ -93,6 +95,7 @@ class DiagLogTests(unittest.TestCase):
         records = [json.loads(line) for line in log.text().splitlines()]
         self.assertEqual(records[0]['event'], 'start')
         self.assertEqual(records[0]['boot'], 'abcdef01')
+        self.assertEqual(records[0]['version'], '2026.10.20', 'which release the box runs opens every start')
         self.assertEqual(records[1]['mode'], 'sta')
         self.assertEqual(records[1]['link'], {'signal': -60})
         self.assertEqual(records[1]['log'], ['x WARN something'])

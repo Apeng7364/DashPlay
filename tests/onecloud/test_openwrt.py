@@ -148,6 +148,18 @@ class HandoffTests(unittest.TestCase):
         self.assertFalse([argv for argv in commands if argv[0] == "iw"])
 
 
+class TemperatureTests(unittest.TestCase):
+    def test_the_drive_log_takes_the_hottest_readable_zone(self):
+        # F50, 2026-10-19: the drive log had no temperature; its zones are named (soc, nr, pa), two cannot be read.
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, value in (("thermal_zone0", "33987\n"), ("thermal_zone1", "36670\n"), ("thermal_zone2", "")):
+                (Path(tmp) / name).mkdir()
+                (Path(tmp) / name / "temp").write_text(value)
+            (Path(tmp) / "thermal_zone3").mkdir()
+            self.assertEqual(ow.hottest(Path(tmp)), 36.7)
+            self.assertIsNone(ow.hottest(Path(tmp) / "none"))
+
+
 class TrustedNetworkTests(unittest.TestCase):
     def test_only_the_network_of_the_wifi_handed_to_the_iphone(self):
         # Every interface used to count, the WAN too (F50: sipa_eth0 10.3.178.29/8, the whole 10/8);
@@ -553,6 +565,24 @@ class ManagedPageTests(unittest.TestCase):
         update.save(self.state / "update-check.json", {"checked_at": 1, "current": "2026.10.20", "latest": "2026.10.20",
                                                        "available": False, "online": True})
         self.assertIn("已是最新", self.page.render(""))
+        self.assertNotIn("本机程序", self.page.render(""), "a development build names no release")
+        (self.state.parent / "version.txt").write_text("2026.10.20\n")
+        self.assertIn("<b>本机程序</b></span><span class=value>2026.10.20", self.page.render(""))
+
+    def test_a_failed_update_is_not_shown_once_the_box_is_up_to_date(self):
+        # F50, 2026-10-19: updated by hand after a failed web update, the page still said it did not finish.
+        import time
+        import update
+        update.save(self.state / "update-status.json", {"phase": "failed", "message": "下载失败", "at": time.time()})
+        update.save(self.state / "update-check.json", {"checked_at": 1, "current": "2026.10.19.1", "latest": "2026.10.20",
+                                                       "available": True, "online": True})
+        self.assertIn("上次升级没有完成", self.page.render(""))
+        update.save(self.state / "update-check.json", {"checked_at": time.time() + 1, "current": "2026.10.20",
+                                                       "latest": "2026.10.20",
+                                                       "available": False, "online": True})
+        html = self.page.render("")
+        self.assertNotIn("上次升级没有完成", html)
+        self.assertIn("已是最新", html)
 
     def test_update_actions_need_the_page_and_start_apart(self):
         import update

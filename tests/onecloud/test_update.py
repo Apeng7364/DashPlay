@@ -88,6 +88,17 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(update.apk_version('dashplay-jre', listing), '21.0.12.1-r1')
         self.assertIsNone(update.apk_version('dashplay', 'dashplay: Receives CarPlay from an iPhone\n'))
 
+    def test_a_box_names_its_release_from_the_bundle(self):
+        # 2026-10-20: a user's N1 still ran the image's 2026.10.15 program; nothing on the box said so.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertIsNone(update.bundled_version(root), 'a development build or an older release')
+            update.save(root / 'state/update.json', {'version': '2026.10.19.2'})
+            self.assertEqual(update.current_version(root, False), '2026.10.19.2')
+            (root / 'version.txt').write_text('2026.10.20\n')
+            self.assertEqual(update.bundled_version(root), '2026.10.20')
+            self.assertEqual(update.current_version(root, False), '2026.10.20', 'the files on the box win')
+
     def test_the_apk_plan_may_not_touch_the_kernel_kmods_or_bluez(self):
         # Shape of `apk add --upgrade --simulate` on the F50 (2026-10-19).
         plan = ('(1/4) Upgrading dashplay (2026.10.16-r1 -> 2026.10.19.1-r1)\n'
@@ -237,9 +248,10 @@ class SignedReleaseTests(unittest.TestCase):
             self.assertEqual(update.install(self.root, True, self.pub), 0)
             self.assertIn('已是最新', json.loads((self.root / 'state/update-status.json').read_text())['message'])
 
-    def openwrt_install(self, simulation_extra='', comes_up=(True,)):
+    def openwrt_install(self, simulation_extra='', comes_up=(True,), old_published=True):
         # Larger than fetch()'s default limit, as real packages are (37 MB; lab, 2026-10-19).
-        old = self.openwrt_release('2026.10.19.1', {n: f'old {n}'.encode() * 200000 for n in update.OPENWRT_PACKAGES})
+        if old_published:
+            self.openwrt_release('2026.10.19.1', {n: f'old {n}'.encode() * 200000 for n in update.OPENWRT_PACKAGES})
         new = self.openwrt_release('2026.10.20', {n: f'new {n}'.encode() for n in update.OPENWRT_PACKAGES})
         self.publish({'format': 1, 'version': '2026.10.20', 'online': True, 'openwrt': new})
         calls, ups = [], list(comes_up)
@@ -284,6 +296,15 @@ class SignedReleaseTests(unittest.TestCase):
         self.assertIn('state/bluetooth/pairing', names)
         self.assertFalse([n for n in names if n.startswith('state/logs')], 'logs stay out of the backup')
         self.assertEqual(os.stat(self.root.parent / 'backup.tar.gz').st_mode & 0o777, 0o600)
+
+    def test_openwrt_stops_first_when_the_installed_version_was_never_published(self):
+        # F50 on a test build, 2026-10-19: it fetched 35 MB, then stopped with a download error that read like the network.
+        code, calls, status = self.openwrt_install(old_published=False)
+        self.assertEqual((code, status['phase']), (1, 'failed'))
+        self.assertIn('找不到当前版本 2026.10.19.1 的安装包', status['message'])
+        self.assertNotIn('网络', status['message'])
+        self.assertFalse([p for p in self.server.seen if p.endswith('.apk')], 'stopped before the new release was fetched')
+        self.assertFalse([c for c in calls if c[:2] == ['apk', 'add']])
 
     def test_openwrt_refuses_a_plan_with_kernel_modules(self):
         code, calls, status = self.openwrt_install('(2/3) Installing kmod-bluetooth (6.12.94-r1)\n')
