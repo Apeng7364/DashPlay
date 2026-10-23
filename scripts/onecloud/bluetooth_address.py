@@ -112,8 +112,29 @@ class BluetoothIdentity:
             raise ValueError('Bluetooth controller address not ready')
         return found[1].lower()
 
+    def configure_unset(self, derived):
+        """Snapdragon 410 sticks: btqcomsmd has no address of its own and takes it from the device tree's
+        "local-bd-address"; without one the kernel lists the controller as unconfigured and `info` answers
+        "Invalid Index" until it is given a public address. Give it the saved one, else derived (a callable).
+        True when it did; the rest of prepare() then runs on that address."""
+        try:
+            listing = self.command('btmgmt', 'config')
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            return False   # an older btmgmt without "config": the controller is read as before
+        if not re.search(r'^hci0:\s+Unconfigured controller$(?:\n\t.*)*?\n\tmissing options:[^\n]*\bpublic-address\b',
+                         listing, re.M):
+            return False
+        saved = json.loads(self.path.read_text()).get('address') if self.path.exists() else None
+        target = (saved.lower() if isinstance(saved, str) and ADDRESS.fullmatch(saved) and saved != '00:00:00:00:00:00'
+                  else derived())
+        self.command('btmgmt', '--index', '0', 'public-addr', target)
+        if not self.wait_for_address(target):
+            raise RuntimeError('Unconfigured Bluetooth controller did not take an address')
+        return True
+
     def prepare(self):
         from platform_debian import derived_address, machine_key, SHARED_BLUETOOTH_ADDRESSES
+        self.configure_unset(lambda: derived_address(machine_key(), 'bluetooth'))
         current = self.current()
         saved = json.loads(self.path.read_text()).get('address') if self.path.exists() else None
         # Derive only for a new unpaired vendor-default device. Keep existing unique hardware as-is.

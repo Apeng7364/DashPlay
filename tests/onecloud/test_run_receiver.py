@@ -11,6 +11,12 @@ spec.loader.exec_module(run_receiver)
 
 
 class BrowserAccessTest(unittest.TestCase):
+    def test_heap_ceiling_follows_the_board_memory(self):
+        self.assertEqual(run_receiver.heap_limit("MemTotal:         402316 kB\nMemFree: 1 kB\n"), "-Xmx224m")   # 410 stick
+        self.assertEqual(run_receiver.heap_limit("MemTotal:         855012 kB\n"), "-Xmx384m")   # OneCloud
+        self.assertEqual(run_receiver.heap_limit("MemTotal:        1897396 kB\n"), "-Xmx384m")   # N1
+        self.assertEqual(run_receiver.heap_limit(""), "-Xmx384m")
+
     def test_token_goes_to_a_file_only_the_box_page_reads_and_the_old_script_goes(self):
         # A script any site could include gave the viewer token away (audit 2026-10-13, A2); the receiver serves
         # receiver-access.json to the box's own page only.

@@ -278,17 +278,51 @@ class NameRecordTests(unittest.TestCase):
 
     def test_tesla_online_own_domain_returns_to_public_resolution(self):
         start = applied(DHCP, name_changes(DHCP, NAME, LAN_IP, PUBLIC, only_public=True))
-        normal = applied(start, name_changes(start, NAME, None))
-        self.assertNotIn('dhcp.dashplay=', normal)
-        self.assertNotIn('dhcp.dashplay6=', normal)
-        self.assertNotIn('/' + NAME + '/', normal)
+        tesla = applied(start, name_changes(start, NAME, None, rebind=True))
+        self.assertNotIn('dhcp.dashplay=', tesla)
+        self.assertNotIn('dhcp.dashplay6=', tesla)
+        self.assertNotIn(f"dhcp.cfg01411c.server='/{NAME}/'", tesla, 'no local A answer')
+        self.assertIn(f"dhcp.cfg01411c.rebind_domain='/{NAME}/'", tesla, 'the upstream answer is let through')
+        normal = applied(tesla, name_changes(tesla, NAME, None, previous=NAME))
+        self.assertNotIn('rebind_domain', normal)
+        self.assertNotIn('server=', normal)
         self.assertEqual(name_changes(normal, NAME, None), [])
+
+    def test_tesla_own_domain_is_whitelisted_for_rebind_protection(self):
+        changes = name_changes(DHCP, NAME, None, rebind=True)
+        self.assertIn(["add_list", f"dhcp.cfg01411c.rebind_domain=/{NAME}/"], changes)
+        after = applied(DHCP, changes)
+        self.assertIn(f"dhcp.cfg01411c.rebind_domain='/{NAME}/'", after)
+        self.assertNotIn('server=', after, 'the name is still not answered locally')
+        self.assertEqual(name_changes(after, NAME, None, rebind=True, previous=NAME), [], 'nothing to do when current')
+
+    def test_a_renamed_domain_replaces_the_whitelist_entry(self):
+        tesla = applied(DHCP, name_changes(DHCP, NAME, None, rebind=True))
+        renamed = applied(tesla, name_changes(tesla, 'dashplay.lan', None, rebind=True, previous=NAME))
+        self.assertNotIn(f'/{NAME}/', renamed)
+        self.assertIn("dhcp.cfg01411c.rebind_domain='/dashplay.lan/'", renamed)
+
+    def test_turning_tesla_mode_off_removes_the_whitelist(self):
+        tesla = applied(DHCP, name_changes(DHCP, NAME, None, rebind=True))
+        back = applied(tesla, name_changes(tesla, NAME, LAN_IP, previous=NAME))
+        self.assertNotIn('rebind_domain', back)
+        self.assertIn(f"dhcp.dashplay.ip='{LAN_IP}'", back)
+        self.assertEqual(name_changes(back, NAME, LAN_IP), [])
+
+    def test_another_programs_whitelist_entries_are_left_alone(self):
+        other = DHCP + "dhcp.cfg01411c.rebind_domain='/other.example/'\n"
+        tesla = applied(other, name_changes(other, NAME, None, rebind=True))
+        self.assertIn("'/other.example/'", tesla)
+        back = applied(tesla, name_changes(tesla, NAME, LAN_IP, previous=NAME))
+        self.assertNotIn(f'/{NAME}/', back)
+        self.assertIn("'/other.example/'", back)
 
     def test_the_lan_address_by_default(self):
         changes = name_changes(DHCP, NAME, LAN_IP)
         after = applied(DHCP, changes)
         self.assertIn(f"dhcp.dashplay.ip='{LAN_IP}'", after)
         self.assertNotIn("dashplay6", after)
+        self.assertNotIn("rebind_domain", after, 'other modes do not touch the rebind whitelist')
         self.assertEqual(name_changes(after, NAME, LAN_IP), [], "nothing to do when current")
 
     def test_beside_the_lan_address(self):

@@ -203,6 +203,69 @@ class BluetoothIdentityTests(unittest.TestCase):
                     with self.assertRaises(ValueError):identity.prepare()
                 self.assertFalse(identity.path.exists())
 
+    def unconfigured_run(self, argv, **kwargs):
+        """btmgmt on a Snapdragon 410 stick (btqcomsmd, no local-bd-address): unconfigured until public-addr."""
+        self.calls.append(argv)
+        if argv[-2] == 'public-addr':
+            self.current = argv[-1]
+        if argv[-1] == 'config':
+            text = ('Unconfigured index list with 1 item\nhci0:\tUnconfigured controller\n\tmanufacturer 29\n'
+                    '\tsupported options: public-address \n\tmissing options: public-address \n' if self.current is None
+                    else 'Unconfigured index list with 0 items\n')
+        elif argv[-1] == 'info':
+            text = ('Reading info for index 0 failed with status 0x11 (Invalid Index)' if self.current is None
+                    else 'addr ' + self.current)
+        elif argv[-1] == 'show':
+            text = 'Controller ' + self.current + ' (public)' if self.current else 'No default controller available'
+        else:
+            text = ''
+        return subprocess.CompletedProcess(argv, 0, text, '')
+
+    def test_controller_without_an_address_gets_this_boxes_own_and_keeps_it(self):
+        derived = '02:00:00:00:00:44'
+        with patch('platform_debian.machine_key', return_value='synthetic-cid'), \
+                patch('platform_debian.derived_address', return_value=derived):
+            for _ in range(2):   # it forgets the address at every boot
+                self.current = None
+                identity = BluetoothIdentity(self.state, self.bluez, self.unconfigured_run, lambda _: None)
+                identity.prepare()
+                self.assertEqual(self.current, derived)
+                self.assertTrue(identity.verify())
+        self.assertEqual(json.loads((self.state / 'bluetooth-identity.json').read_text())['address'], derived)
+        self.assertEqual([c[-1] for c in self.calls if 'public-addr' in c], [derived, derived])
+
+    def test_controller_without_an_address_returns_to_the_paired_identity(self):
+        self.bond(self.old)
+        self.current = None
+        with patch('platform_debian.machine_key', return_value='synthetic-cid'), \
+                patch('platform_debian.derived_address', return_value='02:00:00:00:00:44'):
+            BluetoothIdentity(self.state, self.bluez, self.unconfigured_run, lambda _: None).prepare()
+        self.assertEqual(self.current, self.old, 'the iPhone is paired with this one')
+        self.current = None
+        BluetoothIdentity(self.state, self.bluez, self.unconfigured_run, lambda _: None).prepare()
+        self.assertEqual([c[-1] for c in self.calls if 'public-addr' in c][-1], self.old)
+        self.assertEqual(len([c for c in self.calls if 'public-addr' in c]), 3, 'from the second boot the saved one at once')
+
+    def test_btmgmt_without_config_reads_the_controller_as_before(self):
+        self.current = self.old
+        def no_config(argv, **kwargs):
+            if argv[-1] == 'config':
+                raise subprocess.CalledProcessError(1, argv, 'Invalid command')
+            return self.fake_run(argv, **kwargs)
+        identity = BluetoothIdentity(self.state, self.bluez, no_config, lambda _: None)
+        identity.prepare()
+        self.assertTrue(identity.verify())
+
+    def test_unconfigured_controller_that_never_takes_the_address_blocks_wireless(self):
+        def stuck(argv, **kwargs):
+            result = self.unconfigured_run(argv, **kwargs)
+            self.current = None
+            return result
+        self.current = None
+        (self.state / 'bluetooth-identity.json').write_text('{"address":"02:00:00:00:00:44"}')
+        with self.assertRaisesRegex(RuntimeError, 'did not take an address'):
+            BluetoothIdentity(self.state, self.bluez, stuck, lambda _: None).prepare()
+
     def test_zero_saved_address_is_rejected_before_touching_controller(self):
         (self.state/'bluetooth-identity.json').write_text('{"address":"00:00:00:00:00:00"}')
         identity=BluetoothIdentity(self.state,self.bluez,self.fake_run,lambda _:None)

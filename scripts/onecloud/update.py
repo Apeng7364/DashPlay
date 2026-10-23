@@ -15,6 +15,7 @@ Never while CarPlay is in use, and never by itself: the boxes only check (once a
 Progress goes to state/update-status.json, which the settings page and LuCI show.
 """
 import argparse
+import email.utils
 import hashlib
 import http.client
 import json
@@ -465,11 +466,43 @@ def launch(root, openwrt=None):
     return "已开始升级，约 2–5 分钟，期间 CarPlay 会断开"
 
 
+# Plain HTTP on purpose: its Date header needs no clock, while HTTPS fails on a clock off by months. A box without a
+# battery-backed clock (OneCloud, N1) starts from its last saved time, and NTP may not get through where the update
+# check's HTTPS does; DashPlay OS on 410 sticks has no timesyncd at all (it stalled every shutdown step 30 s, 2026-10-21).
+CLOCK_URLS = ("http://www.baidu.com/", "http://connectivitycheck.gstatic.com/generate_204")
+CLOCK_SLACK = 600
+
+
+def clock_from_http(urls=CLOCK_URLS, now=time.time, set_clock=None, opener=urllib.request.urlopen):
+    """Set the system clock from the first reachable server's Date header when it is off by more than 10 minutes.
+    Returns the offset applied in seconds, 0 when the clock was right, None when no server answered."""
+    for url in urls:
+        try:
+            with opener(urllib.request.Request(url, headers={"User-Agent": "DashPlay-clock"}), timeout=10) as response:
+                date = response.headers.get("Date")
+        except Exception:
+            continue
+        try:
+            server = email.utils.parsedate_to_datetime(date).timestamp()
+        except (TypeError, ValueError):
+            continue
+        offset = server - now()
+        if abs(offset) <= CLOCK_SLACK:
+            return 0
+        (set_clock or (lambda t: time.clock_settime(time.CLOCK_REALTIME, t)))(server)
+        return offset
+    return None
+
+
 def checker(root, stopped, enabled=True, first=120):
     """Supervisor thread body: check once soon after start, then daily. Never installs."""
     if not enabled or stopped.wait(first):
         return
     while True:
+        try:
+            clock_from_http()
+        except Exception:   # a wrong clock must not stop the check either
+            pass
         try:
             check(root)
         except Exception:   # a check must never take the service down

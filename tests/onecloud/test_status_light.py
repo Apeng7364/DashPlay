@@ -54,6 +54,35 @@ class StatusLightTests(unittest.TestCase):
             light.show('live')
             self.assertEqual(((led / 'trigger').read_text().strip(), (led / 'brightness').read_text().strip()), ('none', '1'))
 
+    def test_snapdragon_410_stick_uses_its_green_and_blue_and_leaves_power_alone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('red:power', 'green:wlan', 'blue:wan'):
+                led = root / name; led.mkdir()
+                (led / 'trigger').write_text('[phy0tx]\n'); (led / 'brightness').write_text('0\n')
+            light = StatusLight(root)
+            light.show('waiting')
+            self.assertEqual(((root / 'blue:wan' / 'brightness').read_text(), (root / 'green:wlan' / 'trigger').read_text()),
+                             ('1\n', 'none\n'))
+            light.show('starting')
+            self.assertEqual((root / 'green:wlan' / 'trigger').read_text(), 'timer\n')
+            self.assertEqual((root / 'red:power' / 'trigger').read_text(), '[phy0tx]\n')
+
+    def test_openstick_v1_kernel_led_names_on_the_stick(self):
+        # OpenStick v1's 5.15 kernel names the same LEDs red:os / green:internet / blue:wifi, beside the SIM switches.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('red:os', 'green:internet', 'blue:wifi', 'sim:sel'):
+                led = root / name; led.mkdir()
+                (led / 'trigger').write_text('[none]\n'); (led / 'brightness').write_text('0\n')
+            light = StatusLight(root)
+            light.show('waiting')
+            self.assertEqual(((root / 'blue:wifi' / 'brightness').read_text(), (root / 'green:internet' / 'brightness').read_text()),
+                             ('1\n', '0\n'))
+            light.show('starting')
+            self.assertEqual((root / 'green:internet' / 'trigger').read_text(), 'timer\n')
+            self.assertEqual([(root / name / 'trigger').read_text() for name in ('red:os', 'sim:sel')], ['[none]\n'] * 2)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -129,6 +129,14 @@ def ap_channel_problem(iw_list, freq):
     return None
 
 
+def five_ghz(iw_list):
+    """From `iw list`: True when the radio has a usable 5 GHz channel, False when it lists only 2.4 GHz (the WCN3620
+    of Snapdragon 410 sticks registers no 5 GHz band at all), None when no radio was listed (iw failed)."""
+    if "Wiphy " not in iw_list:
+        return None
+    return re.search(r"\* 5\d{3}(?:\.0)? MHz \[\d+\](?![^\n]*disabled)", iw_list) is not None
+
+
 def missed_on_known_freq(scan_results, ssid):
     """`wpa_cli scan_results` after scanning only last time's frequency: True when that scan found
     networks but not the car hotspot, i.e. the car moved channel (Xpeng: 149 one drive, 36 the next)."""
@@ -170,6 +178,9 @@ SINGLE = {
     "fallback": (150, 150),             # fast blink: the car hotspot was not found
 }
 SINGLE_LEDS = ("n1:white:status",)
+# Snapdragon 410 sticks: green and blue show the states as on the OneCloud, red is power and left alone. Mainline
+# msm8916-ufi.dtsi names them colour:function; OpenStick v1's 5.15 kernel (what the sticks run) names them otherwise.
+STICK_LEDS = ({"green": "green:wlan", "blue": "blue:wan"}, {"green": "green:internet", "blue": "blue:wifi"})
 
 
 class StatusLight:
@@ -194,6 +205,10 @@ class StatusLight:
         if state == self.shown or state not in STATES:
             return
         coloured = [(self.root / f"onecloud:{color}:alive", mode) for color, mode in STATES[state].items()]
+        for names in STICK_LEDS:
+            if any(led.exists() for led, _ in coloured):
+                break
+            coloured = [(self.root / names[color], mode) for color, mode in STATES[state].items()]
         if any(led.exists() for led, _ in coloured):
             for led, mode in coloured:
                 if led.exists():
@@ -330,6 +345,17 @@ class DebianPlatform:
         """Channels a station and an AP may use at once: 0 none, 1 the same (rtw88 built by
         build-rtw88-concurrent.sh), 2 different ones (MT7921AU)."""
         return supports_sta_ap(subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout)
+
+    def wired_capable(self, compatible=Path("/proc/device-tree/compatible")):
+        """Whether the iPhone can be plugged in: not on a Snapdragon 410 stick, whose only USB port is its plug (device
+        side, no power out for a phone)."""
+        try:
+            return b"qcom,msm8916" not in compatible.read_bytes().split(b"\0")
+        except OSError:
+            return True
+
+    def five_ghz(self):
+        return five_ghz(subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout)
 
     def ap_channel_problem(self, freq):
         return ap_channel_problem(subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout, freq)
@@ -482,6 +508,11 @@ class DebianPlatform:
         if frequency:
             command += ["freq", str(frequency)]
         return subprocess.run(command + (["ap-force"] if ap else []), capture_output=True, text=True, timeout=30)
+
+    def survey(self):
+        """`iw dev X scan` before the box hotspot starts, for supervisor.quiet_channel; the interface must be up."""
+        subprocess.run(["ip", "link", "set", "dev", self.interface, "up"], capture_output=True, timeout=10)
+        return self.scan().stdout
 
     def scan_networks(self, own_ssid, ap=False):
         from setup_wizard import parse_scan

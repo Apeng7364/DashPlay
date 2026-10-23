@@ -49,3 +49,15 @@ playport-remember-before-release.patch
 playport-follow-author.patch
 playport-fullscreen-button-place.patch
 playport-auto-resolution-2560.patch
+playport-display-restart.patch
+playport-reconnect-speed.patch
+playport-decode-backlog.patch
+playport-display-pending-save.patch
+playport-window-shape-fit.patch
+playport-ui-size-physical-mm.patch
+playport-window-size-stable.patch
+playport-portrait-stream.patch
+playport-window-renegotiate.patch
+playport-touch-swipe.patch
+playport-performance-mode.patch
+playport-slim-runtime.patch

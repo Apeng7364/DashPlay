@@ -58,6 +58,8 @@ def direct_capable(platform):
     except (OSError, subprocess.SubprocessError):
         concurrent = 0
     if not concurrent:
+        if not platform.wired_capable():
+            return False, '这台盒子的无线网卡不能同时连车机热点又开自己的热点，也没有接 iPhone 的数据线口：连车机热点时出不了 CarPlay。'
         return False, '这台盒子的无线网卡不能同时连车机热点又开自己的热点，iPhone 只能用数据线。'
     if not board_phicomm_n1.direct_ready():
         return False, ('N1 没用上新无线固件（缺 /lib/firmware/cypress/cyfmac43455-sdio.bin 7.45.234），'
@@ -81,6 +83,38 @@ def hotspot_attempts(channel, width):
     if channel > 14:
         attempts.append((6, 20))
     return attempts
+
+
+def radio_hotspot(channel, width, five, quiet=6):
+    """The box hotspot's (channel, width) on this radio: five is platform.five_ghz(). A radio without 5 GHz (the
+    WCN3620 of Snapdragon 410 sticks) starts on 2.4 GHz channel quiet (quiet_channel) instead of failing on 149
+    first; unknown keeps it. A 2.4 GHz channel set in service.json is kept as it is."""
+    return (quiet, 20) if channel > 14 and five is False else (channel, width)
+
+
+QUIET_CHANNELS = (1, 6, 11)
+
+
+def quiet_channel(scan):
+    """Of the non-overlapping 2.4 GHz channels, the one other networks load least, from `iw dev X scan`: each
+    network counts by its received power times how much it overlaps (none 5 channels apart; a 40 MHz network's
+    secondary channel too). Channel 6 unless another carries half its load or less. On a 410 stick at home, 6
+    with three other networks stalled CarPlay for seconds where 11 ran smoothly (2026-10-20)."""
+    load = dict.fromkeys(QUIET_CHANNELS, 0.0)
+    for block in re.split(r"^BSS ", scan, flags=re.M)[1:]:
+        freq = re.search(r"^\s*freq: ([\d.]+)", block, re.M)
+        signal = re.search(r"^\s*signal: (-?[\d.]+) dBm", block, re.M)
+        if not freq or not signal or float(freq.group(1)) > 3000:
+            continue
+        used = [channel_of(float(freq.group(1)))]
+        offset = re.search(r"secondary channel offset: (above|below)", block)
+        if offset:
+            used.append(used[0] + (4 if offset.group(1) == "above" else -4))
+        power = 10 ** (float(signal.group(1)) / 10)
+        for candidate in QUIET_CHANNELS:
+            load[candidate] += power * max(max(0.0, 1 - abs(u - candidate) / 5) for u in used)
+    best = min(QUIET_CHANNELS, key=lambda c: (load[c], c != 6))
+    return best if load[best] * 2 <= load[6] else 6
 
 
 options = setup_wizard.options
@@ -215,6 +249,18 @@ def main():
         setup_wizard.save_json(state / "hotspot.json", hotspot)
     ap_passphrase = None if open_ap else hotspot["passphrase"]
     ap_security = ["--security", "open"] if open_ap else []
+    try:
+        five = platform.five_ghz()
+    except (OSError, subprocess.SubprocessError):
+        five = None
+    quiet = 6
+    if channel > 14 and five is False:
+        try:
+            quiet = quiet_channel(platform.survey())
+        except (OSError, subprocess.SubprocessError):
+            pass
+        print(f"box hotspot: 2.4 GHz only; channel {quiet} is the quietest of {QUIET_CHANNELS}", flush=True)
+    channel, width = radio_hotspot(channel, width, five, quiet)
     platform.configure_hotspot(channel, width, hotspot["ssid"], ap_passphrase)
     stopped = threading.Event()
     reexec = []   # reason, when the configuration changed and the service should restart itself
@@ -223,7 +269,7 @@ def main():
         signal.signal(sig, lambda *_: (reexec.clear(), reexec.append(None), stopped.set()))
     children = platform.children
     status = {"mode": "starting", "entries": [], "box_ssid": hotspot["ssid"], "home": f"http://{address.ip}/",
-              "identity": have_identity, "ap_ip": str(address.ip), "tesla": tesla}
+              "identity": have_identity, "ap_ip": str(address.ip), "tesla": tesla, "only_24ghz": five is False}
 
     def load_json(name):
         try:
@@ -303,6 +349,7 @@ def main():
         mark("supervisor start")
         platform.prepare(wait_for)
         status["direct_capable"], why_not_direct = direct_capable(platform)
+        status["wired_capable"] = platform.wired_capable()
         platform.ensure_receiver_ipv6()
         light.show("starting")
         settings.start()
@@ -358,9 +405,10 @@ def main():
         fallback = '已改用数据线' if use == 'car_hotspot' else 'iPhone 改经随身 WiFi 连接'
         direct_active = False
         WIRED_STATUS.unlink(missing_ok=True)
-        # The cable is always offered; wireless (Bluetooth handoff) except in car_hotspot mode.
+        # The cable is offered where the iPhone can be plugged in (not a 410 stick: its USB bridge cost 7 MB for
+        # nothing); wireless (Bluetooth handoff) except in car_hotspot mode.
         # Remote debugging hands the iPhone no Wi-Fi: the phone hotspot is the owner's, not the car's.
-        usb_args = ["--wired", "--wired-status", str(WIRED_STATUS)] + (
+        usb_args = (["--wired", "--wired-status", str(WIRED_STATUS)] if platform.wired_capable() else []) + (
             [] if setup_wizard.wireless(setup, options(state)) and not debug else ["--no-wireless"]) + [
             # state/options.json "idle_release": seconds without a viewer before wireless CarPlay ends (0: never);
             # in state/, which program updates keep (they replace service.json).

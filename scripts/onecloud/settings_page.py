@@ -141,6 +141,17 @@ class SettingsPage:
         """The box can keep a joined hotspot and its own one for the iPhone at once (supervisor.direct_capable)."""
         return bool(self.status().get('direct_capable'))
 
+    def wired_capable(self):
+        """The box has a USB port for the iPhone (status wired_capable, absent on older status: yes)."""
+        return self.status().get('wired_capable') is not False
+
+    def band_note(self, label):
+        """Under a hotspot list when the radio has no 5 GHz (status only_24ghz, Snapdragon 410 sticks): such hotspots
+        never show up in it."""
+        if not self.status().get('only_24ghz'):
+            return ''
+        return f'这台盒子的无线网卡只支持 2.4 GHz，5 GHz 的{label}不会出现在列表里；要连它请先把它改成 2.4 GHz（画面可能偏卡）。'
+
     def networks(self):
         """The scanned hotspots, or None while a scan runs (the page then shows "scanning" and reloads)."""
         if not self.scanner:
@@ -600,7 +611,7 @@ class SettingsPage:
         if path == '/iphone':
             value = form.get('iphone')
             draft = dict(chosen, **setup)
-            if value not in [key for key, *_ in iphone_choices(draft, self.direct_capable())]:
+            if value not in [key for key, *_ in iphone_choices(draft, self.direct_capable(), self.wired_capable())]:
                 raise ValueError('前面的需求只能使用数据线；请先修改网络来源。')
             setup_wizard.save(self.state, dict(setup, iphone=value))
         else:
@@ -658,7 +669,7 @@ class SettingsPage:
         direct_status = self.status().get('direct_phone')
         rows = ui.banner(direct_status, 'ok' if direct_status.startswith('iPhone 直连') else 'wait') if direct_status else ''
         rows += f'<form method=post action=/iphone>{ui.hidden(nonce)}'
-        for key, title, text in iphone_choices(draft, capable):
+        for key, title, text in iphone_choices(draft, capable, self.wired_capable()):
             rows += (f'<label class=cell><input type=radio name=iphone value={key}{" checked" if setup.get("iphone")==key else ""}>'
                      f'<span class=main><b>{title}</b><span>{text}</span></span></label>')
         rows += '<button class="cell action">保存</button></form>'
@@ -880,7 +891,7 @@ class SettingsPage:
             f"找不到{label}时，盒子临时打开自己的热点「{escape(box.get('ssid', ''))}」，手机连它进入设置。")
         foot = ("盒子连车机热点，车机浏览器经它打开 CarPlay 画面。请先在车机上打开它的热点。"
                 if setup.get("mode") == "car_hotspot" else
-                "盒子、车机和 iPhone 都连这个随身 WiFi。请先打开随身 WiFi。")
+                "盒子、车机和 iPhone 都连这个随身 WiFi。请先打开随身 WiFi。") + self.band_note(label)
         picker = ui.scanning(label) if networks is None else ui.network_picker(
             networks, setup.get("car") if trying else None, nonce, "car", "/setup", "连接", foot, extra, label)
         body = (f'{self.back_link()}<h1>连接{label}</h1><p class=sub>首次设置：第 2 步，共 3 步</p>{notice}'
@@ -951,7 +962,7 @@ class SettingsPage:
                            ui.SCANNING_RELOAD)
         picker = ui.network_picker(networks, car.get("ssid"), nonce, "save", "/car", "连接",
                                    "保存后盒子会切换过去；连不上时临时打开盒子自己的热点。" +
-                                   ("密码留空表示沿用已保存的密码。" if car else ""), label=label)
+                                   ("密码留空表示沿用已保存的密码。" if car else "") + self.band_note(label), label=label)
         body = f'<a class=back href="/">‹ 盒子设置</a><h1>{label}</h1>{notice}{picker}'
         page = ui.page(label, body)
         # A saved password may be kept, so the field is optional on this page only.

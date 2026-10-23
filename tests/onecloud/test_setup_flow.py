@@ -77,6 +77,20 @@ class SetupFlowTests(unittest.TestCase):
         self.assertIn('正在扫描', self.page.render(''))
         release.set()
 
+    def test_a_radio_without_5ghz_says_so_under_the_hotspot_list(self):
+        # Snapdragon 410 sticks (WCN3620): a 5 GHz car hotspot is never in the list, so the page says why.
+        class Listing:
+            def results(self):
+                return [{'ssid': 'Car 2.4', 'band': '2.4', 'signal': -50}]
+        self.page.scanner = Listing()
+        self.answer('vehicle', value='other')
+        self.answer('mode', value='car_hotspot')
+        self.assertNotIn('只支持 2.4 GHz', self.page.render(''))
+        self.status['only_24ghz'] = True
+        html = self.page.render('')
+        self.assertIn('value="Car 2.4"', html)
+        self.assertIn('只支持 2.4 GHz，5 GHz 的车机热点不会出现在列表里', html)
+
     def test_car_hotspot_offers_the_direct_wireless_way_only_when_the_box_can(self):
         # 2026-10-17: the direct iPhone hotspot is a normal choice; whether it is offered depends on the radio only.
         def until_iphone():
@@ -139,6 +153,33 @@ class SetupFlowTests(unittest.TestCase):
         self.assertFalse(capable); self.assertIn('新无线固件', why)
         with patch.object(supervisor.board_phicomm_n1, 'direct_ready', return_value=True):
             self.assertEqual(supervisor.direct_capable(radio), (True, None))
+
+    def test_a_box_without_cable_or_direct_hotspot_is_not_offered_the_car_hotspot(self):
+        # Snapdragon 410 stick: no station + AP at once, no USB port for the iPhone. Way one would carry no CarPlay.
+        self.status.update(direct_capable=False, wired_capable=False)
+        self.answer('vehicle', value='other')
+        html = self.page.render('')
+        self.assertNotIn('value="car_hotspot"', html)
+        self.assertIn('也没有接 iPhone 的数据线口', html)
+        with self.assertRaises(ValueError):
+            self.answer('mode', value='car_hotspot')
+        self.answer('mode', value='no')
+        self.answer('mifi', value='box_hotspot')
+        self.answer('network', ssid='Box', password='synthetic-box')
+        self.answer('internet', value='none')
+        self.answer('sound', value='no')
+        html = self.page.render('')
+        self.assertIn('没有接 iPhone 的数据线口，只用无线', html)
+        self.assertNotIn('value="wired"', html)
+        with self.assertRaises(ValueError):
+            self.answer('iphone', value='wired')
+        self.answer('iphone', value='any')
+        self.answer('summary', value='confirm')
+        self.assertEqual(setup_wizard.load(self.state)['mode'], 'box_hotspot')
+        self.assertTrue(setup_wizard.wireless(setup_wizard.load(self.state), setup_wizard.options(self.state)))
+        from unittest.mock import Mock
+        radio = Mock(); radio.concurrent_ap.return_value = 0; radio.wired_capable.return_value = False
+        self.assertIn('出不了 CarPlay', supervisor.direct_capable(radio)[1])
 
     def test_box_hotspot_password_fields_say_what_an_empty_one_means(self):
         self.answer('vehicle', value='other'); self.answer('mode', value='no'); self.answer('mifi', value='box_hotspot')

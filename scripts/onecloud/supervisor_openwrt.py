@@ -79,6 +79,7 @@ WIRED_STATUS = RUN / "wired-status.json"
 # firewall drops 100.64.0.0/10 from other interfaces unless told not to (shared_lan_conflict).
 SHARED_LAN = setup_wizard.SHARED_LAN
 LAN_BEFORE = "lan-before.json"   # in state/: the LAN address to put back when shared_lan is turned off
+REBIND_NAME = "dns-rebind-name"  # in state/: the own name allowed through dnsmasq's rebind protection
 # LuCI applies with rollback: rpcd keeps the previous configuration here until the browser confirms it still
 # reaches the router (about 90 s), else puts it back. A LAN moved before that confirm cannot be confirmed,
 # so shared_lan would be rolled back to 0 and the address with it.
@@ -135,12 +136,19 @@ def read_config(uci_text):
     return config
 
 
-def name_changes(uci_dhcp, name, host, public=None, only_public=False):
+def name_changes(uci_dhcp, name, host, public=None, only_public=False, rebind=False, previous=None):
     """`uci -q show dhcp` -> the uci commands that make the router's DNS answer name -> host (its LAN address,
     record "dashplay") and name -> public (its own public IPv6 address, record "dashplay6", uci
     dashplay.main.public_ipv6). only_public leaves the LAN address out, and the name is then answered
     locally only: dnsmasq asks upstream for a type the hosts records lack, and a public record of the name
-    may point at the LAN (F50, 2026-10-13). Without a public address the LAN address stays. [] when current."""
+    may point at the LAN (F50, 2026-10-13). Without a public address the LAN address stays. [] when current.
+
+    rebind allows this one name through dnsmasq's DNS-rebind protection (rebind_domain, i.e.
+    --rebind-domain-ok). With only_public the answer comes from upstream, and in Tesla mode the name's public
+    record points into 100.64.0.0/10, where the LAN lives; dnsmasq 2.93 (OpenWrt 25.12.5) counts such a
+    forwarded answer as a rebind attack, so the access point's clients never got the address. previous is the
+    name whitelisted last time: a rename has to drop its entry even when no local record is left to read it
+    from (only_public deletes them)."""
     kinds, options = {}, {}
     for line in (uci_dhcp or "").splitlines():
         match = re.match(r"^dhcp\.([^.=]+)=(\w+)$", line)
@@ -163,20 +171,31 @@ def name_changes(uci_dhcp, name, host, public=None, only_public=False):
     if dns:
         servers = options.get(dns, {}).get("server", [])
         ours = {f"/{old}/" for section in ("dashplay", "dashplay6") for old in options.get(section, {}).get("name", [])}
+        if previous:
+            ours.add(f"/{previous}/")
         local = f"/{name}/" if alone else None
         for entry in sorted((ours | {f"/{name}/"}) - {local}):
             if entry in servers:
                 changes.append(["del_list", f"dhcp.{dns}.server={entry}"])
         if local and local not in servers:
             changes.append(["add_list", f"dhcp.{dns}.server={local}"])
+        # Only this name, and only while it is answered upstream: never the global rebind_protection, and never
+        # the names other programs put there.
+        allowed = {f"/{name}/"} if rebind else set()
+        whitelist = options.get(dns, {}).get("rebind_domain", [])
+        for entry in sorted(ours - allowed):
+            if entry in whitelist:
+                changes.append(["del_list", f"dhcp.{dns}.rebind_domain={entry}"])
+        for entry in sorted(allowed - set(whitelist)):
+            changes.append(["add_list", f"dhcp.{dns}.rebind_domain={entry}"])
     return changes + [["commit", "dhcp"]] if changes else []
 
 
-def point_name(name, host, public=None, only_public=False):
+def point_name(name, host, public=None, only_public=False, rebind=False, previous=None):
     """Keep our uci dhcp records answering name -> the router (name_changes), so the head unit can open
     https://dashplay.lan:18443/ whatever the LAN address. Returns True when they changed."""
     shown = subprocess.run(["uci", "-q", "show", "dhcp"], capture_output=True, text=True).stdout
-    changes = name_changes(shown, name, host, public, only_public)
+    changes = name_changes(shown, name, host, public, only_public, rebind, previous)
     if not changes:
         return False
     for change in changes:
@@ -566,10 +585,26 @@ def main():
         def point(public):
             # The public own name resolves normally online. OfflineChecks owns its A-mode answer.
             upstream_name = config["tesla_mode"] == "1" and ddns is not None
+            # No local answer here, and Tesla mode's LAN address is in 100.64.0.0/10: dnsmasq counts a forwarded
+            # answer there as a rebind attack (2.93, OpenWrt 25.12.5), so this one name is allowed through while
+            # the box itself is the access point's DNS (2026-10-23).
+            try:
+                previous = (state / REBIND_NAME).read_text().strip() or None
+            except OSError:
+                previous = None
             if point_name(config["name"], None if upstream_name else host,
-                          None if upstream_name else public, public_mode == "2" and not upstream_name):
-                say("own name uses upstream DNS" if upstream_name else f"{config['name']} now points at "
+                          None if upstream_name else public, public_mode == "2" and not upstream_name,
+                          rebind=upstream_name, previous=previous):
+                say(f"own name uses upstream DNS (dnsmasq rebind whitelist: /{config['name']}/)" if upstream_name
+                    else f"{config['name']} now points at "
                     + " and ".join(a for a in ([] if public and public_mode == "2" else [host]) + [public] if a))
+            try:
+                if upstream_name:
+                    (state / REBIND_NAME).write_text(config["name"] + "\n")
+                elif previous:
+                    (state / REBIND_NAME).unlink()
+            except OSError:
+                pass
 
         public = platform.public_ipv6(network["device"]) if named and public_mode != "0" else None
         if named:

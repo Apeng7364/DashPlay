@@ -61,6 +61,14 @@ def write_browser_access(root, token, settings_port=80, car_music=False, tesla=F
 PASSPHRASE_FIELD = re.compile(r'(passphrase:\s*)"(?:[^"\\]|\\.)*"')
 
 
+def heap_limit(meminfo):
+    """The JVM heap ceiling for this board, from /proc/meminfo. 384 MB on the 1-2 GB boxes (F50 measured ~180 MB
+    resident). A Snapdragon 410 stick has 512 MB, of which the modem and Wi-Fi firmware keep ~100 MB: a 384 MB
+    ceiling there would let the heap outgrow the board, so 224 MB (not yet measured on a stick)."""
+    found = re.search(r"^MemTotal:\s+(\d+) kB", meminfo, re.M)
+    return "-Xmx224m" if found and int(found.group(1)) < 640 * 1024 else "-Xmx384m"
+
+
 def redact(line, token, password):
     """A receiver log line without the viewer token or the hotspot password."""
     line = line.replace(token, "[REDACTED]")
@@ -157,16 +165,18 @@ def main():
     # AppCDS keeps working after jar updates only if the archive is rebuilt; this JDK mapped a stale
     # archive, logged "shared class paths mismatch" and neither used nor re-dumped it (2026-10-10),
     # costing ~3 s per start. Drop the archive whenever any classpath jar changes.
+    # The JVM's own archive too: after a Java update the old one failed its checksum and AppCDS was off for that start.
+    jvm = Path(args.java).resolve().parent.parent / "lib/server"
     jars = [root / "launcher/onecloud-launcher.jar",
-            *sorted((root / "playport/server/build/install/server/lib").glob("*.jar"))]
+            *sorted((root / "playport/server/build/install/server/lib").glob("*.jar")),
+            *(path for path in (jvm / "libjvm.so", jvm / "classes.jsa") if path.exists())]
     fingerprint = "\n".join(f"{jar.name} {jar.stat().st_size} {jar.stat().st_mtime_ns}" for jar in jars)
     stamp = state / "app-cds.classpath"
     if not stamp.exists() or stamp.read_text() != fingerprint:
         (state / "app-cds.jsa").unlink(missing_ok=True)
         stamp.write_text(fingerprint)
     options = [
-        # 1 GB board: F50 measured ~180 MB resident, so a 384 MB heap ceiling leaves system headroom.
-        "-Xms64m", "-Xmx384m",
+        "-Xms64m", heap_limit(Path("/proc/meminfo").read_text()),
         # iAP2 bootstrap steps (message ids only, no credentials) for diagnosing a stalled Wi-Fi handoff.
         "-Dorg.slf4j.simpleLogger.log.wireless=debug",
         # Milliseconds since JVM start on every line, for boot-time profiling.

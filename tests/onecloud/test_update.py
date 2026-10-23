@@ -72,6 +72,54 @@ class Server:
         self.httpd.server_close()
 
 
+class ClockTests(unittest.TestCase):
+    """The update checker sets a clock months off (no battery clock, no NTP) from a plain-HTTP Date header first."""
+
+    class Reply:
+        def __init__(self, date):
+            self.headers = {"Date": date}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def opener(self, dates):
+        def open_(request, timeout):
+            date = dates.pop(0)
+            if isinstance(date, Exception):
+                raise date
+            return self.Reply(date)
+        return open_
+
+    def test_a_clock_months_behind_is_set_from_the_date_header(self):
+        set_to = []
+        offset = update.clock_from_http(urls=("http://a", "http://b"), now=lambda: 1_700_000_000.0,
+                                        set_clock=set_to.append,
+                                        opener=self.opener(["Tue, 21 Oct 2026 12:00:00 GMT"]))
+        self.assertEqual(set_to, [1792584000.0])
+        self.assertAlmostEqual(offset, 92_584_000.0)
+
+    def test_a_clock_within_ten_minutes_is_left_alone(self):
+        set_to = []
+        self.assertEqual(update.clock_from_http(urls=("http://a",), now=lambda: 1792584000.0 - 300,
+                                                set_clock=set_to.append,
+                                                opener=self.opener(["Tue, 21 Oct 2026 12:00:00 GMT"])), 0)
+        self.assertEqual(set_to, [])
+
+    def test_an_unreachable_or_dateless_server_falls_through_to_the_next(self):
+        set_to = []
+        offset = update.clock_from_http(urls=("http://a", "http://b", "http://c"), now=lambda: 0.0,
+                                        set_clock=set_to.append,
+                                        opener=self.opener([OSError("offline"), "not a date",
+                                                            "Tue, 21 Oct 2026 12:00:00 GMT"]))
+        self.assertEqual(set_to, [1792584000.0])
+        self.assertTrue(offset > 0)
+        self.assertIsNone(update.clock_from_http(urls=("http://a",), set_clock=set_to.append,
+                                                 opener=self.opener([OSError("offline")])))
+
+
 class VersionTests(unittest.TestCase):
     def test_dates_compare_as_numbers(self):
         self.assertTrue(update.newer('2026.10.19.1', '2026.10.19'))

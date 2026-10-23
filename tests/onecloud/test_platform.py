@@ -10,7 +10,7 @@ from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/onecloud'))
 from platform_api import Platform, get_platform
-from platform_debian import AP_VIF, DebianPlatform, ap_width, derived_address, hostapd_config, machine_key, supports_sta_ap, wifi_driver, wpa_network_lines
+from platform_debian import AP_VIF, DebianPlatform, ap_width, derived_address, five_ghz, hostapd_config, machine_key, supports_sta_ap, wifi_driver, wpa_network_lines
 from setup_wizard import Scanner
 
 
@@ -324,6 +324,23 @@ class PlatformTests(unittest.TestCase):
         self.assertFalse(supports_sta_ap(''))
         self.assertFalse(supports_sta_ap('\tvalid interface combinations:\n\t\t * #{ managed } <= 2,\n\t\t   total <= 2\n'))
 
+    def test_a_snapdragon_410_stick_has_no_port_for_the_iphone(self):
+        tree = self.platform.run / 'compatible'
+        tree.write_bytes(b'thwc,ufi001c\0qcom,msm8916\0')
+        self.assertFalse(self.platform.wired_capable(tree))
+        tree.write_bytes(b'phicomm,n1\0amlogic,s905d\0amlogic,meson-gxl\0')
+        self.assertTrue(self.platform.wired_capable(tree))
+        self.assertTrue(self.platform.wired_capable(self.platform.run / 'absent'))
+
+    def test_five_ghz_band_from_iw_list(self):
+        # Shaped like `iw list` of the WCN3620 in Snapdragon 410 sticks: wcn36xx registers Band 1 only.
+        wcn3620 = ('Wiphy phy0\n\tBand 1:\n\t\tFrequencies:\n\t\t\t* 2412.0 MHz [1] (20.0 dBm)\n'
+                   '\t\t\t* 2484.0 MHz [14] (disabled)\n')
+        dual = wcn3620 + '\tBand 2:\n\t\tFrequencies:\n\t\t\t* 5180.0 MHz [36] (20.0 dBm)\n'
+        off = wcn3620 + '\tBand 2:\n\t\tFrequencies:\n\t\t\t* 5180.0 MHz [36] (disabled)\n'
+        self.assertEqual((five_ghz(wcn3620), five_ghz(dual), five_ghz(off)), (False, True, False))
+        self.assertIsNone(five_ghz(''), 'iw failed: unknown, not 2.4 GHz only')
+
     def test_box_hotspot_width_follows_the_car_channel(self):
         self.assertEqual(ap_width(149, 80), 80)
         self.assertEqual(ap_width(36, 80), 80)
@@ -482,6 +499,39 @@ class PlatformTests(unittest.TestCase):
         self.assertEqual(supervisor.hotspot_attempts(149, 40), [(149, 40), (6, 20)])
         self.assertEqual(supervisor.hotspot_attempts(165, 80), [(165, 80), (6, 20)])
         self.assertEqual(supervisor.hotspot_attempts(6, 20), [(6, 20)])
+
+    def test_radio_without_5ghz_starts_its_hotspot_on_channel_6(self):
+        import supervisor
+        self.assertEqual(supervisor.radio_hotspot(149, 80, False), (6, 20))
+        self.assertEqual(supervisor.radio_hotspot(149, 80, True), (149, 80))
+        self.assertEqual(supervisor.radio_hotspot(149, 80, None), (149, 80), 'iw failed: keep the configured channel')
+        self.assertEqual(supervisor.radio_hotspot(11, 20, False), (11, 20))
+        self.assertEqual(supervisor.radio_hotspot(149, 80, False, 11), (11, 20))
+        self.assertEqual(supervisor.radio_hotspot(11, 20, False, 1), (11, 20), 'a 2.4 GHz channel set by hand stays')
+
+    @staticmethod
+    def bss(n, freq, signal, offset='no secondary'):
+        return (f'BSS 00:11:22:33:44:{n:02x}(on wlan0)\n\tfreq: {freq}.0\n\tsignal: {signal}.00 dBm\n\tSSID: net{n}\n'
+                f'\tHT operation:\n\t\t * secondary channel offset: {offset}\n')
+
+    def test_quiet_channel_leaves_a_crowded_6(self):
+        import supervisor
+        # The 410 stick at home: a strong router on 3 (overlapping 1 and 6), three networks on 6, a 40 MHz one on
+        # 8 (secondary above), two faint ones on 11 and a 5 GHz one that does not count.
+        scan = (self.bss(1, 2422, -31) + self.bss(2, 2437, -45) + self.bss(3, 2437, -60) + self.bss(4, 2437, -70)
+                + self.bss(5, 2447, -50, 'above') + self.bss(6, 2462, -71) + self.bss(7, 2462, -81)
+                + self.bss(8, 5745, -20))
+        self.assertEqual(supervisor.quiet_channel(scan), 11)
+
+    def test_quiet_channel_stays_on_6_unless_another_is_clearly_quieter(self):
+        import supervisor
+        self.assertEqual(supervisor.quiet_channel(''), 6, 'no scan: channel 6 as before')
+        self.assertEqual(supervisor.quiet_channel(self.bss(1, 2412, -60) + self.bss(2, 2437, -60) + self.bss(3, 2462, -60)), 6)
+        self.assertEqual(supervisor.quiet_channel(self.bss(1, 2412, -62) + self.bss(2, 2437, -60) + self.bss(3, 2462, -62)), 6,
+                         'only a little quieter')
+        self.assertEqual(supervisor.quiet_channel(self.bss(1, 2437, -60) + self.bss(2, 2462, -62)), 1, '1 is empty')
+        self.assertEqual(supervisor.quiet_channel(self.bss(1, 2437, -60) + self.bss(2, 2462, -60) + self.bss(3, 2412, -70)), 1)
+        self.assertEqual(supervisor.quiet_channel(self.bss(1, 2437, -60, 'below')), 11, 'a 40 MHz secondary on 2 loads 1')
 
 class KnownFrequencyTests(unittest.TestCase):
     def test_car_moved_channel_is_seen_from_one_scan(self):
