@@ -17,6 +17,15 @@ import supervisor_openwrt
 from supervisor_openwrt import (name_changes, read_config, trusted_networks, shared_lan_changes,
                                shared_lan_conflict, apply_shared_lan, car_audio_args, waiting_trust, waiting_warning)
 
+
+class ViewerPortConfigTests(unittest.TestCase):
+    def test_default_is_empty(self):
+        # Empty lets the supervisor adopt an owner's older state/receiver/config.json port; 18443 is the fallback.
+        self.assertEqual(read_config("")["viewer_port"], "")
+
+    def test_parsed(self):
+        self.assertEqual(read_config("dashplay.main.viewer_port='19000'")["viewer_port"], "19000")
+
 # Shape of `ubus call network.wireless status` on OpenWrt 25.12 (two radios, a 2.4 GHz AP listed first).
 WIRELESS = {
     "radio0": {"up": True, "config": {"band": "2g", "channel": "1"}, "interfaces": [

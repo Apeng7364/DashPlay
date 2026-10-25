@@ -9,12 +9,15 @@ import json
 from pathlib import Path
 import socket
 import subprocess
+import threading
 import setup_wizard
 
 TABLE = 'dashplay_tesla_checks'
 # Any one answering means the upstream works. A Chinese SIM may drop 1.1.1.1:443 and 8.8.8.8:443 while the
 # rest of the internet works (F50, 2026-10-15), so domestic resolvers come first.
 PROBES = (('223.5.5.5', 443), ('1.12.12.12', 443), ('1.1.1.1', 443))
+# Background upstream probe interval; the LAN never waits for it.
+PROBE_EVERY = 10
 
 
 def offline_fields(sections, network, host, own_name):
@@ -36,8 +39,9 @@ def offline_fields(sections, network, host, own_name):
     existing = sections[lan[0]].get('dhcp_option', [])
     existing = [existing] if isinstance(existing, str) else existing
     dhcp = [v for v in existing if v.split(',', 1)[0] not in ('3', '6')]
-    fields = {f'{dns[0]}.address': entries, f'{dns[0]}.server': None,
-              f'{dns[0]}.noresolv': '1', f'{dns[0]}.nohosts': '1', f'{dns[0]}.resolvfile': None,
+    # Only the check names are answered here; the upstream (server/resolvfile/noresolv) stays as it was,
+    # so the internet for everything else keeps working and only disappears when the 4G itself does.
+    fields = {f'{dns[0]}.address': entries,
               f'{dns[0]}.logqueries': '1', f'{dns[0]}.logfacility': None,
               f'{lan[0]}.dhcp_option': dhcp + [f'3,{address.ip}', f'6,{address.ip}']}
     return alias, fields
@@ -84,10 +88,12 @@ class OfflineChecks:
         self.run = run
         self.active = False
         self.wanted = None
-        self.samples = 0
         self.platform = platform
         self.query_process = None
         self.query_error = None
+        self.upstream = None
+        self.probe_stop = threading.Event()
+        self.probe_thread = None
 
     def start_query_log(self):
         if self.platform is None or self.query_process is not None and self.query_process.poll() is None:
@@ -128,6 +134,7 @@ class OfflineChecks:
         self.command(['/etc/init.d/dnsmasq', 'restart'])
 
     def restore(self):
+        self.stop_probe()
         self.stop_query_log()
         if not self.path.exists():
             return
@@ -150,31 +157,58 @@ class OfflineChecks:
             self.start_query_log()
             self.write_fields(fields)
             self.active = True
+            self.start_probe()
         except Exception:
             self.restore()
             raise
 
+    def start_probe(self):
+        if self.probe_thread is not None and self.probe_thread.is_alive():
+            return
+        self.probe_stop.clear()
+        self.probe_thread = threading.Thread(target=self._probe, name='tesla-upstream', daemon=True)
+        self.probe_thread.start()
+
+    def _probe(self):
+        while not self.probe_stop.is_set():
+            self.upstream = wan_available(self.run)
+            if self.probe_stop.wait(PROBE_EVERY):
+                break
+
+    def stop_probe(self):
+        self.probe_stop.set()
+        self.probe_thread = None
+        self.upstream = None
+
     def update(self, config, network, status, online=None):
-        was_active = self.active
         choice = config.get('answer_tesla_checks', 'auto')
         eligible = config.get('tesla_mode') == '1' and network['mode'] in ('ap', 'external')
-        upstream = wan_available(self.run) if eligible and choice != '0' and online is None else bool(online)
-        # Even explicit enable may not shadow genuine services when WAN is available.
-        wanted = eligible and choice != '0' and not upstream
-        self.samples = self.samples + 1 if wanted == self.wanted else 1
+        # The LAN (check answers, DHCP gateway/DNS, 80 redirect, 100.96) stays for the whole Tesla mode;
+        # only the upstream comes and goes. The Tesla's page, lease and CarPlay never change (2026-10-25).
+        wanted = eligible and choice != '0'
         self.wanted = wanted
-        # Stop answering immediately when WAN returns; require two offline samples after startup.
-        if self.active != wanted and (not wanted or self.samples >= 2 or 'tesla_offline' not in status):
-            if wanted:
-                self.enable(network, config['name'], int(config['settings_port']))
-            else:
-                self.restore()
-            status['tesla_network_change'] = '网络已切换，请在特斯拉上断开再连接 WiFi，更新网关租约'
+        try:
+            if self.active != wanted:
+                if wanted:
+                    self.enable(network, config['name'], int(config['settings_port']))
+                else:
+                    self.restore()
+        except Exception as error:   # CarPlay must keep running even if the Tesla plumbing cannot be built
+            self.active = False
+            status['tesla_error'] = type(error).__name__ + ': ' + str(error)
+        else:
+            status.pop('tesla_error', None)
         status['tesla_offline'] = self.active
         if self.active:
             self.start_query_log()  # a failed logger retries without interrupting CarPlay
         status['tesla_dns_log'] = ('error: ' + self.query_error if self.query_error else
                                    'recording' if self.query_process is not None and self.query_process.poll() is None else 'stopped')
-        status['tesla_internet'] = ('特斯拉：不上网（替特斯拉回答联网检查）。自带音乐、地图不能联网；要上网请插 SIM 卡。'
-                                    if self.active else '使用上游网络；F50 不支持借手机热点同时供车机连接。')
-        return was_active != self.active
+        if online is not None:
+            self.upstream = bool(online)
+        state = self.upstream
+        status['tesla_upstream'] = 'unknown' if state is None else ('online' if state else 'offline')
+        status['tesla_internet'] = (
+            '上游状态检测中；局域网 CarPlay 正常。' if state is None else
+            '上游在线；特斯拉自带音乐、地图可以上网。' if state else
+            '上游不可用（没有 4G 信号）；局域网 CarPlay 正常；特斯拉自带音乐、地图不能上网。')
+        return False

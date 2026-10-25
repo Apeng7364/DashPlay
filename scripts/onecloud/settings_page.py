@@ -23,6 +23,7 @@ import debug_uplink
 import own_domain
 from pairing_window import PairingWindow
 import settings_ui as ui
+import viewer_port
 import setup_wizard
 from setup_flow import FirstSetup, iphone_choices, limitations, validation_table
 import diagnostics
@@ -396,6 +397,9 @@ class SettingsPage:
         if path == "/audio":
             self.check_nonce(form)
             return self.save_car_audio(form)
+        if path == "/viewer-port":
+            self.check_nonce(form)
+            return self.save_viewer_port(form)
         if path == "/debug" and self.run:
             self.check_nonce(form)
             return self.apply_debug(form)
@@ -545,7 +549,7 @@ class SettingsPage:
                 f'<div class=inner style="padding:0 0 12px">{form}'
                 + (f'<p class=foot>{escape(state)}</p>' if state else "") +
                 '<p class=foot>在 duckdns.org 免费注册并建一个子域名，把子域名和页面上的 token 填在这里。盒子会把这个域名指向自己，'
-                '并向 Let’s Encrypt 申请免费的正式证书、到期前自动续签；车机改用 https://子域名.duckdns.org:18443/ 打开，'
+                f'并向 Let’s Encrypt 申请免费的正式证书、到期前自动续签；车机改用 https://子域名.duckdns.org:{viewer_port.resolve(self.state)}/ 打开，'
                 f'不再有证书警告。不需要开放任何端口。{ipv6}'
                 + ('盒子热点方式在车上没有网络，申请和续签要在家插上网线开机。' if mode == "box_hotspot" else "") + '</p></div></details>')
 
@@ -572,7 +576,7 @@ class SettingsPage:
             return (f"特斯拉浏览器不让开 192.168.x.x 这类局域网地址：要在{label}自己的后台把局域网地址改成 {shared}"
                     f"（100.64–100.127 开头的都行），盒子改不了{label}的地址。" + common)
         return (f"盒子热点的网段改成 {shared}（特斯拉浏览器不让开 192.168.x.x 这类局域网地址），车机打开 "
-                f"https://{shared}:18443/ ；改完车机和手机重新连一次盒子热点。" + common)
+                f"https://{shared}:{viewer_port.resolve(self.state)}/ ；改完车机和手机重新连一次盒子热点。" + common)
 
     def save_car_audio(self, form):
         chosen = _load(self.options_file)
@@ -821,7 +825,12 @@ class SettingsPage:
                                "用户名 root，密码 1234。文件放好后盒子会自动开始工作，网络和添加手机可以先设置。", "wait") + notice
         if self.managed:
             notice += ui.banner(self.status().get("tesla_internet", ""))
-            notice += ui.banner(self.status().get("tesla_network_change", ""), "wait")
+            internet = self.status().get("tesla_internet", "")
+            if internet:
+                notice += ui.banner(internet, "wait" if ("不可用" in internet or "检测" in internet) else "ok")
+            error = self.status().get("tesla_error", "")
+            if error:
+                notice += ui.banner("特斯拉模式局域网设置失败：" + error + "；CarPlay 不受影响。", "bad")
             return self.render_full(notice)
         setup = self.setup()
         if params.get("view", [""])[0] == "setup" or setup.get("wizard_version") == 2 and not setup.get("confirmed") and not setup.get("done"):
@@ -857,7 +866,7 @@ class SettingsPage:
         if mode == "box_hotspot":
             address = self.status().get("ap_ip", "192.168.78.1")
             return ("车机和 iPhone 都连这个热点。车机连上后不能上网（盒子热点没有互联网）；"
-                    f"CarPlay 画面地址固定为 https://{address}:18443/ 。")
+                    f"CarPlay 画面地址为 https://{address}:{viewer_port.resolve(self.state)}/ 。")
         return f"连不上{network_label(mode)}时，盒子临时打开这个热点，手机连它进入设置。"
 
     def render_hotspot_change(self, notice):
@@ -924,13 +933,20 @@ class SettingsPage:
             return ""
         mode = self.setup().get("mode")
         if self.managed:
-            foot = f"车机连接 WiFi「{escape(status.get('ssid', ''))}」后，在车机浏览器打开上面的地址。"
+            foot = f"车机连接 WiFi「{escape(status.get('ssid', ''))}」后，在车机浏览器打开上面的地址；画面端口在 LuCI 的 DashPlay 页设置。"
         elif status.get("mode") == "ap" and mode == "box_hotspot":
             foot = f"车机连接盒子热点「{escape(status.get('box_ssid', ''))}」后，在车机浏览器打开上面的地址。是否能上网请看「车机上网」当前状态。"
         elif status.get("mode") == "ap":
             foot = "当前通过盒子热点连接。在连着盒子热点的设备上打开上面的地址。"
         else:
             foot = f"当前通过{network_label(mode)}连接。在车机浏览器打开上面的地址。"
+        if not self.managed:
+            current = viewer_port.resolve(self.state)
+            entries += (f'<form method=post action=/viewer-port>{ui.hidden(self.pairing.nonce)}'
+                        f'<label class=cell><span class=main><b>画面端口</b>'
+                        f'<span>车机浏览器打开的 HTTPS 端口；默认 18443，改完约 1 分钟后生效</span></span>'
+                        f'<input type=number name=viewer_port min=1024 max=65535 value={current}></label>'
+                        '<button class="cell action">保存端口</button></form>')
         return ui.group("CarPlay 画面", entries, foot)
 
     def render_phone_step(self, notice):

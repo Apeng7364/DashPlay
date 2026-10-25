@@ -35,6 +35,7 @@ import debug_uplink
 from phone_uplink import PhoneUplink, JoinedPhoneAP, UnsuitableChannel
 import board_phicomm_n1
 from mdns_name import NameResponder
+import viewer_port
 import own_domain
 from settings_page import SettingsPage, network_label
 import setup_wizard
@@ -373,7 +374,8 @@ def main():
 
         def with_name(entries):
             # The name first once its certificate is in use: the head unit then opens it without a warning.
-            return ([f"https://{own_name}:18443/"] if own_name and own_domain.serving(state) else []) + entries
+            p = viewer_port.resolve(state)
+            return ([f"https://{own_name}:{p}/"] if own_name and own_domain.serving(state) else []) + entries
 
         def keep_name(target, wifi=None):
             """DuckDNS record -> target (None: leave it) and the certificate, in the background. wifi: the joined
@@ -418,6 +420,7 @@ def main():
             """plan: (bind address, channel, security) of the joined hotspot, which the iPhone is handed.
             The viewer listens on every address: the head unit comes through that hotspot."""
             argv = ["python3", str(root / "run-receiver.py"), "--root", str(root), *phone_args,
+                    "--viewer-port", str(viewer_port.resolve(state)),
                     *joined_receiver_network(state, plan, interface, debug,
                                              address.ip if direct_active else None, platform.ap_interface),
                     *([a for a in usb_args if a != '--no-wireless'] if direct_active and setup.get('iphone') != 'wired' else usb_args)]
@@ -488,8 +491,9 @@ def main():
                 start("receiver", receiver_argv(joined))
             # mifi: the iPhone's video comes through the portable Wi-Fi; acknowledge at once (relay lag).
             platform.quick_ack()
+            p = viewer_port.resolve(state)
             status.update(mode="sta", ssid=car["ssid"], home=f"http://{sta_address}/", channel=sta_channel, entries=with_name([
-                f"https://{sta_address}:18443/", f"http://{sta_address}/ （本设置页）"]))
+                f"https://{sta_address}:{p}/", f"http://{sta_address}/ （本设置页）"]))
             mark(f"{'debug' if debug else use} hotspot joined, viewer on {sta_address}")
             if tesla and not debug and not setup_wizard.tesla_reaches(sta_address):
                 # A joined hotspot is numbered by its owner: only its own settings can move it.
@@ -503,8 +507,9 @@ def main():
             if tesla_warning:
                 status["tesla_warning"] = tesla_warning
                 print(f"Tesla mode: {tesla_warning}", flush=True)
+            p = viewer_port.resolve(state)
             status.update(mode="ap", ssid=hotspot["ssid"], open=open_ap, entries=with_name([
-                f"https://{address.ip}:18443/", f"http://{address.ip}/ （本设置页）"]))
+                f"https://{address.ip}:{p}/", f"http://{address.ip}/ （本设置页）"]))
             # Box hotspot: the head unit opens the box at its fixed address; online through the Ethernet cable
             # (at home) the box renews the certificate. The fallback hotspot of the joining modes leaves the record.
             keep_name(str(address.ip) if use == "box_hotspot" else None)
@@ -514,7 +519,7 @@ def main():
             # bound; bt-bridge waits for a powered adapter itself (BT_BRIDGE_READY_WAIT).
             def launch_receiver(ap_channel):
                 start("receiver", ["python3", str(root / "run-receiver.py"), "--root", str(root),
-                                   "--bind", str(address.ip), *phone_args,
+                                   "--bind", str(address.ip), *phone_args, "--viewer-port", str(viewer_port.resolve(state)),
                                    "--interface", platform.ap_interface, "--channel", str(ap_channel), *ap_security, *usb_args])
 
             launch_receiver(channel)

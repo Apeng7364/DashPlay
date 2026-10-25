@@ -33,8 +33,9 @@ import own_domain
 import update
 from tesla_openwrt import OfflineChecks
 from platform_openwrt import OpenWrtPlatform, RUN
+import viewer_port
 
-DEFAULTS = {"enabled": "1", "wifi": "auto", "settings_port": "18080",
+DEFAULTS = {"enabled": "1", "wifi": "auto", "settings_port": "18080", "viewer_port": "",
             # wifi "external": the Wi-Fi of another router (a travel router with better radios, its uplink this
             # router over USB or a cable, bridged into external_network) as entered, with its fixed channel.
             "external_ssid": "", "external_key": "", "external_security": "wpa2", "external_channel": "",
@@ -401,8 +402,12 @@ def main():
     root = args.root.resolve()
     config = read_config(subprocess.run(["uci", "-q", "show", "dashplay"], capture_output=True, text=True).stdout)
     port = int(config["settings_port"])
-    if not re.fullmatch(r"[A-Za-z0-9_@\[\]-]{1,64}", config["wifi"]) or not 1024 <= port <= 65535 or port == 18443:
-        raise ValueError("Invalid dashplay.main.wifi or settings_port")
+    # Empty in the uci means 18443, or an owner's older state/receiver/config.json value: an update keeps it.
+    viewer = (int(config["viewer_port"]) if str(config.get("viewer_port", "")).isdigit()
+              else viewer_port.resolve(root / "state"))
+    if (not re.fullmatch(r"[A-Za-z0-9_@\[\]-]{1,64}", config["wifi"]) or not 1024 <= port <= 65535
+            or port == viewer or not viewer_port.valid(viewer)):
+        raise ValueError("Invalid dashplay.main.wifi, settings_port or viewer_port")
     if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,62})(\.[a-z0-9-]{1,63})+", config["name"]):
         raise ValueError("Invalid dashplay.main.name")
     ddns = own_config(config)
@@ -431,6 +436,12 @@ def main():
     if config["dbus_address"]:
         os.environ["DBUS_SYSTEM_BUS_ADDRESS"] = config["dbus_address"]
     state = root / "state"
+    # Keep the uci mirroring the effective port, so the LuCI link and field show it (an owner's older
+    # state/receiver/config.json value is adopted once; the uci survives package updates).
+    if not args.check and str(viewer) != config.get("viewer_port", ""):
+        subprocess.run(["uci", "set", f"dashplay.main.viewer_port={viewer}"], check=False, capture_output=True)
+        subprocess.run(["uci", "commit", "dashplay"], check=False, capture_output=True)
+        config["viewer_port"] = str(viewer)
     state.mkdir(mode=0o700, exist_ok=True)
     platform = OpenWrtPlatform(run=RUN)
     platform.bluetooth_state = state
@@ -485,7 +496,8 @@ def main():
             sys.executable, str(root / "run-receiver.py"), "--root", str(root), "--bind", str(network["address"].ip),
             "--channel", str(network["channel"]), "--security", network["security"],
             "--hotspot", str(handoff_file), "--interface", network["device"], "--web-host", "0.0.0.0",
-            "--java", config["java"], "--settings-port", str(port), "--wired", "--wired-status", str(WIRED_STATUS),
+            "--java", config["java"], "--settings-port", str(port), "--viewer-port", str(viewer),
+            "--wired", "--wired-status", str(WIRED_STATUS),
             "--idle-release", str(int(config["idle_release"]) if config["idle_release"].isdigit() else 300)]
             + ([] if wireless else ["--no-wireless"]) + (["--bind-wait", "120"] if wait else [])
             + car_audio_args(config))
@@ -613,8 +625,8 @@ def main():
         # The DuckDNS name also works on a client network (the head unit asks the public record), once its
         # certificate is in use.
         status.update(ssid=network["ssid"], home=f"http://{host}:{port}/",
-                      entries=([f"https://{config['name']}:18443/"] if named or (ddns and own_domain.serving(state)) else [])
-                      + [f"https://{host}:18443/"])
+                      entries=([f"https://{config['name']}:{viewer}/"] if named or (ddns and own_domain.serving(state)) else [])
+                      + [f"https://{host}:{viewer}/"])
         if ddns:
             maintainer.append(own_domain.Maintainer(root, ddns, host, stopped, say, tesla=config["tesla_mode"] == "1"))
             maintainer[0].start()
@@ -629,8 +641,7 @@ def main():
         trusted[:] = trusted_networks(network)
         if not settings_open:
             settings.start(port)
-        if offline_checks.update(config, network, status) and network.get("ifname"):
-            reconnect_clients(network["ifname"], say)
+        offline_checks.update(config, network, status)
         diagnostics.start(stopped, diagnostics.DiagLog(state / "diag"), RUN / "receiver.log", platform, status,
                           state=state)
         # A new release is looked for once a day and only shown (LuCI, settings page); nothing installs by itself.
@@ -666,8 +677,7 @@ def main():
                     raise RuntimeError(f"{name} exited with {child.returncode}")
             if time.monotonic() >= next_check:
                 next_check = time.monotonic() + RECHECK_EVERY
-                if offline_checks.update(config, network, status) and network.get("ifname"):
-                    reconnect_clients(network["ifname"], say)
+                offline_checks.update(config, network, status)
                 refresh_network_warning(shared_on, network["device"], status, base_warning)
                 now, why = platform.handoff(config["wifi"], external=config)
                 if now is None or plan_of(now) != plan:

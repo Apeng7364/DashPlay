@@ -102,6 +102,8 @@ def main():
     parser.add_argument("--wired-status", type=Path, help="where the receiver writes the wired CarPlay phase")
     parser.add_argument("--java", default="/usr/bin/java", help="Java 21 (OpenWrt: the dashplay-jre package)")
     parser.add_argument("--settings-port", type=int, default=80, help="port of the box settings page")
+    parser.add_argument("--viewer-port", type=int, default=0,
+                        help="port of the viewer page (default: the saved config's, else 18443)")
     # Any car whose own Bluetooth is paired with the iPhone (found in a Tesla, 2026-10-14); --tesla is all of it.
     parser.add_argument("--car-music", action="store_true",
                         help="music over the car's own Bluetooth: the page leaves the media card and keys to the car")
@@ -130,9 +132,10 @@ def main():
     hotspot = json.loads((args.hotspot or root / "state/hotspot.json").read_text())
     ssid = hotspot["ssid"]
     password = "" if args.security == "open" else hotspot["passphrase"]
+    viewer = args.viewer_port if 1024 <= args.viewer_port <= 65535 else 0
     config = {
         "deviceName": "DashPlay", "model": "DashPlay", "manufacturer": "DashPlay",
-        "airPlayPort": 7000, "httpPort": 18443,
+        "airPlayPort": 7000, "httpPort": viewer or saved.get("httpPort", 18443),
         "display": saved.get("display", {"width": 1280, "height": 720, "fps": 30, "uiScale": 100, "hevc": False}),
         # While an iPhone is on the cable the receiver pauses wireless invitations (WiredBootstrap).
         "wireless": not args.no_wireless, "wifiSsid": ssid, "wifiPassphrase": password,
