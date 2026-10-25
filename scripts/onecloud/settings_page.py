@@ -918,7 +918,15 @@ class SettingsPage:
         wired = self.wired_phase()
         waiting = wired in ("trust", "starting") or first and mode == "car_hotspot" and wired != "live"
         if not setup_wizard.wireless(self.setup(), setup_wizard.options(self.state), self.direct_capable()):
-            return ui.wired_block(wired, "iPhone 用数据线", "这种使用方式只能用数据线（有线 CarPlay）。"), waiting, {}, wired
+            devices = self.pairing.devices()
+            error = self.status().get("bluetooth_error", "")
+            notice = ui.banner("无线蓝牙没有启动：" + error + "；已配对的手机会保留，修好后重启盒子即可恢复无线。",
+                               "bad") if error else ""
+            paired = "".join(f'<div class=cell><span class=main><b>{escape(name)}</b>'
+                             f'<span>{escape(address)}</span></span></div>'
+                             for address, name in devices.items()) if devices else ""
+            return (ui.wired_block(wired, "iPhone 用数据线", "这种使用方式只能用数据线（有线 CarPlay）。")
+                    + notice + paired, waiting, devices, wired)
         foot = ("插着数据线时用有线；拔掉后改用下面的无线。"
                 + ("无线卡顿或连不上时请用数据线：有的随身 WiFi 不让设备互相访问。" if mode == "mifi" else ""))
         block, refresh, devices = self.phones_block(nonce, first)

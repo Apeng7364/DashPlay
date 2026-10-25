@@ -523,6 +523,7 @@ def main():
 
         def bring_up_bluetooth():
             if not has_bluez:
+                status["bluetooth_error"] = "没有安装 BlueZ（bluez-daemon/bluetoothctl）"
                 say("No BlueZ (bluez-daemon not installed): wired CarPlay only")
                 return bluetooth.append(False)
             try:
@@ -530,9 +531,12 @@ def main():
                 mark("bluetooth powered")
                 bluetooth.append(True)
             except TimeoutError:
+                # The board helper's own reason (rfkill, btattach) is in state/logs; the page shows this line.
+                status["bluetooth_error"] = "蓝牙适配器没有上电（详见诊断/日志）"
                 say("Bluetooth adapter did not power on: wired CarPlay only")
                 bluetooth.append(False)
             except InterruptedError:
+                status["bluetooth_error"] = "蓝牙启动被中断"
                 bluetooth.append(False)
 
         bluetooth_thread = threading.Thread(target=bring_up_bluetooth, name="bluetooth-power", daemon=True)
@@ -650,8 +654,9 @@ def main():
 
         bluetooth_thread.join()
         wireless = bool(bluetooth and bluetooth[0])
-        # setup.json carries the way of use the settings page shows: wireless (handoff) or cable only.
-        setup_wizard.save(state, {"done": True, "mode": "box_hotspot" if wireless else "car_hotspot"})
+        # Keep the owner's way of use: a transient Bluetooth failure must not rewrite it to wired only.
+        setup = setup_wizard.load(state)
+        setup_wizard.save(state, {**setup, "done": True})
         if have_identity:
             # A renewed certificate (or a new CA) needs a new receiver: it reads the keystore once (audit A6).
             if early and plan_of(early) == plan_of(network) and wireless == has_bluez and not renewed:

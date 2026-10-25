@@ -59,6 +59,23 @@ def reset_controller(state, init, sleep=time.sleep):
     raise SystemExit("Marlin3 Bluetooth init failed")
 
 
+def unblock_rfkill(root=Path("/sys/class/rfkill")):
+    """The controller can come up soft-blocked (F50/MU300, BlueZ 5.83, 2026-10-25): unblock the Bluetooth
+    rfkill after hci0 exists. Match by type, never a fixed rfkill index; a hard block is an operator problem."""
+    radio = next((p for p in Path(root).glob("rfkill*")
+                  if (p / "type").read_text().strip() == "bluetooth"), None)
+    if radio is None:
+        raise SystemExit("Bluetooth rfkill not found after hci0")
+    hard = (radio / "hard").read_text().strip()
+    if hard != "0":
+        raise SystemExit(f"Bluetooth is hard-blocked (rfkill hard={hard})")
+    if (radio / "soft").read_text().strip() != "0":
+        (radio / "soft").write_text("0\n")
+    if (radio / "soft").read_text().strip() != "0":
+        raise SystemExit("Bluetooth rfkill unblock failed (soft is still 1)")
+    return radio
+
+
 def stop_children(children, timeout=6):
     """Stop every child (each in its own process group) within one deadline: one after the other, 8 s each,
     outlasted the supervisor's wait for this helper, which was then killed with the children left running."""
@@ -179,6 +196,10 @@ def main():
         start("btattach", [str(runtime / "usr/bin/btattach"), "-B", str(TTY), "-P", "h4"])
         start("bluetoothd", [str(runtime / "usr/bin/bluetoothd"), "-n", "-f", str(BUS / "bluez.conf")])
         wait_for(Path("/sys/class/bluetooth/hci0").exists, 15)
+        wait_for(lambda: any((p / "type").read_text().strip() == "bluetooth"
+                             for p in Path("/sys/class/rfkill").glob("rfkill*")), 5)
+        radio = unblock_rfkill()
+        print(f"F50 hci0 rfkill unblocked ({radio.name})", flush=True)
         print("F50 Bluetooth ready", flush=True)
         while not stopped:
             for name, child in children:
