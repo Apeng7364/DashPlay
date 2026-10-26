@@ -341,11 +341,12 @@ def main():
 
     light = platform.status_light()
     scanner = setup_wizard.Scanner(interface, hotspot["ssid"], lambda: status["mode"], platform=platform)
+    maintainer = []   # own_domain.Maintainer, when a DuckDNS name is set
     settings = SettingsPage(state, lambda: status, request_reexec, lambda: [ip.network for ip in platform.local_addresses()],
-                            scanner, WIRED_STATUS, run=RUN)
+                            scanner, WIRED_STATUS, run=RUN,
+                            retry_cert=lambda: [worker.request_retry() for worker in list(maintainer)])
     uplink = None
     direct_ap = None
-    maintainer = []   # own_domain.Maintainer, when a DuckDNS name is set
     try:
         mark("supervisor start")
         platform.prepare(wait_for)

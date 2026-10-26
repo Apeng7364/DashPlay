@@ -503,11 +503,11 @@ class DebianPlatform:
     def has_stations(self):
         return "Station" in self.ap_iw("station", "dump")
 
-    def scan(self, ap=False, frequency=None):
+    def scan(self, ap=False, frequency=None, timeout=30):
         command = ["iw", "dev", self.interface, "scan"]
         if frequency:
             command += ["freq", str(frequency)]
-        return subprocess.run(command + (["ap-force"] if ap else []), capture_output=True, text=True, timeout=30)
+        return subprocess.run(command + (["ap-force"] if ap else []), capture_output=True, text=True, timeout=timeout)
 
     def survey(self):
         """`iw dev X scan` before the box hotspot starts, for supervisor.quiet_channel; the interface must be up."""
@@ -518,9 +518,9 @@ class DebianPlatform:
         from setup_wizard import parse_scan
         return parse_scan(self.scan(ap=ap).stdout, own_ssid)
 
-    def find_hotspot(self, ssid, frequency=None):
+    def find_hotspot(self, ssid, frequency=None, timeout=30):
         from setup_wizard import _unescape_ssid
-        result = self.scan(ap=True, frequency=frequency)
+        result = self.scan(ap=True, frequency=frequency, timeout=timeout)
         # iw escapes UTF-8 bytes; compare decoded names, preserving meaningful spaces.
         found = any(_unescape_ssid(name) == ssid
                     for name in re.findall(r"^\s*SSID: ?(.*)$", result.stdout, re.M))
@@ -693,6 +693,16 @@ class DebianPlatform:
                                 capture_output=True, text=True, check=True, timeout=5)
         routes = json.loads(result.stdout)
         return next((str(ipaddress.IPv4Address(route['gateway'])) for route in routes if route.get('gateway')), None)
+
+    def default_route_devices(self):
+        """Interfaces holding an IPv4 default route; the cable (anything but the Wi-Fi) may be the uplink."""
+        try:
+            result = subprocess.run(['ip', '-j', '-4', 'route', 'show', 'default'],
+                                    capture_output=True, text=True, timeout=5)
+            routes = json.loads(result.stdout or '[]')
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return []
+        return [route['dev'] for route in routes if route.get('dev')] if isinstance(routes, list) else []
 
     def prepare_phone_uplink(self):
         from phone_uplink import station_mac

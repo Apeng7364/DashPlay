@@ -6,6 +6,7 @@ keep the AP MAC, and undo our NAT/forwarding before returning to offline mode.
 """
 import json
 from pathlib import Path
+import socket
 import subprocess
 import time
 import setup_wizard
@@ -13,6 +14,27 @@ import setup_wizard
 HOTSPOT = 'uplink-hotspot.json'
 # Direct iPhone AP sharing the car's internet: the station's default route can come a moment after its address.
 GATEWAY_WAIT = 10
+WIRED_RECHECK = 30   # s: look again whether the cable still carries the uplink
+AP_READY_MISSES = 3  # hostapd checks (2 s apart) before the AP is rebuilt: one miss is not a dead AP
+UPLINK_SCAN_TIMEOUT = 10
+
+
+def wired_uplink(platform, resolve=None):
+    """True when the box already has internet through something other than its Wi-Fi: the Ethernet cable at home.
+    Then the phone hotspot is not needed, and joining it would take the access point and local DNS down for
+    nothing (2026-10-26: the box kept rebuilding its AP while the cable was already online)."""
+    resolve = resolve or socket.getaddrinfo   # looked up at call time, so a test can replace it
+    try:
+        devices = platform.default_route_devices()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if not any(device not in (platform.interface, platform.ap_interface, 'lo') for device in devices):
+        return False
+    try:
+        resolve('www.duckdns.org', 443, type=socket.SOCK_STREAM)   # a route without a working resolver is not enough
+    except OSError:
+        return False
+    return True
 
 
 def hotspot(state):
@@ -145,13 +167,15 @@ class PhoneUplink:
         self.wait_for, self.start_receiver, self.status, self.say, self.clock = wait_for, start_receiver, status, say, clock
         self.phase, self.frequency = 'offline', None
         self.next_try, self.backoff = clock() + 5, 15
+        self.ap_misses = 0
         self.saved = hotspot(state)
         self.set_status('offline', '先提供盒子热点，再寻找手机热点')
 
     def set_status(self, phase, reason):
         self.phase = phase
         self.status['uplink'] = {'phase': phase, 'ssid': self.saved['ssid'] if self.saved else '', 'reason': reason}
-        self.status['tesla_offline'] = bool(self.status.get('tesla') and phase != 'online')
+        # "wired" has the internet too, so the Tesla checks do not need to be answered locally.
+        self.status['tesla_offline'] = bool(self.status.get('tesla') and phase in ('offline', 'connecting'))
         # No credentials in logs; diagnostics also records this dict.
         self.say(f'phone uplink {phase}: {reason}')
 
@@ -181,26 +205,40 @@ class PhoneUplink:
         p = self.platform
         if self.phase == 'online':
             if not p.connected():
+                self.ap_misses = 0
                 self.fallback('手机热点掉线，已退回不上网')
             elif p.frequency() != self.frequency:
+                self.ap_misses = 0
                 self.fallback('手机热点信道改变，已退回不上网')
             elif not p.ap_ready():
-                self.fallback('共享热点停止，已退回不上网')
+                self.ap_misses += 1
+                if self.ap_misses >= AP_READY_MISSES:
+                    self.ap_misses = 0
+                    self.fallback('共享热点停止，已退回不上网')
+            else:
+                self.ap_misses = 0
             return
         if not self.saved or self.clock() < self.next_try:
             return
         self.next_try = self.clock() + self.backoff
+        network_changed = False
         try:
+            if wired_uplink(p):
+                # The cable is already the uplink: keep the AP (and local DNS) as it is, look again later.
+                self.set_status('wired', '已接有线网络，不连手机热点')
+                self.next_try = self.clock() + WIRED_RECHECK
+                return
             if not p.concurrent_ap():
                 self.set_status('offline', '无线驱动不支持同时连接和开热点')
                 self.next_try = self.clock() + 300
                 return
-            supported, found, _ = p.find_hotspot(self.saved['ssid'])
+            supported, found, _ = p.find_hotspot(self.saved['ssid'], timeout=UPLINK_SCAN_TIMEOUT)
             if not supported or not found:
                 self.set_status('offline', '没找到手机热点，保持不上网')
                 self.backoff = min(self.backoff * 2, 300)
                 return
             self.set_status('connecting', '已找到手机热点，正在连接')
+            network_changed = True
             self.stop_network()
             p.prepare_phone_uplink()
             if not p.join_wifi(self.saved, {}, self.wait_for, 20):
@@ -224,7 +262,12 @@ class PhoneUplink:
             self.set_status('online', '已连上手机热点，车机可上网')
         except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
             # Exception strings from commands can contain credentials; only report the category.
-            self.fallback('连接失败（' + type(error).__name__ + '），已退回不上网')
+            if network_changed:
+                self.fallback('连接失败（' + type(error).__name__ + '），已退回不上网')
+            else:
+                # A failed scan has not changed the AP. Keep it and the receiver running until the next retry.
+                self.set_status('offline', '手机热点检查暂不可用（' + type(error).__name__ + '），稍后重试')
+                self.backoff = min(self.backoff * 2, 300)
 
     def close(self):
         self.platform.cleanup_phone_uplink()

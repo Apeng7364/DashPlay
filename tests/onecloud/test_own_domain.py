@@ -1,6 +1,7 @@
 """Own DuckDNS name with a Let's Encrypt certificate (own_domain.py): for car browsers that refuse the box's local
 CA with no "continue" (2026-10-13). acme.sh is replaced by a script that hands out a synthetic certificate."""
 import json
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import shutil
@@ -10,11 +11,15 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/onecloud"))
 import boxnet
 import own_domain
+import settings_page
 from settings_page import SettingsPage
 import setup_wizard
 import supervisor_openwrt
@@ -23,6 +28,8 @@ TOKEN = "0a1b2c3d-1111-2222-3333-444455556666"
 FAKE_ACME = """#!/bin/sh
 # Records how it was called; --install-cert copies the prepared certificate to the requested files.
 echo "$*" >> "$FAKE_DIR/calls"
+echo "$PATH" >> "$FAKE_DIR/env"
+echo "${ACME_USE_IPV4_REQUESTS:-}" >> "$FAKE_DIR/ipv4"
 [ -n "$DuckDNS_Token" ] && echo "token in environment" >> "$FAKE_DIR/calls"
 case " $* " in *" --issue "*) [ -n "$FAKE_SLEEP" ] && sleep "$FAKE_SLEEP"; exit "${FAKE_ISSUE:-0}" ;; esac
 while [ $# -gt 0 ]; do
@@ -32,15 +39,25 @@ done
 """
 
 
-def make_certificate(directory, name, days=90):
+def make_certificate(directory, name, days=90, validity=None):
     run = lambda *a: subprocess.run(["openssl", *a], check=True, capture_output=True, cwd=directory)
     run("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", "ca.key",
         "-out", "ca.crt", "-days", "100", "-subj", "/CN=Synthetic CA")
     run("req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", "key.pem",
         "-out", "leaf.csr", "-subj", "/CN=" + name)
     (Path(directory) / "ext").write_text(f"subjectAltName=DNS:{name}\n")
-    run("x509", "-req", "-in", "leaf.csr", "-CA", "ca.crt", "-CAkey", "ca.key", "-CAcreateserial", "-days", str(days),
-        "-extfile", "ext", "-out", "leaf.crt")
+    if validity is None:
+        run("x509", "-req", "-in", "leaf.csr", "-CA", "ca.crt", "-CAkey", "ca.key", "-CAcreateserial", "-days", str(days),
+            "-extfile", "ext", "-out", "leaf.crt")
+    else:   # ca supports explicit dates on the older OpenSSL 3 versions shipped on boxes too
+        (Path(directory) / "index").write_text("")
+        (Path(directory) / "serial").write_text("01\n")
+        (Path(directory) / "ca.cnf").write_text(
+            "[ca]\ndefault_ca=synthetic\n[synthetic]\ndatabase=index\nserial=serial\n"
+            "new_certs_dir=.\ndefault_md=sha256\npolicy=subject\nx509_extensions=leaf\n"
+            f"[subject]\ncommonName=supplied\n[leaf]\nsubjectAltName=DNS:{name}\n")
+        run("ca", "-batch", "-notext", "-config", "ca.cnf", "-cert", "ca.crt", "-keyfile", "ca.key",
+            "-in", "leaf.csr", "-startdate", validity[0], "-enddate", validity[1], "-out", "leaf.crt")
     (Path(directory) / "fullchain.pem").write_text((Path(directory) / "leaf.crt").read_text()
                                                    + (Path(directory) / "ca.crt").read_text())
 
@@ -81,6 +98,8 @@ class MaintainerTests(unittest.TestCase):
             self.records.append(address), self.sent.append((address, ipv6, clear)))[0] or True)
         record.start(); self.addCleanup(record.stop)
         self.stopped = threading.Event()
+        ready = patch.object(own_domain, "network_ready", lambda: None)   # the test host's network is not the box's
+        ready.start(); self.addCleanup(ready.stop)
 
     def maintainer(self, address="192.168.5.80"):
         return own_domain.Maintainer(self.root, self.config, address, self.stopped, say=lambda _: None)
@@ -112,14 +131,139 @@ class MaintainerTests(unittest.TestCase):
 
     def test_a_certificate_for_another_name_is_refused(self):
         make_certificate(self.fake, "someone-else.duckdns.org")
-        self.assertEqual(self.maintainer().check_certificate(), own_domain.CERT_RETRY)
+        self.assertEqual(self.maintainer().check_certificate(), own_domain.CERT_RETRY_STEPS[0])
         self.assertFalse((self.state / "tls" / "own" / "fullchain.pem").exists())
-        self.assertEqual(own_domain.read_status(self.state)["phase"], "retry")
-        self.assertIn("每小时重试", own_domain.message(self.state, self.name))
+        status = own_domain.read_status(self.state)
+        self.assertEqual((status["phase"], status["reason"]), ("retry", "certificate"))
+        self.assertIn("会自动重试", own_domain.message(self.state, self.name))
 
-    def test_failure_is_retried_within_the_hour(self):
+    def test_failures_retry_from_a_minute_up_to_hourly(self):
         with patch.dict(os.environ, FAKE_ISSUE="1"):
-            self.assertEqual(self.maintainer().check_certificate(), own_domain.CERT_RETRY)
+            worker = self.maintainer()
+            self.assertEqual([worker.check_certificate() for _ in range(6)],
+                             [60, 120, 300, 900, 3600, 3600])
+
+    def test_slow_failures_wait_the_full_retry_interval_after_completion(self):
+        worker = self.maintainer(None)
+        clock, starts, waits = [0], [], []
+
+        def obtain():
+            starts.append(clock[0])
+            clock[0] += 240
+            if len(starts) == 6:
+                self.stopped.set()
+            raise TimeoutError("synthetic slow failure")
+
+        def wait(deadline):
+            waits.append(max(0, deadline - clock[0]))
+            clock[0] = max(clock[0], deadline)
+            return False
+
+        with patch.object(worker, "obtain", obtain), patch.object(worker, "wait_until", wait), \
+                patch.object(own_domain.time, "monotonic", lambda: clock[0]):
+            worker.run()
+        self.assertEqual(starts, [0, 300, 660, 1200, 2340, 6180])
+        self.assertEqual(waits, [60, 120, 300, 900, 3600, 3600])
+
+    def test_no_route_or_dns_waits_without_running_acme(self):
+        for reason in ("route", "dns"):
+            with patch.object(own_domain, "network_ready", lambda reason=reason: reason):
+                self.assertEqual(self.maintainer().check_certificate(), own_domain.READY_RETRY)
+            self.assertFalse((self.fake / "calls").exists(), "nothing run while the network is not ready")
+            status = own_domain.read_status(self.state)
+            self.assertEqual((status["phase"], status["reason"]), ("waiting", reason))
+        self.assertIn("等待盒子联网", own_domain.message(self.state, self.name))
+
+    def test_acme_runs_with_the_curl_shim_first_in_path(self):
+        make_certificate(self.fake, self.name)
+        self.maintainer().check_certificate()
+        first = (self.fake / "env").read_text().splitlines()[0].split(os.pathsep)[0]
+        self.assertEqual(first, str(self.state / "acme" / "bin"))
+        shim = self.state / "acme" / "bin" / "curl"
+        self.assertIn("--connect-timeout 10", shim.read_text())
+        self.assertIn("--max-time 90", shim.read_text())
+        self.assertEqual(shim.stat().st_mode & 0o777, 0o700)
+
+    def test_the_previous_acme_log_is_kept(self):
+        make_certificate(self.fake, self.name)
+        worker = self.maintainer()
+        worker.obtain()
+        (self.state / "acme" / "acme.log").write_text("the run that failed")
+        worker.obtain()
+        self.assertEqual((self.state / "acme" / "acme.log.1").read_text(), "the run that failed")
+
+    def test_ipv4_is_preferred_where_the_box_has_an_ipv4_route(self):
+        make_certificate(self.fake, self.name)
+        with patch.object(own_domain, "default_route_families", lambda *a, **k: [4]):
+            self.maintainer().check_certificate()
+        self.assertEqual((self.fake / "ipv4").read_text().splitlines()[0], "1")
+
+    def test_the_curl_shim_aborts_a_server_that_never_answers(self):
+        import http.server
+        class Silent(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                time.sleep(10)
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Silent)   # daemon handler: shutdown is quick
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        with patch.multiple(own_domain, ACME_REQUEST_TIMEOUT=2, ACME_CONNECT_TIMEOUT=2, ACME_RETRY=0):
+            shim = own_domain.curl_shim(self.state / "acme")
+            started = time.monotonic()
+            result = subprocess.run([shim + "/curl", "-s", f"http://127.0.0.1:{server.server_port}/"],
+                                    capture_output=True, timeout=15)
+            elapsed = time.monotonic() - started
+        server.shutdown()
+        self.assertEqual(result.returncode, 28, "curl gives 28 when --max-time ends the request")
+        self.assertLess(elapsed, 6)
+
+    def test_a_curl_code_becomes_the_reason_and_the_text(self):
+        log = self.state / "acme" / "acme.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("... Please refer to ... error code: 28 ...")
+        self.assertEqual(own_domain.failure_reason(TimeoutError("took too long"), log), "curl28")
+        self.assertIn("curl 28", own_domain.reason_text("curl28"))
+        self.assertEqual(own_domain.failure_reason(RuntimeError("x"), log), "curl28", "the log wins when it has one")
+        log.unlink()
+        self.assertEqual(own_domain.failure_reason(TimeoutError("x"), log), "timeout")
+
+    def test_imported_certificate_is_checked_before_it_replaces_anything(self):
+        make_certificate(self.fake, self.name)
+        chain = (self.fake / "fullchain.pem").read_text()
+        key = (self.fake / "key.pem").read_text()
+        own_domain.import_certificate(self.state, self.name, chain, key)
+        self.assertTrue(own_domain.certificate_for(self.state, self.name))
+        self.assertEqual((self.state / "tls" / "own" / "key.pem").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(own_domain.read_status(self.state)["phase"], "ready")
+        with self.assertRaises(ValueError):
+            own_domain.import_certificate(self.state, "other.duckdns.org", chain, key)
+        with self.assertRaises(ValueError):
+            own_domain.import_certificate(self.state, self.name, "no certificate", key)
+        with self.assertRaises(ValueError):
+            own_domain.import_certificate(self.state, "", chain, key)
+
+    def test_invalid_certificate_dates_preserve_the_working_pair_and_status(self):
+        make_certificate(self.fake, self.name)
+        own_domain.import_certificate(self.state, self.name, (self.fake / "fullchain.pem").read_text(),
+                                      (self.fake / "key.pem").read_text())
+        paths = [self.state / "tls/own/fullchain.pem", self.state / "tls/own/key.pem",
+                 self.state / "own-domain.json"]
+        before = [path.read_bytes() for path in paths]
+        now = datetime.now(timezone.utc)
+        cases = {"expired": (now - timedelta(days=2), now - timedelta(days=1)),
+                 "not_started": (now + timedelta(days=1), now + timedelta(days=90)),
+                 "expires_today": (now - timedelta(days=1), now + timedelta(hours=12))}
+        for label, dates in cases.items():
+            with self.subTest(label=label):
+                directory = self.fake / label
+                directory.mkdir()
+                make_certificate(directory, self.name, validity=[date.strftime("%Y%m%d%H%M%SZ") for date in dates])
+                with self.assertRaises(ValueError):
+                    own_domain.import_certificate(self.state, self.name, (directory / "fullchain.pem").read_text(),
+                                                  (directory / "key.pem").read_text())
+                self.assertEqual([path.read_bytes() for path in paths], before)
+                self.assertIsNotNone(boxnet._own_certificate(self.state))
 
     def test_stopping_the_service_stops_acme(self):
         make_certificate(self.fake, self.name)
@@ -194,6 +338,88 @@ class MaintainerTests(unittest.TestCase):
         self.assertNotIn("回家", own_domain.message(self.state, self.name))
 
 
+class RouteTests(unittest.TestCase):
+    def test_ipv4_proc_rejects_unusable_or_nondefault_routes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            net = Path(tmp) / "net"
+            net.mkdir()
+            no_json = lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "unrecognized option: j")
+            for flags, device, mask in (("0201", "eth0", "00000000"), ("0000", "eth0", "00000000"),
+                                        ("0001", "lo", "00000000"), ("0001", "eth0", "000000FF")):
+                with self.subTest(flags=flags, device=device, mask=mask):
+                    (net / "route").write_text(
+                        "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n"
+                        f"{device} 00000000 00000000 {flags} 0 0 100 {mask} 0 0 0\n")
+                    self.assertEqual(own_domain.default_route_families(no_json, proc=tmp), [])
+
+    def test_ipv6_proc_rejects_unusable_defaults_but_accepts_an_up_route(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            net = Path(tmp) / "net"
+            net.mkdir()
+            no_json = lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "unrecognized option: j")
+            prefix = "0" * 32 + " 00 " + "0" * 32 + " 00 " + "0" * 32 + " ffffffff 00000001 00000000 "
+            for flags, device in (("00200200", "lo"), ("00000201", "eth0"), ("00000000", "eth0"),
+                                  ("00000001", "lo")):
+                with self.subTest(flags=flags, device=device):
+                    (net / "ipv6_route").write_text(prefix + flags + " " + device + "\n")
+                    self.assertEqual(own_domain.default_route_families(no_json, proc=tmp), [])
+            (net / "ipv6_route").write_text(prefix + "00200200 lo\n" + prefix + "00000003 eth0\n")
+            self.assertEqual(own_domain.default_route_families(no_json, proc=tmp), [6])
+
+    def test_ip_json_reject_routes_are_not_an_uplink(self):
+        for kind in ("unreachable", "blackhole", "prohibit", "throw"):
+            with self.subTest(kind=kind):
+                out = json.dumps([{"dst": "default", "type": kind, "dev": "eth0"}])
+                run = lambda *a, **k: subprocess.CompletedProcess(a, 0, out, "")
+                self.assertEqual(own_domain.default_route_families(run, proc="/nonexistent"), [])
+
+    def test_failed_or_malformed_ip_json_is_not_an_uplink(self):
+        for code, routes in ((1, [{"dev": "eth0"}]), (0, {"dev": "eth0"}), (0, [None, {}, "eth0"])):
+            with self.subTest(code=code, routes=routes):
+                run = lambda *a, **k: subprocess.CompletedProcess(a, code, json.dumps(routes), "")
+                self.assertEqual(own_domain.default_route_families(run, proc="/nonexistent"), [])
+
+    def test_real_ipv6_json_default_is_an_uplink(self):
+        def run(argv, **kwargs):
+            routes = [{"dst": "default", "gateway": "fe80::1", "dev": "eth0"}] if "-6" in argv else []
+            return subprocess.CompletedProcess(argv, 0, json.dumps(routes), "")
+        self.assertEqual(own_domain.default_route_families(run, proc="/nonexistent"), [6])
+
+    def test_openwrt_busybox_ip_without_json_falls_back_to_proc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "net").mkdir()
+            (Path(tmp) / "net" / "route").write_text(
+                "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+                "eth0\t00000000\t0102A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n")
+            no_json = lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "unrecognized option: j")
+            self.assertEqual(own_domain.default_route_families(no_json, proc=tmp), [4])
+
+    def test_debian_ip_json_route_is_read(self):
+        out = json.dumps([{"dst": "default", "gateway": "192.0.2.1", "dev": "eth0", "flags": []}])
+
+        def run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, out if "-4" in argv else "[]", "")
+        self.assertEqual(own_domain.default_route_families(run, proc="/nonexistent"), [4])
+
+    def test_no_route_at_all(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "net").mkdir()
+            (Path(tmp) / "net" / "route").write_text("Iface\tDestination\tGateway\tFlags\n")
+            empty = lambda *a, **k: subprocess.CompletedProcess(a, 0, "[]", "")
+            self.assertEqual(own_domain.default_route_families(empty, proc=tmp), [])
+
+    def test_readiness_reports_route_before_dns(self):
+        def no_dns(*a, **k):
+            raise OSError("no dns")
+        with patch.object(own_domain, "default_route_families", lambda *a, **k: []):
+            self.assertEqual(own_domain.network_ready(resolve=no_dns), "route")
+        with patch.object(own_domain, "default_route_families", lambda *a, **k: [4]):
+            self.assertEqual(own_domain.network_ready(resolve=no_dns), "dns")
+            calls = []
+            self.assertIsNone(own_domain.network_ready(resolve=lambda host, *a, **k: calls.append(host)))
+            self.assertEqual(calls, ["www.duckdns.org", "acme-v02.api.letsencrypt.org"])
+
+
 class Ipv6Tests(unittest.TestCase):
     def test_finds_the_stable_public_address(self):
         out = json.dumps([{"ifname": "wlan0", "addr_info": [
@@ -231,10 +457,16 @@ class Ipv6Tests(unittest.TestCase):
         self.assertIn("clear=true", urls[1]); self.assertNotIn("ipv6", urls[2])
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 class SettingsPageTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         self.state = Path(tmp.name) / "state"; self.state.mkdir()
+        self.certs = Path(tmp.name) / "certs"; self.certs.mkdir()
         (self.state / "hotspot.json").write_text('{"ssid": "DashPlay", "passphrase": "installed1"}')
         setup_wizard.save(self.state, {"done": True, "mode": "box_hotspot"})
         self.status = {"mode": "ap", "box_ssid": "DashPlay", "entries": [], "home": "http://192.168.78.1/"}
@@ -279,6 +511,72 @@ class SettingsPageTests(unittest.TestCase):
         self.assertIn("checked", self.page.render("").split("name=ipv6")[1][:40])
         self.save(action="save", domain="mycar", token="")
         self.assertNotIn("ipv6", own_domain.load(self.state), "unticked: off")
+
+    def test_retry_button_and_manual_import(self):
+        self.save(action="save", domain="mycar", token=TOKEN)
+        called = []
+        self.page.retry_cert = lambda: called.append(True)
+        self.assertIn("重新申请证书", self.page.render(""))
+        self.assertIn("name=chain", self.page.render(""))
+        self.assertIn("手动导入证书", self.page.render(""))
+        self.assertIn("已请求", self.page.apply("/cert", {"action": "retry", "nonce": self.nonce}))
+        self.assertEqual(called, [True])
+        make_certificate(self.certs, "mycar.duckdns.org")
+        chain = (self.certs / "fullchain.pem").read_text()
+        key = (self.certs / "key.pem").read_text()
+        self.assertIn("已导入", self.page.apply("/cert", {"action": "import", "nonce": self.nonce,
+                                                          "chain": chain, "key": key}))
+        self.assertEqual(self.changes[-1], "certificate imported")
+        self.assertTrue(own_domain.certificate_for(self.state, "mycar.duckdns.org"))
+        with self.assertRaises(ValueError):
+            self.page.apply("/cert", {"action": "import", "nonce": self.nonce, "chain": "x", "key": "y"})
+        with self.assertRaises(ValueError):
+            self.page.apply("/cert", {"action": "retry", "nonce": "stale"})
+
+    def test_http_forms_carry_retry_and_a_pasted_certificate(self):
+        self.save(action="save", domain="mycar", token=TOKEN)
+        called = []
+        self.page.retry_cert = lambda: called.append(True)
+        real = settings_page.ThreadingHTTPServer
+
+        def loopback(address, handler):   # a test server on 127.0.0.1 only: no firewall prompt
+            return real(("127.0.0.1", address[1]), handler)
+        with patch.object(settings_page, "ThreadingHTTPServer", loopback):
+            self.page.start(port=0)
+        self.addCleanup(self.page.stop)
+        port = self.page.server.server_address[1]
+        opener = urllib.request.build_opener(_NoRedirect)
+        messages = []
+
+        def post(**fields):
+            request = urllib.request.Request(f"http://127.0.0.1:{port}/cert",
+                                             data=urllib.parse.urlencode(fields).encode(), method="POST")
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                opener.open(request, timeout=10)
+            location = caught.exception.headers.get("Location", "")
+            messages.append(urllib.parse.parse_qs(urllib.parse.urlsplit(location).query).get("m", [""])[0])
+            return caught.exception.code
+
+        self.assertEqual(post(action="retry", nonce=self.nonce), 303)
+        self.assertEqual(called, [True])
+        make_certificate(self.certs, "mycar.duckdns.org")
+        self.assertEqual(post(action="import", nonce=self.nonce,
+                              chain=(self.certs / "fullchain.pem").read_text(),
+                              key=(self.certs / "key.pem").read_text()), 303)
+        self.assertTrue(own_domain.certificate_for(self.state, "mycar.duckdns.org"))
+        self.assertIn("certificate imported", self.changes)
+        paths = [self.state / "tls/own/fullchain.pem", self.state / "tls/own/key.pem",
+                 self.state / "own-domain.json"]
+        before = [path.read_bytes() for path in paths]
+        changes = list(self.changes)
+        make_certificate(self.certs, "mycar.duckdns.org", days=0)
+        self.assertEqual(post(action="import", nonce=self.nonce,
+                              chain=(self.certs / "fullchain.pem").read_text(),
+                              key=(self.certs / "key.pem").read_text()), 303)
+        self.assertTrue(messages[-1].startswith("错误："))
+        self.assertIn("已过期", messages[-1])
+        self.assertEqual([path.read_bytes() for path in paths], before)
+        self.assertEqual(self.changes, changes, "a rejected import must not restart the service")
 
     def test_reset_keeps_the_name(self):
         self.save(action="save", domain="mycar", token=TOKEN)

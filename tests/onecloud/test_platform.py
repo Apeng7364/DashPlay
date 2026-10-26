@@ -66,7 +66,7 @@ class PlatformTests(unittest.TestCase):
                 scan = f'BSS 02:00:00:00:00:01\n\tSSID: {encoded}\n\tsignal: -40 dBm\n'
                 with patch.object(self.platform, 'scan', return_value=Mock(returncode=0, stdout=scan, stderr='')) as run:
                     self.assertEqual(self.platform.find_hotspot(name, 5745), (True, True, ''))
-                    run.assert_called_with(ap=True, frequency=5745)
+                    run.assert_called_with(ap=True, frequency=5745, timeout=30)
                     self.assertFalse(self.platform.find_hotspot(name + ' other')[1])
 
     def test_find_hotspot_does_not_trim_a_different_name_or_hide_scan_failure(self):
@@ -75,6 +75,14 @@ class PlatformTests(unittest.TestCase):
             self.assertFalse(self.platform.find_hotspot('Phone')[1])
         with patch.object(self.platform, 'scan', return_value=Mock(returncode=1, stdout='', stderr='scan failed')):
             self.assertEqual(self.platform.find_hotspot('Phone'), (False, False, 'scan failed'))
+
+    def test_uplink_scan_has_a_shorter_deadline_without_changing_setup_scans(self):
+        with patch('platform_debian.subprocess.run', return_value=Mock(returncode=0, stdout='', stderr='')) as run:
+            self.platform.find_hotspot('Phone', timeout=10)
+            run.assert_called_once_with(['iw', 'dev', 'wlan-test', 'scan', 'ap-force'],
+                                        capture_output=True, text=True, timeout=10)
+            self.platform.scan()
+            self.assertEqual(run.call_args.kwargs['timeout'], 30)
 
     def test_phone_ap_waits_for_networkmanager_release_before_assigning_mac(self):
         (self.root / 'phone-uplink.json').write_text('{"mac":"00:00:5e:00:53:01"}')

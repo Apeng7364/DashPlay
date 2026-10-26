@@ -30,6 +30,7 @@ import diagnostics
 import update
 
 MAX_BODY = 4096
+CERT_BODY = 65536   # /cert only: a fullchain.pem and key.pem pasted as PEM text
 # A phone shown the setup portal gets its connectivity checks answered "online" for this long (first-run setup).
 PORTAL_SEEN_SECONDS = 3600
 PIXEL = (b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,"
@@ -114,12 +115,14 @@ def read_wired(path):
 
 class SettingsPage:
     def __init__(self, state: Path, status, on_change, allowed_networks, scanner=None, wired_status=None,
-                 managed=None, run=None):
+                 managed=None, run=None, retry_cert=None):
         """status() -> dict for display; on_change(reason) re-applies the configuration;
         wired_status: the receiver's wired CarPlay status file; managed: {"by": "OpenWrt", "admin": URL of
         its Wi-Fi settings} when the system, not this page, sets up the network; run: the service's runtime
-        directory, which holds the remote-debugging window (debug_uplink.py; offered only with it)."""
+        directory, which holds the remote-debugging window (debug_uplink.py; offered only with it);
+        retry_cert() asks the own-domain worker to try the certificate now, without restarting the service."""
         self.managed = managed
+        self.retry_cert = retry_cert
         self.run = run
         self.state = state
         self.pairing = PairingWindow(state.parent)
@@ -213,7 +216,7 @@ class SettingsPage:
                 if not self._allowed():
                     return self._send(403, "forbidden")
                 length = int(self.headers.get("Content-Length") or 0)
-                if length > MAX_BODY:
+                if length > (CERT_BODY if self.path == "/cert" else MAX_BODY):
                     return self._send(413, "too large")
                 form = {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(length).decode(),
                                                                  keep_blank_values=True).items()}
@@ -243,7 +246,8 @@ class SettingsPage:
     def tesla_check(self, host, path="/"):
         status = self.status()
         enabled = status.get("tesla_offline") if self.managed else setup_wizard.tesla_offline(
-            self.setup(), setup_wizard.options(self.state), status.get("uplink", {}).get("phase") == "online")
+            self.setup(), setup_wizard.options(self.state),
+            status.get("uplink", {}).get("phase") in ("online", "wired"))
         return setup_wizard.check_response(host, path) if enabled and status.get("mode") in ("ap", "openwrt") else None
 
     def note_check(self, host, path, reply):
@@ -394,6 +398,9 @@ class SettingsPage:
         if path == "/ddns":
             self.check_nonce(form)
             return self.save_ddns(form)
+        if path == "/cert":
+            self.check_nonce(form)
+            return self.apply_certificate(form)
         if path == "/audio":
             self.check_nonce(form)
             return self.save_car_audio(form)
@@ -520,6 +527,25 @@ class SettingsPage:
         return (f"已保存 {domain}{own_domain.SUFFIX}。盒子约 1 分钟后重启服务，联网时自动更新解析并申请正式证书"
                 "（几分钟），下次开机起用。")
 
+    def apply_certificate(self, form):
+        """Try the certificate now, or import one from elsewhere (own_domain.py). A new certificate is loaded when
+        the service starts, so an import restarts it after the reply has gone out."""
+        config = own_domain.load(self.state)
+        if not config:
+            raise ValueError("先保存自己的域名，再申请或导入证书。")
+        action = form.get("action")
+        if action == "retry":
+            if not self.retry_cert:
+                raise ValueError("当前页面不能触发申请。")
+            self.retry_cert()
+            return "已请求重新申请正式证书：盒子联网时会立即开始，通常几分钟；新证书下次开机时启用。"
+        if action == "import":
+            own_domain.import_certificate(self.state, own_domain.name_of(config),
+                                          form.get("chain", ""), form.get("key", ""))
+            self.apply_later("certificate imported")
+            return "证书已导入，服务约 2 秒后重启并启用；之后打开 https://域名 不再有证书警告。"
+        raise ValueError("未知操作。")
+
     def ddns_block(self, nonce, mode):
         """Advanced: the own DuckDNS name. On OpenWrt LuCI sets it; this page only tells how it is going."""
         name = self.status().get("own_name")
@@ -539,7 +565,27 @@ class SettingsPage:
                 '<button class="btn plain" name=action value=save>保存</button></form>'
                 + (f'<form method=post action=/ddns>{ui.hidden(nonce)}<button class="btn plain" name=action value=clear '
                    'onclick="return confirm(\'关闭后车机改用盒子自带证书的地址，确定？\')">关闭</button></form>' if ddns else ""))
-        state = own_domain.message(self.state, name, mode == "box_hotspot") if ddns else ""
+        state = (own_domain.message(self.state, name, mode == "box_hotspot", retry=bool(self.retry_cert))
+                 if ddns else "")
+        actions = ""
+        if ddns and self.retry_cert and not own_domain.certificate_for(self.state, name, own_domain.RENEW_DAYS):
+            actions += (f'<form method=post action=/cert>{ui.hidden(nonce)}'
+                        '<button class="btn plain" name=action value=retry>重新申请证书</button></form>')
+        if ddns:
+            actions += (
+                '<details><summary class=cell><span class=main><b>手动导入证书</b>'
+                '<span>申请一直不成功时，把别处拿到的证书放进来</span></span><span class=chev></span></summary>'
+                f'<div class=inner style="padding:0 0 12px"><form method=post action=/cert>{ui.hidden(nonce)}'
+                '<label class=cell><span class=main><b>证书链 fullchain.pem</b></span></label>'
+                '<textarea name=chain rows=5 required spellcheck=false style="width:100%" '
+                'placeholder="-----BEGIN CERTIFICATE-----"></textarea>'
+                '<label class=cell><span class=main><b>私钥 key.pem</b></span></label>'
+                '<textarea name=key rows=4 required spellcheck=false style="width:100%" '
+                'placeholder="-----BEGIN PRIVATE KEY-----"></textarea>'
+                '<button class="btn plain" name=action value=import '
+                'onclick="return confirm(\'导入后服务会重启一下，确定？\')">导入并重启服务</button></form>'
+                '<p class=foot>两段都要是 PEM 文本，证书必须是这个子域名的（名字对不上会被拒绝），私钥要和证书成对。'
+                '证书只写到盒子本地，不会上传；服务重启后才生效。</p></div></details>')
         ipv6 = ('勾选「同时登记公网 IPv6」后，盒子把自己的公网 IPv6 地址也登记到这个域名：车机拿到的是公网地址，'
                 '画面仍在同一个 WiFi 里直接传。需要车机热点或随身 WiFi 给设备分配 IPv6；这个地址在 DuckDNS 上谁都查得到，'
                 '所以盒子同时开启防火墙，只让同一个 WiFi 里的设备连进来。' if mode in setup_wizard.JOINS else
@@ -547,7 +593,7 @@ class SettingsPage:
         return (f'<details><summary class=cell><span class=main><b>自己的域名</b><span>证书警告点不过去，或不让打开局域网地址</span></span>'
                 f'<span class=value>{escape(name or "未设置")}</span><span class=chev></span></summary>'
                 f'<div class=inner style="padding:0 0 12px">{form}'
-                + (f'<p class=foot>{escape(state)}</p>' if state else "") +
+                + (f'<p class=foot>{escape(state)}</p>' if state else "") + actions +
                 '<p class=foot>在 duckdns.org 免费注册并建一个子域名，把子域名和页面上的 token 填在这里。盒子会把这个域名指向自己，'
                 f'并向 Let’s Encrypt 申请免费的正式证书、到期前自动续签；车机改用 https://子域名.duckdns.org:{viewer_port.resolve(self.state)}/ 打开，'
                 f'不再有证书警告。不需要开放任何端口。{ipv6}'
@@ -646,10 +692,12 @@ class SettingsPage:
         chosen = setup_wizard.options(self.state)
         saved = _load(self.state / 'uplink-hotspot.json') or {}
         current = self.status().get('uplink', {})
-        label = ('已连上 ' + current.get('ssid', '') + '，车机可上网' if current.get('phase') == 'online' else
+        phase = current.get('phase')
+        label = ('已连上 ' + current.get('ssid', '') + '，车机可上网' if phase == 'online' else
+                 '已接有线网络，车机可上网' if phase == 'wired' else
                  '没找到或无法连接 ' + saved.get('ssid', '手机热点') + '，已退回不上网' if chosen['car_internet'] == 'phone_hotspot' else
                  '特斯拉：不上网（替特斯拉回答联网检查）' if chosen.get('tesla') else '不上网')
-        rows = ui.banner(label, 'ok' if current.get('phase') == 'online' else 'wait')
+        rows = ui.banner(label, 'ok' if phase in ('online', 'wired') else 'wait')
         rows += f'<form method=post action=/internet>{ui.hidden(nonce)}'
         for value, text in [('none', '不上网'), ('phone_hotspot', '借手机热点')]:
             rows += f'<label class=cell><input type=radio name=car_internet value={value}{" checked" if chosen["car_internet"]==value else ""}>{text}</label>'

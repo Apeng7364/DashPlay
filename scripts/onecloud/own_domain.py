@@ -12,6 +12,10 @@ no "continue"). Off unless the owner enters a DuckDNS sub-domain and token: on t
   Renewed when less than RENEW_DAYS remain, whenever the box is online (box hotspot: no internet in the car,
   so at home on the Ethernet cable).
 - The token reaches acme.sh by its environment only (not its command line); it is never logged or shown.
+- An attempt starts only when the box has a default route and both DuckDNS and the CA resolve; without that it
+  waits 15 s and tries again (no penalty). A failed attempt is retried after 60/120/300/900 s, then hourly; the
+  settings page can ask for one now, and a certificate can be imported there. acme.sh 3.1.6 sends its requests
+  without any timeout, so a curl shim in state/acme/bin bounds each one (the pinned acme.sh itself is untouched).
 - Optional, on the car hotspot or portable Wi-Fi ("ipv6": true): the record also carries the box's own public
   IPv6 address, for car browsers that refuse a LAN address (the picture still comes straight over the Wi-Fi). The
   head unit asks that hotspot, which asks DuckDNS, so the address is public: it is published only behind an IPv6
@@ -28,6 +32,8 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import socket
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -42,10 +48,17 @@ RENEW_DAYS = 30            # Let's Encrypt certificates last 90 days
 RECORD_REFRESH = 1800      # seconds between DuckDNS updates once one succeeded
 RECORD_RETRY = 60
 CERT_CHECK = 12 * 3600
-CERT_RETRY = 3600
-ACME_TIMEOUT = 600
+CERT_RETRY = 3600          # once the quick attempts below are used up
+CERT_RETRY_STEPS = (60, 120, 300, 900)   # first failures: the authorization is still valid, a retry is cheap
+READY_RETRY = 15           # no default route or DNS yet: not a failure, just look again soon
+ACME_TIMEOUT = 240         # the whole acme.sh run; the curl shim below caps every single request
+ACME_CONNECT_TIMEOUT = 10
+ACME_REQUEST_TIMEOUT = 90
+ACME_RETRY = 2
 DNS_SLEEP = 60             # wait for the TXT record instead of acme.sh's DoH check (blocked on some networks)
 ACME_SERVER = os.environ.get("DASHPLAY_ACME_SERVER", "letsencrypt")   # tests: letsencrypt_test
+ACME_HOSTS = {"letsencrypt": "acme-v02.api.letsencrypt.org",
+              "letsencrypt_test": "acme-staging-v02.api.letsencrypt.org"}
 
 
 def sub_domain(text):
@@ -77,6 +90,115 @@ def load(state):
 
 def name_of(config):
     return config["domain"] + SUFFIX if config else None
+
+
+def directory_host():
+    """The ACME server's host name, for the readiness check (acme.sh takes a name or a full directory URL)."""
+    if "://" in ACME_SERVER:
+        return urllib.parse.urlsplit(ACME_SERVER).hostname or ""
+    return ACME_HOSTS.get(ACME_SERVER, ACME_HOSTS["letsencrypt"])
+
+
+def default_route_families(run=subprocess.run, proc=Path("/proc")):
+    """[4] or [4, 6] when the box has a default route, [] when it has none (early in boot, link down).
+
+    `ip -j` is the Debian way; OpenWrt's BusyBox ip has no JSON, so /proc is the fallback there (without it the
+    readiness check would wait forever and never renew)."""
+    families = set()
+    for flag in ("-4", "-6"):
+        try:
+            out = run(["ip", flag, "-j", "route", "show", "default"], capture_output=True, text=True, timeout=5)
+            routes = json.loads(out.stdout or "[]")
+            if out.returncode == 0 and isinstance(routes, list) and any(
+                    isinstance(route, dict) and route.get("type", "unicast") == "unicast"
+                    and route.get("dev") not in (None, "", "lo") for route in routes):
+                families.add(int(flag[1]))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+    if 4 not in families:
+        try:   # Iface Destination Gateway Flags ... Mask ...: /0, up, not a reject route
+            for line in (Path(proc) / "net/route").read_text().splitlines()[1:]:
+                fields = line.split()
+                if (len(fields) >= 11 and fields[0] != "lo" and fields[1] == fields[7] == "00000000"
+                        and int(fields[3], 16) & 1 and not int(fields[3], 16) & 0x200):
+                    families.add(4)
+                    break
+        except (OSError, ValueError):
+            pass
+    if 6 not in families:
+        try:   # ::/0 must be UP and not REJECT; Linux also lists an unreachable ::/0 on lo
+            for line in (Path(proc) / "net/ipv6_route").read_text().splitlines():
+                fields = line.split()
+                if (len(fields) == 10 and fields[0] == "0" * 32 and fields[1] == "00" and fields[9] != "lo"
+                        and int(fields[8], 16) & 1 and not int(fields[8], 16) & 0x200):
+                    families.add(6)
+                    break
+        except (OSError, ValueError):
+            pass
+    return sorted(families)
+
+
+def network_ready(run=subprocess.run, resolve=socket.getaddrinfo):
+    """None when the box can reach DuckDNS and the CA, else 'route' or 'dns' for the settings page.
+
+    Checked before acme.sh runs: at boot the first attempt used to land while the access point was still
+    being rebuilt and the Wi-Fi uplink was down, which cost an hour of retry (2026-10-26, N1 mode 3)."""
+    if not default_route_families(run):
+        return "route"
+    for host in ("www.duckdns.org", directory_host()):
+        try:
+            resolve(host, 443, type=socket.SOCK_STREAM)
+        except OSError:
+            return "dns"
+    return None
+
+
+def retry_delay(failures):
+    """Seconds to the next attempt: 60, 120, 300, 900, then hourly."""
+    return CERT_RETRY_STEPS[failures - 1] if 1 <= failures <= len(CERT_RETRY_STEPS) else CERT_RETRY
+
+
+CURL_FAILURE = re.compile(r"error code: (\d{1,3})")
+
+
+def curl_failure(log):
+    """The curl exit code from the last acme.sh log ('6' name lookup, '28' timeout), digits only."""
+    try:
+        found = CURL_FAILURE.findall(Path(log).read_text(errors="replace"))
+    except OSError:
+        return None
+    return found[-1] if found else None
+
+
+def failure_reason(error, log=None):
+    """A short code for state/own-domain.json: never a message, which may carry the token."""
+    code = curl_failure(log) if log else None
+    if code:
+        return "curl" + code
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, ValueError):
+        return "certificate"
+    if isinstance(error, OSError):
+        return "network"
+    return "acme"
+
+
+def reason_text(reason):
+    """The settings page's words for failure_reason (and the readiness codes)."""
+    if reason == "route":
+        return "盒子还没有默认路由（没连上网络）"
+    if reason == "dns":
+        return "域名解析失败"
+    if reason == "timeout":
+        return "acme.sh 超时"
+    if reason and reason.startswith("curl") and reason[4:].isdigit():
+        return f"连接 Let's Encrypt 失败（curl {reason[4:]}）"
+    if reason == "network":
+        return "网络中断"
+    if reason == "certificate":
+        return "证书内容不对"
+    return "acme.sh 申请没有成功"
 
 
 def forget_certificate(state):
@@ -196,8 +318,75 @@ def end_date(state):
         return None
 
 
+def install_certificate(state, name, chain, key):
+    """Replace only with a matching, already valid certificate that boxnet can use for at least one more day."""
+    pub = lambda *args: _openssl(*args).stdout
+    if "does match" not in pub("x509", "-noout", "-checkhost", name, "-in", str(chain)) or (
+            pub("x509", "-noout", "-pubkey", "-in", str(chain)) != pub("pkey", "-pubout", "-in", str(key))):
+        raise ValueError("certificate does not match")
+    validity = _openssl("x509", "-noout", "-dates", "-in", str(chain))
+    try:
+        dates = dict(line.split("=", 1) for line in validity.stdout.splitlines())
+        starts = ssl.cert_time_to_seconds(dates["notBefore"])
+        ends = ssl.cert_time_to_seconds(dates["notAfter"])
+    except (KeyError, ValueError):
+        raise ValueError("invalid certificate dates") from None
+    if validity.returncode or not starts <= time.time() < ends - 86400:
+        raise ValueError("certificate is not valid for the next day")
+    own = Path(state) / "tls" / "own"
+    own.mkdir(mode=0o700, parents=True, exist_ok=True)
+    key.chmod(0o600)
+    key.replace(own / "key.pem")
+    chain.replace(own / "fullchain.pem")
+
+
+def import_certificate(state, name, chain_text, key_text):
+    """A certificate brought from another machine (PEM text from the settings page), validated like acme.sh's own
+    output. The service must restart to load it (boxnet reads it once at start)."""
+    if not name:
+        raise ValueError("先设置自己的域名，再导入证书。")
+    if not 0 < len(chain_text) <= 65536 or not 0 < len(key_text) <= 16384:
+        raise ValueError("证书或私钥为空，或者太长。")
+    if "BEGIN CERTIFICATE" not in chain_text or "PRIVATE KEY" not in key_text:
+        raise ValueError("需要 PEM 格式的证书链（fullchain.pem）和私钥（key.pem）。")
+    with tempfile.TemporaryDirectory(dir=state) as scratch:
+        chain, key = Path(scratch) / "fullchain.pem", Path(scratch) / "key.pem"
+        chain.write_text(chain_text.strip() + "\n")
+        key.write_text(key_text.strip() + "\n")
+        try:
+            install_certificate(state, name, chain, key)
+        except ValueError:
+            raise ValueError("证书域名或私钥不匹配，或证书尚未生效、已过期、剩余有效期不足一天。") from None
+    write_status(Path(state), name=name, phase="ready", reason="")
+
+
+def curl_shim(home):
+    """A curl in front of acme.sh's: acme.sh 3.1.6 sends its requests without any timeout, so one dead connection
+    holds the whole run (and the old 600 s cap made it look stuck). PATH only for the acme.sh process; the bundled
+    acme.sh stays byte-identical to its pinned hash. None when curl is not there."""
+    real = shutil.which("curl")
+    if not real:
+        return None
+    directory = Path(home) / "bin"
+    path = directory / "curl"
+    text = ("#!/bin/sh\n"
+            f'exec "{real}" --connect-timeout {ACME_CONNECT_TIMEOUT} --max-time {ACME_REQUEST_TIMEOUT} '
+            f'--retry {ACME_RETRY} --retry-delay 2 "$@"\n')
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not path.exists() or path.read_text() != text:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
+            with os.fdopen(fd, "w") as out:
+                out.write(text)
+            path.chmod(0o700)
+    except OSError:
+        return None
+    return str(directory)
+
+
 def write_status(state, **fields):
-    """Fixed, public fields only (phase, record, address): never an error text, which may carry the token."""
+    """Fixed, public fields only (phase, record, address, reason): never an error text, which may carry the token.
+    reason is one of the codes from failure_reason()/network_ready(), never a message."""
     path = Path(state) / "own-domain.json"
     try:
         old = json.loads(path.read_text())
@@ -236,6 +425,12 @@ class Maintainer(threading.Thread):
                 say("DuckDNS record kept: Tesla cannot reach the current address")
         self.stopped, self.say, self.interface = stopped, say, interface
         self.sent, self.sent_at = None, 0.0   # (address, ipv6) last accepted by DuckDNS, and when
+        self.failures = 0                     # consecutive obtain() failures, for the retry ladder
+        self.retry = threading.Event()        # "重新申请证书" from the settings page, or a new uplink
+
+    def request_retry(self):
+        """Ask for an attempt now: the waiting loop is cut short and the certificate is looked at again."""
+        self.retry.set()
 
     def ipv6(self):
         """(address or None, state for the settings page): ok, none (no public IPv6), firewall (no nft), off."""
@@ -268,27 +463,55 @@ class Maintainer(threading.Thread):
                              ipv6=published or "", ipv6_state=v6state)
                 next_record = now + (RECORD_RETRY if not ok or v6state != "off" else RECORD_REFRESH)
             if now >= next_cert:
-                next_cert = now + self.check_certificate()
+                delay = self.check_certificate()
+                next_cert = time.monotonic() + delay   # a slow attempt must not consume its retry interval
             if not self.address:
                 next_record = float("inf")
-            self.stopped.wait(max(1.0, min(next_record, next_cert) - time.monotonic()))
+            if self.wait_until(min(next_record, next_cert)):
+                next_cert = time.monotonic()   # asked to try again now
+
+    def wait_until(self, deadline):
+        """Wait for the deadline; True when a retry was requested. Checks stopped every second so that a stop or a
+        request never waits out the 12-hour check interval."""
+        while not self.stopped.is_set():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            if self.retry.wait(min(left, 1.0)):
+                self.retry.clear()
+                return True
+        return False
 
     def check_certificate(self):
         """Seconds until the next look."""
         if certificate_for(self.state, self.name, RENEW_DAYS):
-            write_status(self.state, name=self.name, phase="ready")
+            write_status(self.state, name=self.name, phase="ready", reason="")
             return CERT_CHECK
+        try:
+            missing = network_ready()
+        except (OSError, ValueError, subprocess.SubprocessError, TypeError):   # never kill the worker here
+            missing = "route"
+        if missing:   # boot, access point rebuilding, uplink not up yet: not a failure, look again shortly
+            write_status(self.state, name=self.name, phase="waiting", reason=missing)
+            return READY_RETRY
         renewing = certificate_for(self.state, self.name)
-        write_status(self.state, name=self.name, phase="renewing" if renewing else "issuing")
+        write_status(self.state, name=self.name, phase="renewing" if renewing else "issuing", reason="")
+        log = self.state / "acme" / "acme.log"
+        before = log.stat().st_mtime_ns if log.exists() else None
         try:
             self.obtain()
         except InterruptedError:
             return CERT_CHECK
         except Exception as error:   # no internet, DuckDNS or Let's Encrypt refused; texts may carry the token
-            write_status(self.state, name=self.name, phase="retry")
-            self.say(f"certificate for {self.name} deferred: {type(error).__name__}")
-            return CERT_RETRY
-        write_status(self.state, name=self.name, phase="ready")
+            self.failures += 1
+            after = log.stat().st_mtime_ns if log.exists() else None
+            reason = failure_reason(error, log if after != before else None)   # this run's log, not the last one
+            write_status(self.state, name=self.name, phase="retry", reason=reason)
+            delay = retry_delay(self.failures)
+            self.say(f"certificate for {self.name} deferred ({reason}), next try in {delay} s")
+            return delay
+        self.failures = 0
+        write_status(self.state, name=self.name, phase="ready", reason="")
         self.say(f"certificate for {self.name} installed until {end_date(self.state)}; used from the next start")
         return CERT_CHECK
 
@@ -296,7 +519,8 @@ class Maintainer(threading.Thread):
         home = self.state / "acme"
         home.mkdir(mode=0o700, exist_ok=True)
         log = home / "acme.log"
-        log.unlink(missing_ok=True)   # one run's log only (private, 0600)
+        if log.exists():
+            log.replace(home / "acme.log.1")   # keep the run that just failed (private, 0600)
         # One worker at a time, also across a supervisor restart while acme.sh is still running.
         fd = os.open(home / "dashplay.lock", os.O_RDWR | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a") as lock:
@@ -313,16 +537,7 @@ class Maintainer(threading.Thread):
                 self.install(chain, key)
 
     def install(self, chain, key):
-        """Only a certificate for this name whose key matches replaces the installed one."""
-        pub = lambda *args: _openssl(*args).stdout
-        if "does match" not in pub("x509", "-noout", "-checkhost", self.name, "-in", str(chain)) or (
-                pub("x509", "-noout", "-pubkey", "-in", str(chain)) != pub("pkey", "-pubout", "-in", str(key))):
-            raise ValueError("certificate does not match")
-        own = self.state / "tls" / "own"
-        own.mkdir(mode=0o700, parents=True, exist_ok=True)
-        key.chmod(0o600)
-        key.replace(own / "key.pem")
-        chain.replace(own / "fullchain.pem")
+        install_certificate(self.state, self.name, chain, key)
 
     def acme(self, arguments, log):
         """acme.sh in its own process group, cancelled when the service stops; the token only in its environment."""
@@ -330,6 +545,12 @@ class Maintainer(threading.Thread):
         command = [str(self.root / "acme" / "acme.sh"), "--home", str(self.root / "acme"), "--config-home", str(home),
                    "--cert-home", str(home / "certs"), *arguments, "--server", ACME_SERVER, "--no-color"]
         env = dict(os.environ, DuckDNS_Token=self.config["token"])
+        shim = curl_shim(home)
+        if shim:   # acme.sh asks for "curl"; its requests get bounded by the shim, the script stays untouched
+            env["PATH"] = shim + os.pathsep + env.get("PATH", "")
+        if 4 in default_route_families():
+            # Where there is IPv4, don't let a broken IPv6 path to the CA hold or reset the request (2026-10-26).
+            env.setdefault("ACME_USE_IPV4_REQUESTS", "1")
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "ab") as out, subprocess.Popen(
                 command, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
@@ -355,8 +576,8 @@ class Maintainer(threading.Thread):
                         process.wait()
 
 
-def message(state, name, box_hotspot=False):
-    """The settings page's line about the name and its certificate."""
+def message(state, name, box_hotspot=False, retry=False):
+    """The settings page's line about the name and its certificate. retry: the page also offers a retry button."""
     if not name:
         return ""
     status = read_status(state)
@@ -369,12 +590,20 @@ def message(state, name, box_hotspot=False):
             text += "新证书在下次开机时启用。"
         if box_hotspot and not certificate_for(state, name, RENEW_DAYS):
             text += "车上没有网络无法续签：请回家插上网线开机一次，盒子会自动续签。"
+    elif status.get("phase") == "retry":
+        detail = reason_text(status.get("reason")) if status.get("reason") else "请确认盒子能上网、子域名和 token 正确"
+        text = f"正式证书暂未申请到：{detail}。盒子会自动重试（1 分钟内开始，逐步放慢）。"
+        if retry:
+            text += "也可以点下面的「重新申请证书」立即再试一次。"
+    elif status.get("phase") == "waiting":
+        detail = reason_text(status.get("reason")) if status.get("reason") else "等待盒子联网"
+        text = f"等待盒子联网：{detail}；联网后自动申请正式证书。"
+    elif status.get("phase") == "issuing":
+        text = "正在申请正式证书，通常几分钟；完成后下次开机启用。"
     else:
-        text = {"issuing": "正在申请正式证书，通常几分钟；完成后下次开机启用。",
-                "retry": "正式证书暂未申请到：请确认盒子能上网、子域名和 token 正确；盒子每小时重试。",
-                }.get(status.get("phase"), "等待申请正式证书：盒子联网后自动开始。")
-        if box_hotspot:
-            text += "盒子热点方式在车上没有网络：请在家插上网线开机申请。"
+        text = "等待申请正式证书：盒子联网后自动开始。"
+    if not until and box_hotspot:
+        text += "盒子热点方式在车上没有网络：请在家插上网线开机申请。"
     if status.get("record") == "blocked":
         text += status.get("warning", "已保留原域名记录。")
     if status.get("record") == "failed":

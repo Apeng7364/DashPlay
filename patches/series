@@ -61,3 +61,4 @@ playport-window-renegotiate.patch
 playport-touch-swipe.patch
 playport-performance-mode.patch
 playport-slim-runtime.patch
+playport-viewer-video-priority.patch

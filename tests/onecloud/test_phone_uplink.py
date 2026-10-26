@@ -1,6 +1,7 @@
 """Phone sharing state machine and actual adapter command order with fake kernel I/O."""
 import ipaddress
 import json
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -28,6 +29,8 @@ class PhoneUplinkTests(unittest.TestCase):
         self.p.connected.return_value = True
         self.p.ap_ready.return_value = True
         self.p.ap_channel_problem.return_value = None
+        self.p.interface, self.p.ap_interface = 'wlan0', 'wlan0'
+        self.p.default_route_devices.return_value = []
         self.now = 0
         self.status = {'tesla':True,'own_name':'example.duckdns.org'}
         self.receiver = Mock()
@@ -67,6 +70,40 @@ class PhoneUplinkTests(unittest.TestCase):
             self.assertTrue(self.p.start_dhcp.call_args.kwargs['router'], 'offline Tesla checks need a default route')
             self.assertGreater(self.u.next_try,self.now)
 
+    def test_scan_errors_never_restart_network_or_receiver(self):
+        for error in (subprocess.TimeoutExpired('iw', 10), OSError('busy'),
+                      subprocess.CalledProcessError(1, 'iw')):
+            with self.subTest(error=type(error).__name__):
+                self.p.find_hotspot.side_effect = error
+                self.now = self.u.next_try; self.u.tick()
+                self.p.stop_child.assert_not_called()
+                self.p.cleanup_phone_uplink.assert_not_called()
+                self.receiver.assert_not_called()
+                self.assertEqual(self.u.phase, 'offline')
+                self.assertGreater(self.u.next_try, self.now)
+        self.p.find_hotspot.side_effect = None
+        self.now = self.u.next_try; self.u.tick()
+        self.assertEqual(self.u.phase, 'online', 'scan errors must not prevent recovery')
+        self.p.find_hotspot.assert_called_with('Phone', timeout=10)
+
+    def test_unsuccessful_scan_does_not_restart_the_ap(self):
+        for why in ('Device or resource busy (-16)', 'scan unsupported'):
+            with self.subTest(why=why):
+                self.p.find_hotspot.return_value = (False, False, why)
+                self.now = self.u.next_try; self.u.tick()
+                self.p.stop_child.assert_not_called()
+                self.receiver.assert_not_called()
+                self.assertEqual(self.u.phase, 'offline')
+                self.assertGreater(self.u.next_try, self.now)
+
+    def test_failure_after_network_changes_still_restores_offline_ap(self):
+        self.p.prepare_phone_uplink.side_effect = OSError('synthetic failure')
+        self.now = self.u.next_try; self.u.tick()
+        self.p.cleanup_phone_uplink.assert_called_once()
+        self.receiver.assert_called_once_with(149)
+        self.assertEqual(self.u.phase, 'offline')
+        self.assertTrue(self.status['tesla_offline'])
+
     def test_missing_hotspot_never_tears_down_ap_and_retries(self):
         self.p.find_hotspot.return_value = (True,False,'')
         self.now=5; self.u.tick()
@@ -84,6 +121,36 @@ class PhoneUplinkTests(unittest.TestCase):
         self.now=self.u.next_try; self.u.tick()
         self.assertEqual(self.u.phase,'offline')
         self.u.close(); self.p.cleanup_phone_uplink.assert_called()
+
+    def test_a_working_cable_keeps_the_ap_and_skips_the_hotspot(self):
+        self.p.default_route_devices.return_value = ['eth0']
+        with patch('socket.getaddrinfo', return_value=[('AF_INET', 0, 0, '', ('192.0.2.9', 443))]):
+            self.now = 5; self.u.tick()
+        self.assertEqual(self.status['uplink']['phase'], 'wired')
+        self.p.find_hotspot.assert_not_called()
+        self.p.stop_child.assert_not_called()
+        self.assertFalse(self.status['tesla_offline'], 'the cable has internet, no need for local Tesla answers')
+        # the cable goes: the next look joins the phone hotspot
+        self.p.default_route_devices.return_value = ['wlan0']
+        self.now = self.u.next_try; self.u.tick()
+        self.assertEqual(self.status['uplink']['phase'], 'online')
+
+    def test_a_cable_route_without_name_resolution_still_joins(self):
+        self.p.default_route_devices.return_value = ['eth0']
+        with patch('socket.getaddrinfo', side_effect=OSError('no dns')):
+            self.now = 5; self.u.tick()
+        self.assertEqual(self.status['uplink']['phase'], 'online')
+
+    def test_one_missing_ap_status_does_not_rebuild_the_ap(self):
+        self.online()
+        self.p.stop_child.reset_mock()   # the join itself replaces the AP once
+        self.p.ap_ready.return_value = False
+        self.u.tick(); self.u.tick()
+        self.assertEqual(self.u.phase, 'online', 'two misses are not a dead AP')
+        self.p.stop_child.assert_not_called()
+        self.u.tick()
+        self.assertEqual(self.u.phase, 'offline')
+        self.p.stop_child.assert_called()
 
     def test_mac_pair_is_stable_distinct_and_unicast(self):
         for mac in ('00:00:5e:00:53:01','02:00:5e:00:53:01'):
