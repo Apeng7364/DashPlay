@@ -1,10 +1,12 @@
 """Own DuckDNS name with a Let's Encrypt certificate (own_domain.py): for car browsers that refuse the box's local
 CA with no "continue" (2026-10-13). acme.sh is replaced by a script that hands out a synthetic certificate."""
 import json
+import fcntl
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -31,6 +33,7 @@ echo "$*" >> "$FAKE_DIR/calls"
 echo "$PATH" >> "$FAKE_DIR/env"
 echo "${ACME_USE_IPV4_REQUESTS:-}" >> "$FAKE_DIR/ipv4"
 [ -n "$DuckDNS_Token" ] && echo "token in environment" >> "$FAKE_DIR/calls"
+[ -n "$DEDYN_TOKEN" ] && echo "desec token in environment" >> "$FAKE_DIR/calls"
 case " $* " in *" --issue "*) [ -n "$FAKE_SLEEP" ] && sleep "$FAKE_SLEEP"; exit "${FAKE_ISSUE:-0}" ;; esac
 while [ $# -gt 0 ]; do
     case "$1" in --fullchain-file) cp "$FAKE_DIR/fullchain.pem" "$2" ;; --key-file) cp "$FAKE_DIR/key.pem" "$2" ;; esac
@@ -80,8 +83,130 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(supervisor_openwrt.own_config(bad), "a wrong token turns it off, CarPlay still starts")
 
 
+class DesecConfigTests(unittest.TestCase):
+    TOKEN = "A1b2C3d4E5f6G7h8J9kMnPqRsTuV"
+
+    def test_full_name_validation(self):
+        self.assertEqual(own_domain.domain_name(" BOX01.Car.Example.com. "),
+                         "box01.car.example.com")
+        for bad in ("", "no-dot", "a..b", "-x.example.com", "a_b.example.com", "http://a.example.com",
+                    "a.example.com/path"):
+            with self.assertRaises(ValueError):
+                own_domain.domain_name(bad)
+        with self.assertRaises(ValueError):
+            own_domain.check_desec_token("short")
+
+    def test_load_and_name(self):
+        config = {"provider": "desec", "domain": "box01.car.example.com",
+                  "token": self.TOKEN, "ipv6": True}
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root)
+            (state / "ddns.json").write_text(json.dumps(config))
+            loaded = own_domain.load(state)
+            self.assertEqual(loaded, {"provider": "desec", "domain": "box01.car.example.com",
+                                      "token": self.TOKEN})
+            self.assertEqual(own_domain.name_of(loaded), "box01.car.example.com")
+
+    def test_no_public_record(self):
+        config = {"provider": "desec", "domain": "box01.car.example.com", "token": self.TOKEN}
+        with patch.object(own_domain.urllib.request, "urlopen",
+                          side_effect=AssertionError("deSEC must not publish an A record")):
+            self.assertTrue(own_domain.update_record(config, "100.96.0.1"))
+
+
+@unittest.skipUnless(shutil.which("openssl"), "needs the openssl command")
+class DesecMaintainerTests(unittest.TestCase):
+    TOKEN = "A1b2C3d4E5f6G7h8J9kMnPqRsTuV"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name) / "dashplay"; self.state = self.root / "state"
+        (self.root / "acme").mkdir(parents=True); self.state.mkdir()
+        self.fake = Path(tmp.name) / "fake"; self.fake.mkdir()
+        acme = self.root / "acme" / "acme.sh"
+        acme.write_text(FAKE_ACME); acme.chmod(0o755)
+        self.name = "box01.car.example.com"
+        self.config = {"provider": "desec", "domain": self.name, "token": self.TOKEN}
+        env = patch.dict(os.environ, FAKE_DIR=str(self.fake)); env.start(); self.addCleanup(env.stop)
+        ready = patch.object(own_domain, "network_ready", lambda provider=None: None)
+        ready.start(); self.addCleanup(ready.stop)
+        self.stopped = threading.Event()
+
+    def test_obtains_with_desec_and_no_public_record(self):
+        make_certificate(self.fake, self.name)
+        maintainer = own_domain.Maintainer(self.root, self.config, "100.96.0.1", self.stopped, say=lambda _: None)
+        self.assertEqual(maintainer.check_certificate(), own_domain.CERT_CHECK)
+        calls = (self.fake / "calls").read_text()
+        self.assertIn("--dns dns_desec", calls)
+        self.assertIn("desec token in environment", calls)
+        self.assertNotIn(self.TOKEN, calls, "the token stays off acme.sh's command line")
+        self.assertTrue(own_domain.certificate_for(self.state, self.name, own_domain.RENEW_DAYS))
+
+    def test_record_stays_local(self):
+        maintainer = own_domain.Maintainer(self.root, self.config, "100.96.0.1", self.stopped, say=lambda _: None)
+        with patch.object(maintainer, "check_certificate", lambda: own_domain.CERT_CHECK), \
+                patch.object(own_domain, "update_record", side_effect=AssertionError("no public record")):
+            maintainer.start()
+            for _ in range(50):
+                if own_domain.read_status(self.state).get("record") == "local":
+                    break
+                time.sleep(0.1)
+            self.stopped.set(); maintainer.join(10)
+        status = own_domain.read_status(self.state)
+        self.assertEqual(status.get("record"), "local")
+        self.assertEqual(status.get("address"), "100.96.0.1")
+
+
 @unittest.skipUnless(shutil.which("openssl"), "needs the openssl command")
 class MaintainerTests(unittest.TestCase):
+    def test_busy_signer_waits_without_counting_a_network_failure(self):
+        worker = self.maintainer()
+        with patch.object(worker, 'obtain', side_effect=BlockingIOError()):
+            self.assertEqual(worker.check_certificate(), own_domain.READY_RETRY)
+        self.assertEqual(worker.failures, 0)
+        self.assertEqual(own_domain.read_status(self.state)['reason'], 'busy')
+
+    def test_signer_keeps_lock_after_supervisor_is_killed(self):
+        script = self.root / 'acme/acme.sh'
+        script.write_text(FAKE_ACME.replace('echo "$*"', 'echo $$ > "$FAKE_DIR/pid"\necho "$*"', 1))
+        code = ('import sys, threading; sys.path.insert(0, sys.argv[1]); import own_domain; '
+                'own_domain.Maintainer(sys.argv[2], {"domain":"mycar", "token":"' + TOKEN + '"}, '
+                'None, threading.Event()).obtain()')
+        parent = subprocess.Popen([sys.executable, '-c', code, str(Path(own_domain.__file__).parent), str(self.root)],
+                                  env=dict(os.environ, FAKE_SLEEP='30'), stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+        signer = None
+        try:
+            deadline = time.monotonic() + 10
+            while not (self.fake / 'pid').exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue((self.fake / 'pid').exists(), 'the signer must actually start')
+            signer = int((self.fake / 'pid').read_text())
+            parent.kill(); parent.wait(timeout=5)
+            with (self.state / 'acme/dashplay.lock').open('a') as lock:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            if parent.poll() is None:
+                parent.kill(); parent.wait(timeout=5)
+            if signer:
+                try:
+                    os.killpg(signer, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_contending_worker_cannot_rotate_the_active_log(self):
+        home = self.state / 'acme'
+        home.mkdir()
+        log = home / 'acme.log'
+        log.write_text('active attempt')
+        with (home / 'dashplay.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(BlockingIOError):
+                self.maintainer().obtain()
+            self.assertTrue(log.exists(), 'the busy worker must leave the active log in place')
+            self.assertEqual(log.read_text(), 'active attempt')
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name) / "dashplay"; self.state = self.root / "state"
@@ -463,6 +588,24 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class SettingsPageTests(unittest.TestCase):
+    def test_supplied_domain_keeps_retry_and_import_without_exposing_or_overwriting_config(self):
+        config = {'provider': 'desec', 'domain': 'box01.car.example.com', 'token': 'synthetic-supplied-token-00000'}
+        path = self.state / 'ddns.json'; path.write_text(json.dumps(config))
+        before = path.read_bytes()
+        called = []
+        self.page.retry_cert = lambda: called.append(True)
+        html = self.page.ddns_block(self.nonce, 'box_hotspot')
+        self.assertIn(config['domain'], html)
+        self.assertIn('重新申请证书', html)
+        self.assertIn('手动导入证书', html)
+        self.assertNotIn(config['token'], html)
+        self.assertNotIn('name=domain', html)
+        self.page.apply('/cert', {'action': 'retry', 'nonce': self.nonce})
+        self.assertEqual(called, [True])
+        with self.assertRaises(ValueError):
+            self.save(action='clear')
+        self.assertEqual(path.read_bytes(), before)
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         self.state = Path(tmp.name) / "state"; self.state.mkdir()

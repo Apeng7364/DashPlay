@@ -233,14 +233,18 @@ def compare(root, openwrt, manifest):
     online, reason = bool(manifest.get("online")), "" if manifest.get("online") else "这一版改了系统"
     if openwrt:
         available = newer(manifest["version"], current)
-    else:   # a box flashed from an image knows no version: its files tell
+    else:
         files = manifest.get("debian", {}).get("files", {})
-        available = not program_matches(root, files)
-        current = manifest["version"] if not available else current
+        modified = not program_matches(root, files)
+        # Known releases compare by version. Hashes still verify downloads and diagnose local changes;
+        # they must not offer the same release repeatedly or offer an older public build.
+        available = newer(manifest["version"], current) if version_key(current) else modified
+        current = manifest["version"] if not version_key(current) and not modified else current
         if online and not system_matches(root, files):
             online, reason = False, "这台盒子的系统比这一版要求的旧"
     return {"current": current, "latest": manifest["version"], "notes": manifest.get("notes", ""),
-            "available": available, "online": online, "reason": reason}
+            "available": available, "online": online, "reason": reason,
+            "modified": modified if not openwrt else False}
 
 
 def check(root, openwrt=None, key=KEY, manifest=None):

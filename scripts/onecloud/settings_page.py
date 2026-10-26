@@ -506,8 +506,11 @@ class SettingsPage:
                 f'<div class=inner style="padding:0 0 12px">{form}<p class=note>调试中想恢复：给盒子拔电再插上，就回到原来的网络；或等 30 分钟自动结束。</p></div></details>{actions}')
 
     def save_ddns(self, form):
-        """Own DuckDNS name (own_domain.py); a new name or turning it off drops the old name's certificate."""
+        """Own DuckDNS name (own_domain.py); a new name or turning it off drops the old name's certificate.
+        A deSEC name is configured when the box is prepared (state/ddns.json), not from this page."""
         old = own_domain.load(self.state)
+        if old and old.get("provider") == own_domain.DESEC:
+            raise ValueError("这个域名是刷机时配置的，不能在这里修改。")
         if form.get("action") == "clear":
             self.ddns_file.unlink(missing_ok=True)
             own_domain.forget_certificate(self.state)
@@ -546,27 +549,8 @@ class SettingsPage:
             return "证书已导入，服务约 2 秒后重启并启用；之后打开 https://域名 不再有证书警告。"
         raise ValueError("未知操作。")
 
-    def ddns_block(self, nonce, mode):
-        """Advanced: the own DuckDNS name. On OpenWrt LuCI sets it; this page only tells how it is going."""
-        name = self.status().get("own_name")
-        if self.managed:
-            return (f'<div class=cell><span class=main><b>自己的域名</b><span>{escape(own_domain.message(self.state, name))}'
-                    f'</span></span><span class=value>{escape(name)}</span></div>') if name else ""
-        ddns = own_domain.load(self.state) or {}
-        form = (f'<form method=post action=/ddns>{ui.hidden(nonce)}<div class=group>'
-                f'<label class=cell><span class=main><b>子域名</b></span><input type=text name=domain '
-                f'value="{escape(ddns.get("domain", ""))}" placeholder="如 mycar" required autocapitalize=off '
-                'style="text-align:right"></label>'
-                '<label class=cell><span class=main><b>Token</b></span><input type=password name=token '
-                f'placeholder="{"留空表示不修改" if ddns else "必填"}" autocomplete=off style="text-align:right"></label>'
-                + ('<label class=cell><span class=main><b>同时登记公网 IPv6</b><span>车机不让打开 192.168.x.x 这类局域网地址时才勾选</span>'
-                   f'</span><input type=checkbox name=ipv6 value=on{" checked" if ddns.get("ipv6") else ""}></label>'
-                   if mode in setup_wizard.JOINS else "") + '</div>'
-                '<button class="btn plain" name=action value=save>保存</button></form>'
-                + (f'<form method=post action=/ddns>{ui.hidden(nonce)}<button class="btn plain" name=action value=clear '
-                   'onclick="return confirm(\'关闭后车机改用盒子自带证书的地址，确定？\')">关闭</button></form>' if ddns else ""))
-        state = (own_domain.message(self.state, name, mode == "box_hotspot", retry=bool(self.retry_cert))
-                 if ddns else "")
+    def certificate_actions(self, nonce, ddns, name):
+        """The same retry/import controls for owner-configured and supplied domains."""
         actions = ""
         if ddns and self.retry_cert and not own_domain.certificate_for(self.state, name, own_domain.RENEW_DAYS):
             actions += (f'<form method=post action=/cert>{ui.hidden(nonce)}'
@@ -586,6 +570,37 @@ class SettingsPage:
                 'onclick="return confirm(\'导入后服务会重启一下，确定？\')">导入并重启服务</button></form>'
                 '<p class=foot>两段都要是 PEM 文本，证书必须是这个子域名的（名字对不上会被拒绝），私钥要和证书成对。'
                 '证书只写到盒子本地，不会上传；服务重启后才生效。</p></div></details>')
+        return actions
+
+    def ddns_block(self, nonce, mode):
+        """Advanced: the own DuckDNS name. On OpenWrt LuCI sets it; this page only tells how it is going."""
+        name = self.status().get("own_name")
+        if self.managed:
+            return (f'<div class=cell><span class=main><b>自己的域名</b><span>{escape(own_domain.message(self.state, name))}'
+                    f'</span></span><span class=value>{escape(name)}</span></div>') if name else ""
+        ddns = own_domain.load(self.state) or {}
+        name = name or own_domain.name_of(ddns)
+        if ddns.get("provider") == own_domain.DESEC:
+            return (f'<div class=cell><span class=main><b>自己的域名</b><span>{escape(own_domain.message(self.state, name, mode == "box_hotspot"))}</span></span><span class=value>{escape(name)}</span></div>'
+                    '<p class=foot>这个域名已由设备提供方配置。证书到期前，盒子联网会自动续期。'
+                    '更换域名请联系设备提供方。</p>'
+                    + ('<p class=note>这个网址需要车机连接盒子热点才能解析；其他连接方式请使用设置页显示的 IP 地址。</p>'
+                       if mode != "box_hotspot" else '') + self.certificate_actions(nonce, ddns, name))
+        form = (f'<form method=post action=/ddns>{ui.hidden(nonce)}<div class=group>'
+                f'<label class=cell><span class=main><b>子域名</b></span><input type=text name=domain '
+                f'value="{escape(ddns.get("domain", ""))}" placeholder="如 mycar" required autocapitalize=off '
+                'style="text-align:right"></label>'
+                '<label class=cell><span class=main><b>Token</b></span><input type=password name=token '
+                f'placeholder="{"留空表示不修改" if ddns else "必填"}" autocomplete=off style="text-align:right"></label>'
+                + ('<label class=cell><span class=main><b>同时登记公网 IPv6</b><span>车机不让打开 192.168.x.x 这类局域网地址时才勾选</span>'
+                   f'</span><input type=checkbox name=ipv6 value=on{" checked" if ddns.get("ipv6") else ""}></label>'
+                   if mode in setup_wizard.JOINS else "") + '</div>'
+                '<button class="btn plain" name=action value=save>保存</button></form>'
+                + (f'<form method=post action=/ddns>{ui.hidden(nonce)}<button class="btn plain" name=action value=clear '
+                   'onclick="return confirm(\'关闭后车机改用盒子自带证书的地址，确定？\')">关闭</button></form>' if ddns else ""))
+        state = (own_domain.message(self.state, name, mode == "box_hotspot", retry=bool(self.retry_cert))
+                 if ddns else "")
+        actions = self.certificate_actions(nonce, ddns, name)
         ipv6 = ('勾选「同时登记公网 IPv6」后，盒子把自己的公网 IPv6 地址也登记到这个域名：车机拿到的是公网地址，'
                 '画面仍在同一个 WiFi 里直接传。需要车机热点或随身 WiFi 给设备分配 IPv6；这个地址在 DuckDNS 上谁都查得到，'
                 '所以盒子同时开启防火墙，只让同一个 WiFi 里的设备连进来。' if mode in setup_wizard.JOINS else

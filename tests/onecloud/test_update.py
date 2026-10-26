@@ -121,6 +121,18 @@ class ClockTests(unittest.TestCase):
 
 
 class VersionTests(unittest.TestCase):
+    def test_known_debian_version_does_not_offer_same_or_older_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'version.txt').write_text('2026.10.26\n')
+            (root / 'own_domain.py').write_text('local provider support')
+            for latest, available in [('2026.10.26', False), ('2026.10.25', False), ('2026.10.26.1', True)]:
+                manifest = {'version': latest, 'online': True,
+                            'debian': {'files': {'own_domain.py': sha(b'public implementation')}}}
+                result = update.compare(root, False, manifest)
+                self.assertEqual(result['available'], available)
+                self.assertTrue(result['modified'])
+
     def test_dates_compare_as_numbers(self):
         self.assertTrue(update.newer('2026.10.19.1', '2026.10.19'))
         self.assertTrue(update.newer('2026.10.20', '2026.10.19.1'))

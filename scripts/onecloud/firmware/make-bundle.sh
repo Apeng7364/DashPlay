@@ -38,6 +38,7 @@ for jar in "$lib"/*.jar; do
 done
 
 for file in "$repo"/scripts/onecloud/*.py "$repo/scripts/onecloud/dashplay.service"; do
+    [ "$(basename "$file")" = provision.py ] && continue
     cp "$file" "$stage/"
 done
 mkdir -p "$stage/playport/web" "$stage/identity/offline-mfi" "$stage/firmware"

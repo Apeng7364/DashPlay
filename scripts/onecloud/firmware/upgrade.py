@@ -96,15 +96,40 @@ def run(*args):
     return subprocess.run(list(args), capture_output=True, text=True)
 
 
-def service_up(seconds=90):
-    """The service runs and its supervisor got past its start (the settings page answers on port 80)."""
+def service_up(seconds=150, check=None, steady=15):
+    """Require a stable settings service and, when configured, the owner's domain/DNS/HTTPS."""
     until = time.monotonic() + seconds
+    healthy_since = None
     while time.monotonic() < until:
         if run("systemctl", "is-active", "dashplay").stdout.strip() == "active" and \
-                run("python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 80), 2)").returncode == 0:
-            return True
+                run("python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 80), 2)").returncode == 0 and \
+                (check is None or check()):
+            if healthy_since is None:
+                healthy_since = time.monotonic()
+            if time.monotonic() - healthy_since >= steady:
+                return True
+        else:
+            healthy_since = None
         time.sleep(2)
     return False
+
+
+def domain_check(program, root, health=False, require_https=False):
+    """Use the candidate's own reader and hooks before overwriting any files."""
+    if not (root / "state/ddns.json").exists() and not require_https:
+        return {"https": False}
+    checker = Path(program) / "upgrade_checks.py"
+    if not checker.is_file():
+        raise ValueError("升级包不能验证已有的域名配置，已停止")
+    command = [sys.executable, str(checker), "--root", str(root)]
+    if health:
+        command.append("--health")
+    if require_https:
+        command.append("--require-https")
+    result = run(*command)
+    if result.returncode:
+        raise ValueError("设备域名、验证脚本、本地 DNS 或 HTTPS 检查失败")
+    return json.loads(result.stdout)
 
 
 def backup(root):
@@ -163,6 +188,13 @@ def main(argv):
         missing = [p for p in NEEDED if not (Path(staging) / p).exists()]
         if missing:
             raise SystemExit(f"{bundle} is not a DashPlay program bundle (missing {', '.join(missing)})")
+        try:
+            expected = domain_check(Path(staging), ROOT)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            say(str(error), log)
+            return 1
+        domain_file = ROOT / "state/ddns.json"
+        domain_before = domain_file.read_bytes() if domain_file.exists() else None
         remove, write = plan(ROOT, staging)
         print("\n".join([f"replace/add {p}" for p in write] + [f"remove {p}" for p in remove]) or "nothing to change")
         if dry:
@@ -173,7 +205,17 @@ def main(argv):
         say(f"upgrade to bundle sha256 {digest}: {len(write)} files new or changed, {len(remove)} removed", log)
         backup(ROOT)
         say(f"previous program saved in {PREVIOUS}", log)
-        apply(ROOT, staging, remove, write)
+        # Stop before replacing hooks or modules a signer might still be using.
+        if run("systemctl", "stop", "dashplay").returncode:
+            say("could not stop service; program left unchanged", log)
+            return 1
+        try:
+            apply(ROOT, staging, remove, write)
+        except (OSError, ValueError):
+            say("program replacement failed; restoring previous program", log)
+            restore(ROOT, log)
+            run("systemctl", "restart", "dashplay")
+            return 1
     install_unit(ROOT, log)
     check = run("python3", str(ROOT / "supervisor.py"), "--root", str(ROOT), "--check")
     if check.returncode != 0:
@@ -183,11 +225,21 @@ def main(argv):
         return 1
     say("check passed; restarting the service (the box's Wi-Fi restarts too)", log)
     run("systemctl", "restart", "dashplay")
-    if service_up():
+
+    def domain_healthy():
+        try:
+            if (domain_file.read_bytes() if domain_file.exists() else None) != domain_before:
+                return False
+            domain_check(ROOT, ROOT, health=True, require_https=expected.get("https", False))
+            return True
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
+
+    if service_up(check=domain_healthy):
         (ROOT / "state" / "upgrade.json").write_text(json.dumps({"bundle_sha256": digest, "at": int(time.time())}) + "\n")
         say("upgrade done; service up", log)
         return 0
-    say("service did not come up with the new program: rolling back", log)
+    say("service or domain/DNS/HTTPS did not become healthy: rolling back", log)
     restore(ROOT, log)
     run("systemctl", "restart", "dashplay")
     say("rolled back; service " + ("up" if service_up() else "NOT up"), log)

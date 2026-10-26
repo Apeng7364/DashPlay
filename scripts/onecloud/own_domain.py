@@ -3,6 +3,9 @@ and offer no way past the warning (2026-10-13: a head unit's Chromium showed ERR
 no "continue"). Off unless the owner enters a DuckDNS sub-domain and token: on the box in the settings page
 (state/ddns.json), on OpenWrt in LuCI (uci dashplay.main.duckdns_domain / duckdns_token).
 
+- Preconfigured deSEC names use the same runtime and upgrade package. state/ddns.json selects provider=desec,
+  a full domain name and a per-device token. Only DNS-01 TXT is public; the device's hotspot answers A locally.
+  Factory provisioning tools and actual credentials are separate from the public program.
 - The public DuckDNS record points the name at the address the head unit opens: the box on the car hotspot or
   portable Wi-Fi, 192.168.78.1 on the box hotspot, the router's own address on OpenWrt. DuckDNS takes a
   private address; a DNS server that filters those ("rebind protection") will not resolve the name.
@@ -42,8 +45,10 @@ import urllib.parse
 import urllib.request
 
 SUFFIX = ".duckdns.org"
+DESEC = "desec"
 DOMAIN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 TOKEN = re.compile(r"[A-Za-z0-9-]{16,64}")   # DuckDNS shows a UUID
+DESEC_TOKEN = re.compile(r"[A-Za-z0-9_-]{20,64}")   # deSEC shows 28 URL-safe characters
 RENEW_DAYS = 30            # Let's Encrypt certificates last 90 days
 RECORD_REFRESH = 1800      # seconds between DuckDNS updates once one succeeded
 RECORD_RETRY = 60
@@ -76,10 +81,34 @@ def check_token(token):
     return token
 
 
+def domain_name(text):
+    """A full DNS name, normalized; ValueError when invalid."""
+    name = (text or "").strip().lower().rstrip(".")
+    if not name or len(name) > 253 or "." not in name:
+        raise ValueError("域名要填完整名称，如 box01.car.example.com。")
+    if any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in name.split(".")):
+        raise ValueError("域名只能包含小写字母、数字、连字符和点，每段不能以连字符开头或结尾。")
+    return name
+
+
+def check_desec_token(token):
+    token = (token or "").strip()
+    if not DESEC_TOKEN.fullmatch(token):
+        raise ValueError("deSEC token 格式不对：在 deSEC 的 Tokens 页面新建后复制。")
+    return token
+
+
 def load(state):
-    """state/ddns.json -> {"domain": sub-domain, "token": ..., ["ipv6": True]}, or None when off or unreadable."""
+    """state/ddns.json -> DuckDNS {"domain": sub-domain, "token": ..., ["ipv6": True]} or deSEC
+    {"provider": "desec", "domain": full-name, "token": ...}; None when off or unreadable."""
     try:
         config = json.loads((Path(state) / "ddns.json").read_text())
+        provider = str(config.get("provider") or "duckdns").lower()
+        if provider == DESEC:
+            return {"provider": DESEC, "domain": domain_name(config["domain"]),
+                    "token": check_desec_token(config["token"])}
+        if provider != "duckdns":
+            return None
         loaded = {"domain": sub_domain(config["domain"]), "token": check_token(config["token"])}
         if config.get("ipv6") is True:
             loaded["ipv6"] = True
@@ -89,7 +118,9 @@ def load(state):
 
 
 def name_of(config):
-    return config["domain"] + SUFFIX if config else None
+    if not config:
+        return None
+    return config["domain"] if config.get("provider") == DESEC else config["domain"] + SUFFIX
 
 
 def directory_host():
@@ -138,14 +169,14 @@ def default_route_families(run=subprocess.run, proc=Path("/proc")):
     return sorted(families)
 
 
-def network_ready(run=subprocess.run, resolve=socket.getaddrinfo):
-    """None when the box can reach DuckDNS and the CA, else 'route' or 'dns' for the settings page.
+def network_ready(run=subprocess.run, resolve=socket.getaddrinfo, provider=None):
+    """None when the box can reach its DNS provider and the CA, else 'route' or 'dns' for the settings page.
 
     Checked before acme.sh runs: at boot the first attempt used to land while the access point was still
     being rebuilt and the Wi-Fi uplink was down, which cost an hour of retry (2026-10-26, N1 mode 3)."""
     if not default_route_families(run):
         return "route"
-    for host in ("www.duckdns.org", directory_host()):
+    for host in (("desec.io" if provider == DESEC else "www.duckdns.org"), directory_host()):
         try:
             resolve(host, 443, type=socket.SOCK_STREAM)
         except OSError:
@@ -192,6 +223,8 @@ def reason_text(reason):
         return "域名解析失败"
     if reason == "timeout":
         return "acme.sh 超时"
+    if reason == "busy":
+        return "上一轮证书申请仍在结束，稍后继续"
     if reason and reason.startswith("curl") and reason[4:].isdigit():
         return f"连接 Let's Encrypt 失败（curl {reason[4:]}）"
     if reason == "network":
@@ -209,7 +242,10 @@ def forget_certificate(state):
 
 def update_record(config, address, ipv6=None, clear=False, timeout=15):
     """Point the name at address (private addresses allowed) and, when given, its AAAA at ipv6. clear: drop both
-    records first (DuckDNS has no way to drop the AAAA alone). True when DuckDNS answered OK."""
+    records first (DuckDNS has no way to drop the AAAA alone). True when DuckDNS answered OK. A deSEC name is
+    answered by the box itself, so there is no public A/AAAA record to keep."""
+    if config.get("provider") == DESEC:
+        return True
     def call(fields):
         query = urllib.parse.urlencode(dict(fields, domains=config["domain"], token=config["token"]))
         with urllib.request.urlopen("https://www.duckdns.org/update?" + query, timeout=timeout) as response:
@@ -417,6 +453,7 @@ class Maintainer(threading.Thread):
         super().__init__(name="own-domain", daemon=True)
         self.root, self.state = Path(root), Path(root) / "state"
         self.config, self.name, self.address = config, name_of(config), address
+        self.local_only = bool(config and config.get("provider") == DESEC)   # deSEC: the box answers the name
         if tesla and address:
             from setup_wizard import tesla_reaches
             if not tesla_reaches(address):
@@ -447,21 +484,27 @@ class Maintainer(threading.Thread):
         while not self.stopped.is_set():
             now = time.monotonic()
             if self.address and now >= next_record:
-                ipv6, v6state = self.ipv6()
-                if (self.address, ipv6) == self.sent and now < self.sent_at + RECORD_REFRESH:
-                    ok = True   # nothing changed since DuckDNS took it
+                if self.local_only:
+                    # deSEC: the name is answered by the box's own dnsmasq; no public A/AAAA, no IPv6 guard.
+                    write_status(self.state, name=self.name, record="local", address=self.address,
+                                 ipv6="", ipv6_state="off")
+                    next_record = float("inf")
                 else:
-                    try:
-                        ok = update_record(self.config, self.address, ipv6=ipv6, clear=bool(published and not ipv6))
-                    except (OSError, ValueError):   # no internet yet; URLError is an OSError
-                        ok = False
-                    if ok:
-                        self.sent, self.sent_at, published = (self.address, ipv6), now, ipv6
-                    self.say(f"duckdns {self.name} -> {self.address}{' ' + ipv6 if ipv6 else ''}: "
-                             f"{'OK' if ok else 'failed'}")
-                write_status(self.state, name=self.name, record="ok" if ok else "failed", address=self.address,
-                             ipv6=published or "", ipv6_state=v6state)
-                next_record = now + (RECORD_RETRY if not ok or v6state != "off" else RECORD_REFRESH)
+                    ipv6, v6state = self.ipv6()
+                    if (self.address, ipv6) == self.sent and now < self.sent_at + RECORD_REFRESH:
+                        ok = True   # nothing changed since DuckDNS took it
+                    else:
+                        try:
+                            ok = update_record(self.config, self.address, ipv6=ipv6, clear=bool(published and not ipv6))
+                        except (OSError, ValueError):   # no internet yet; URLError is an OSError
+                            ok = False
+                        if ok:
+                            self.sent, self.sent_at, published = (self.address, ipv6), now, ipv6
+                        self.say(f"duckdns {self.name} -> {self.address}{' ' + ipv6 if ipv6 else ''}: "
+                                 f"{'OK' if ok else 'failed'}")
+                    write_status(self.state, name=self.name, record="ok" if ok else "failed", address=self.address,
+                                 ipv6=published or "", ipv6_state=v6state)
+                    next_record = now + (RECORD_RETRY if not ok or v6state != "off" else RECORD_REFRESH)
             if now >= next_cert:
                 delay = self.check_certificate()
                 next_cert = time.monotonic() + delay   # a slow attempt must not consume its retry interval
@@ -488,7 +531,7 @@ class Maintainer(threading.Thread):
             write_status(self.state, name=self.name, phase="ready", reason="")
             return CERT_CHECK
         try:
-            missing = network_ready()
+            missing = network_ready(provider=DESEC) if self.local_only else network_ready()
         except (OSError, ValueError, subprocess.SubprocessError, TypeError):   # never kill the worker here
             missing = "route"
         if missing:   # boot, access point rebuilding, uplink not up yet: not a failure, look again shortly
@@ -502,6 +545,9 @@ class Maintainer(threading.Thread):
             self.obtain()
         except InterruptedError:
             return CERT_CHECK
+        except BlockingIOError:
+            write_status(self.state, name=self.name, phase="waiting", reason="busy")
+            return READY_RETRY
         except Exception as error:   # no internet, DuckDNS or Let's Encrypt refused; texts may carry the token
             self.failures += 1
             after = log.stat().st_mtime_ns if log.exists() else None
@@ -519,32 +565,34 @@ class Maintainer(threading.Thread):
         home = self.state / "acme"
         home.mkdir(mode=0o700, exist_ok=True)
         log = home / "acme.log"
-        if log.exists():
-            log.replace(home / "acme.log.1")   # keep the run that just failed (private, 0600)
         # One worker at a time, also across a supervisor restart while acme.sh is still running.
         fd = os.open(home / "dashplay.lock", os.O_RDWR | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if log.exists():
+                log.replace(home / "acme.log.1")
             # 2: acme.sh still has a certificate it considers current; install that one.
-            if self.acme(["--issue", "--dns", "dns_duckdns", "--dnssleep", str(DNS_SLEEP), "-d", self.name,
-                          "--keylength", "ec-256"], log) not in (0, 2):
+            dns = "dns_desec" if self.local_only else "dns_duckdns"
+            if self.acme(["--issue", "--dns", dns, "--dnssleep", str(DNS_SLEEP), "-d", self.name,
+                          "--keylength", "ec-256"], log, lock.fileno()) not in (0, 2):
                 raise RuntimeError("acme.sh could not obtain the certificate")
             with tempfile.TemporaryDirectory(dir=home) as scratch:
                 chain, key = Path(scratch) / "fullchain.pem", Path(scratch) / "key.pem"
                 if self.acme(["--install-cert", "-d", self.name, "--ecc", "--fullchain-file", str(chain),
-                              "--key-file", str(key)], log) != 0:
+                              "--key-file", str(key)], log, lock.fileno()) != 0:
                     raise RuntimeError("acme.sh could not export the certificate")
                 self.install(chain, key)
 
     def install(self, chain, key):
         install_certificate(self.state, self.name, chain, key)
 
-    def acme(self, arguments, log):
+    def acme(self, arguments, log, lock_fd=None):
         """acme.sh in its own process group, cancelled when the service stops; the token only in its environment."""
         home = self.state / "acme"
         command = [str(self.root / "acme" / "acme.sh"), "--home", str(self.root / "acme"), "--config-home", str(home),
                    "--cert-home", str(home / "certs"), *arguments, "--server", ACME_SERVER, "--no-color"]
-        env = dict(os.environ, DuckDNS_Token=self.config["token"])
+        env = dict(os.environ, **({"DEDYN_TOKEN": self.config["token"]} if self.local_only
+                                  else {"DuckDNS_Token": self.config["token"]}))
         shim = curl_shim(home)
         if shim:   # acme.sh asks for "curl"; its requests get bounded by the shim, the script stays untouched
             env["PATH"] = shim + os.pathsep + env.get("PATH", "")
@@ -554,7 +602,7 @@ class Maintainer(threading.Thread):
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "ab") as out, subprocess.Popen(
                 command, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                start_new_session=True) as process:
+                start_new_session=True, pass_fds=(() if lock_fd is None else (lock_fd,))) as process:
             deadline = time.monotonic() + ACME_TIMEOUT
             try:
                 while True:
@@ -567,8 +615,13 @@ class Maintainer(threading.Thread):
                     except subprocess.TimeoutExpired:
                         pass
             finally:
-                if process.poll() is None:
+                # Reap descendants even when the shell itself already exited. The inherited lock also
+                # survives an abrupt supervisor death until its signer has finished.
+                try:
                     os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                if process.poll() is None:
                     try:
                         process.wait(timeout=3)
                     except subprocess.TimeoutExpired:

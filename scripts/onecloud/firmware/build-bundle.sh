@@ -21,6 +21,7 @@ lib="$playport/server/build/install/server/lib"
 ACME_VERSION=3.1.6
 ACME_SHA256=c7d68b021cfd6380ea83a82962abde5b484779fee0b97d38681dfa1396bbc8d7
 DUCKDNS_SHA256=8be535b8d6270b7a37671da954d89c896df7af29c2f38d5029054ec315fe77af
+DESEC_SHA256=8e31d236594fd50d6629f324c0dca8a6fed80b030bf6ae708fe23332e4055d6b
 [ -s "$lib/server-0.1.0.jar" ] || { echo "build the receiver first (:server:installDist)" >&2; exit 1; }
 stage=$(mktemp -d "${TMPDIR:-/tmp}/dashplay-bundle.XXXXXX")
 work=$(mktemp -d "${TMPDIR:-/tmp}/dashplay-build.XXXXXX")
@@ -31,7 +32,7 @@ sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum 
 # Committed files only: work in progress in the tree must not ship.
 for file in $(git -C "$repo" ls-files 'scripts/onecloud/*.py') scripts/onecloud/dashplay.service scripts/onecloud/tls.security \
             scripts/onecloud/update-key.pem; do   # update.py checks release manifests with this public key
-    case "$file" in scripts/onecloud/*/*) continue ;; esac   # the top level only, as on the box
+    case "$file" in scripts/onecloud/provision.py|scripts/onecloud/*/*) continue ;; esac
     cp "$repo/$file" "$stage/"
 done
 mkdir -p "$stage/playport/server/build/install/server" "$stage/playport/web" "$stage/identity/offline-mfi" \
@@ -52,14 +53,16 @@ python3 -m pip download --quiet --no-deps --only-binary=:all: --require-hashes \
 unzip -q "$work"/wheels/dbus_next-0.2.3-*.whl 'dbus_next/*' -d "$stage/linux-bt-bridge/deps"
 cp "$repo/licenses/dbus-next-0.2.3-MIT.txt" "$stage/linux-bt-bridge/deps/dbus_next-LICENSE.txt"
 
-# acme.sh, pinned: only the main script and the DuckDNS hook are used (own_domain.py).
+# acme.sh, pinned: the main script and the DuckDNS/deSEC hooks (own_domain.py).
 curl -fsSL -o "$work/acme.tar.gz" "https://github.com/acmesh-official/acme.sh/archive/refs/tags/$ACME_VERSION.tar.gz"
 tar -xzf "$work/acme.tar.gz" -C "$work"
 cp "$work/acme.sh-$ACME_VERSION/acme.sh" "$stage/acme/acme.sh"
 cp "$work/acme.sh-$ACME_VERSION/dnsapi/dns_duckdns.sh" "$stage/acme/dnsapi/dns_duckdns.sh"
+cp "$repo/scripts/onecloud/acme/dnsapi/dns_desec.sh" "$stage/acme/dnsapi/dns_desec.sh"
 cp "$work/acme.sh-$ACME_VERSION/LICENSE.md" "$stage/acme/LICENSE.md"
 [ "$(sha256 "$stage/acme/acme.sh")" = "$ACME_SHA256" ] || { echo "acme.sh hash mismatch" >&2; exit 1; }
 [ "$(sha256 "$stage/acme/dnsapi/dns_duckdns.sh")" = "$DUCKDNS_SHA256" ] || { echo "dns_duckdns.sh hash mismatch" >&2; exit 1; }
+[ "$(sha256 "$stage/acme/dnsapi/dns_desec.sh")" = "$DESEC_SHA256" ] || { echo "dns_desec.sh hash mismatch" >&2; exit 1; }
 chmod 755 "$stage/acme/acme.sh"
 
 cp "$repo"/scripts/onecloud/firmware/install.sh "$repo"/scripts/onecloud/firmware/prepare-image.sh \

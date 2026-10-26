@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import io
+import json
+import subprocess
 import tarfile
 
 spec = importlib.util.spec_from_file_location(
@@ -21,6 +23,43 @@ def make(root, files):
 
 
 class UpgradeInPlaceTests(unittest.TestCase):
+    def test_candidate_without_domain_support_is_rejected_before_backup_or_write(self):
+        make(self.box, {'state/ddns.json': '{"provider":"desec"}'})
+        for name in upgrade.NEEDED:
+            make(self.bundle, {name: 'candidate'})
+        archive = Path(self.tmp.name) / 'bundle.tar'
+        with tarfile.open(archive, 'w') as out:
+            out.add(self.bundle, arcname='.')
+        with patch.object(upgrade, 'ROOT', self.box), patch.object(upgrade.os, 'geteuid', return_value=0), \
+                patch.object(upgrade, 'backup') as backup, patch.object(upgrade, 'run') as run:
+            self.assertEqual(upgrade.main([str(archive)]), 1)
+        backup.assert_not_called(); run.assert_not_called()
+        self.assertEqual((self.box / 'supervisor.py').read_text(), 'old')
+
+    def test_domain_failure_rolls_back_and_keeps_device_data(self):
+        make(self.box, {'state/ddns.json': '{"provider":"desec"}', 'state/tls/own/key.pem': 'device-key'})
+        for name in upgrade.NEEDED:
+            make(self.bundle, {name: 'candidate'})
+        archive = Path(self.tmp.name) / 'bundle.tar'
+        previous = Path(self.tmp.name) / 'previous.tar'
+        with tarfile.open(archive, 'w') as out:
+            out.add(self.bundle, arcname='.')
+        def domain(program, root, health=False, require_https=False):
+            if health:
+                raise ValueError('domain offline')
+            return {'https': True}
+        def started(**kwargs):
+            return kwargs['check']() if 'check' in kwargs else True
+        with patch.object(upgrade, 'ROOT', self.box), patch.object(upgrade, 'PREVIOUS', previous), \
+                patch.object(upgrade.os, 'geteuid', return_value=0), patch.object(upgrade.os, 'chown'), \
+                patch.object(upgrade, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')), \
+                patch.object(upgrade, 'install_unit'), patch.object(upgrade, 'domain_check', side_effect=domain), \
+                patch.object(upgrade, 'service_up', side_effect=started):
+            self.assertEqual(upgrade.main([str(archive)]), 1)
+        self.assertEqual((self.box / 'supervisor.py').read_text(), 'old')
+        self.assertEqual((self.box / 'state/tls/own/key.pem').read_text(), 'device-key')
+        self.assertEqual(json.loads((self.box / 'state/ddns.json').read_text())['provider'], 'desec')
+
     """firmware/upgrade.py: a box keeps its first-run setup, iPhones, identity and settings (2026-10-14)."""
 
     def setUp(self):
